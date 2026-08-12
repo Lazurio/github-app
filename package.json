@@ -1,0 +1,13 @@
+{
+  "name": "@lazurio/github-app-broker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "node --check src/broker.mjs && node --check test/broker.test.mjs",
+    "test": "node --test"
+  }
+}

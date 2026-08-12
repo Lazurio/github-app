@@ -1,0 +1,25 @@
+{
+  "schema_version": "lazurio.github_app_broker.policy.v1",
+  "github_owner": {
+    "id": 1001,
+    "login": "example-organization"
+  },
+  "installation_id": 2001,
+  "installation_permissions": {
+    "contents": "write",
+    "metadata": "read"
+  },
+  "repositories": [
+    {
+      "id": 3001,
+      "full_name": "example-organization/example-repository"
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "example-team",
+      "credential_file": "/run/secrets/workspace-example-team",
+      "repository_ids": [3001]
+    }
+  ]
+}
