@@ -6,9 +6,9 @@ import test from "node:test";
 import {
   createBrokerServer,
   createGithubClient,
-  createReloadingPolicy,
   parseCommand,
   parsePolicy,
+  startBroker,
 } from "../src/broker.mjs";
 
 const secretByPath = new Map([
@@ -303,66 +303,33 @@ test("mints through repository_ids and rejects an over-scoped token response", a
   );
 });
 
-test("reloads and verifies a changed Workspace repository policy without restart", async () => {
-  let current = JSON.stringify(policyFixture());
-  let verifies = 0;
-  const getPolicy = createReloadingPolicy({
-    policyFile: "/run/config/policy.json",
-    github: {
-      verifyPolicy: async () => {
-        verifies += 1;
-      },
-    },
-    readFile: (file) =>
-      file === "/run/config/policy.json" ? current : (secretByPath.get(file) ?? ""),
-    realpath: (file) => file,
-  });
-
-  assert.deepEqual((await getPolicy()).policy.workspaces[0].repository_ids, [3001]);
-  assert.equal(verifies, 1);
-  assert.deepEqual((await getPolicy()).policy.workspaces[0].repository_ids, [3001]);
-  assert.equal(verifies, 1);
-
-  const changed = policyFixture();
-  changed.workspaces[0].repository_ids = [3002];
-  current = JSON.stringify(changed);
-  assert.deepEqual((await getPolicy()).policy.workspaces[0].repository_ids, [3002]);
-  assert.equal(verifies, 2);
-});
-
-test("does not fall back to the previously accepted policy when a replacement is invalid", async () => {
-  let current = JSON.stringify(policyFixture());
-  const getPolicy = createReloadingPolicy({
-    policyFile: "/run/config/policy.json",
-    github: { verifyPolicy: async () => {} },
-    readFile: (file) =>
-      file === "/run/config/policy.json" ? current : (secretByPath.get(file) ?? ""),
-    realpath: (file) => file,
-  });
-  await getPolicy();
-  current = "{not-json";
-  await assert.rejects(() => getPolicy(), SyntaxError);
-});
-
-test("rejects duplicated Workspace credential values and aliased paths", async () => {
-  const current = JSON.stringify(policyFixture());
-  const duplicateValue = createReloadingPolicy({
-    policyFile: "/run/config/policy.json",
-    github: { verifyPolicy: async () => {} },
-    readFile: (file) =>
-      file === "/run/config/policy.json" ? current : "same-secret-value-with-at-least-32-bytes",
-    realpath: (file) => file,
-  });
-  await assert.rejects(() => duplicateValue(), /credential values must be unique/);
-
-  const aliasedPath = createReloadingPolicy({
-    policyFile: "/run/config/policy.json",
-    github: { verifyPolicy: async () => {} },
-    readFile: (file) =>
-      file === "/run/config/policy.json" ? current : (secretByPath.get(file) ?? ""),
-    realpath: () => "/run/secrets/same-file",
-  });
-  await assert.rejects(() => aliasedPath(), /resolve to unique/);
+test("rejects duplicated Workspace credential values and aliased paths before listening", async () => {
+  const policy = parsePolicy(policyFixture());
+  const github = { verifyPolicy: async () => {} };
+  await assert.rejects(
+    () =>
+      startBroker({
+        policy,
+        github,
+        readFile: () => "same-secret-value-with-at-least-32-bytes",
+        realpath: (file) => file,
+        port: 0,
+        host: "127.0.0.1",
+      }),
+    /credential values must be unique/,
+  );
+  await assert.rejects(
+    () =>
+      startBroker({
+        policy,
+        github,
+        readFile: (file) => secretByPath.get(file) ?? "",
+        realpath: () => "/run/secrets/same-file",
+        port: 0,
+        host: "127.0.0.1",
+      }),
+    /resolve to unique/,
+  );
 });
 
 test("policy rejects a non-canonical secret path", () => {
@@ -378,7 +345,7 @@ test("accepts only the server and one-shot verification commands", () => {
   assert.throws(() => parseCommand(["--verify-only", "extra"]), /usage/);
 });
 
-test("authenticates against the same credential snapshot that passed uniqueness", async () => {
+test("keeps one verified credential snapshot for the complete server lifetime", async () => {
   const reads = new Map();
   const server = createBrokerServer({
     policy: parsePolicy(policyFixture()),
@@ -401,8 +368,8 @@ test("authenticates against the same credential snapshot that passed uniqueness"
   await once(server, "listening");
   try {
     const address = server.address();
-    const response = await request(`http://127.0.0.1:${address.port}`);
-    assert.equal(response.status, 200);
+    assert.equal((await request(`http://127.0.0.1:${address.port}`)).status, 200);
+    assert.equal((await request(`http://127.0.0.1:${address.port}`)).status, 200);
     assert.equal(reads.get("/run/secrets/workspace-alpha"), 1);
     assert.equal(reads.get("/run/secrets/workspace-beta"), 1);
   } finally {
@@ -411,43 +378,52 @@ test("authenticates against the same credential snapshot that passed uniqueness"
   }
 });
 
-test("concurrent policy verification never shares a stale credential snapshot", async () => {
-  const values = new Map(secretByPath);
-  let releaseVerification;
-  let verificationStarted;
-  const started = new Promise((resolve) => {
-    verificationStarted = resolve;
-  });
-  const blocked = new Promise((resolve) => {
-    releaseVerification = resolve;
-  });
-  const getPolicy = createReloadingPolicy({
-    policyFile: "/run/config/policy.json",
+test("verifies live policy exactly once before serving runtime requests", async () => {
+  let verifies = 0;
+  const server = await startBroker({
+    policy: parsePolicy(policyFixture()),
     github: {
       verifyPolicy: async () => {
-        verificationStarted();
-        await blocked;
+        verifies += 1;
       },
+      mintToken: async (_policy, repositoryId) => ({
+        token: `ghs_synthetic_${repositoryId}`,
+        expires_at: "2030-01-01T00:00:00Z",
+        repository_id: repositoryId,
+      }),
     },
-    readFile: (file) =>
-      file === "/run/config/policy.json"
-        ? JSON.stringify(policyFixture())
-        : (values.get(file) ?? ""),
+    readFile: (file) => secretByPath.get(file) ?? "",
     realpath: (file) => file,
+    port: 0,
+    host: "127.0.0.1",
   });
+  try {
+    const address = server.address();
+    assert.equal(verifies, 1);
+    assert.equal((await request(`http://127.0.0.1:${address.port}`)).status, 200);
+    assert.equal((await request(`http://127.0.0.1:${address.port}`)).status, 200);
+    assert.equal(verifies, 1);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
 
-  const first = getPolicy();
-  await started;
-  values.set("/run/secrets/workspace-alpha", "rotated-alpha-secret-with-at-least-32-bytes");
-  const second = getPolicy();
-  releaseVerification();
-
-  assert.equal(
-    (await first).credentials.get("alpha-team"),
-    "rotated-alpha-secret-with-at-least-32-bytes",
-  );
-  assert.equal(
-    (await second).credentials.get("alpha-team"),
-    "rotated-alpha-secret-with-at-least-32-bytes",
+test("unknown Workspace credentials are denied before any GitHub token call", async () => {
+  let calls = 0;
+  await withServer(
+    async (origin) => {
+      const response = await request(origin, {
+        workspace: "unknown-team",
+        secret: "unknown-secret-value-with-at-least-32-bytes",
+      });
+      assert.equal(response.status, 401);
+      assert.deepEqual(await response.json(), { error: "workspace_unauthorized" });
+      assert.equal(calls, 0);
+    },
+    async () => {
+      calls += 1;
+      throw new Error("must not be called");
+    },
   );
 });

@@ -8,6 +8,7 @@ const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v1";
 const GITHUB_API_VERSION = "2026-03-10";
 const USER_AGENT = "lazurio-github-app-broker/0.1";
 const MAX_BODY_BYTES = 1024;
+const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
 
 function fail(message) {
   throw new Error(message);
@@ -251,52 +252,6 @@ export function createGithubClient({ appId, privateKey, fetchImpl = fetch, now =
   return Object.freeze({ verifyPolicy, mintToken });
 }
 
-export function createReloadingPolicy({
-  policyFile,
-  github,
-  readFile = fs.readFileSync,
-  realpath = fs.realpathSync,
-}) {
-  let acceptedRaw;
-  let acceptedPolicy;
-  let pending;
-
-  return async function getPolicy() {
-    const raw = readFile(policyFile, "utf8");
-    if (acceptedRaw === raw && acceptedPolicy) {
-      return {
-        policy: acceptedPolicy,
-        credentials: snapshotWorkspaceCredentials(acceptedPolicy, { readFile, realpath }),
-      };
-    }
-    if (pending?.raw === raw) {
-      const policy = await pending.promise;
-      return {
-        policy,
-        credentials: snapshotWorkspaceCredentials(policy, { readFile, realpath }),
-      };
-    }
-
-    const promise = (async () => {
-      const candidate = parsePolicy(raw);
-      await github.verifyPolicy(candidate);
-      acceptedRaw = raw;
-      acceptedPolicy = candidate;
-      return candidate;
-    })();
-    pending = { raw, promise };
-    try {
-      const policy = await promise;
-      return {
-        policy,
-        credentials: snapshotWorkspaceCredentials(policy, { readFile, realpath }),
-      };
-    } finally {
-      if (pending?.promise === promise) pending = undefined;
-    }
-  };
-}
-
 function readWorkspaceCredential(file, readFile = fs.readFileSync) {
   const credential = readFile(file, "utf8").trim();
   if (credential.length < 32 || /\s/.test(credential)) fail("Workspace credential is invalid");
@@ -352,19 +307,12 @@ async function readJsonBody(request) {
 
 export function createBrokerServer({
   policy,
-  getPolicy,
   github,
   readFile = fs.readFileSync,
   realpath = fs.realpathSync,
+  credentials = snapshotWorkspaceCredentials(policy, { readFile, realpath }),
 }) {
-  const policySource =
-    getPolicy ??
-    (async () => {
-      return {
-        policy,
-        credentials: snapshotWorkspaceCredentials(policy, { readFile, realpath }),
-      };
-    });
+  const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
 
   const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
@@ -385,16 +333,13 @@ export function createBrokerServer({
     const authorization = request.headers.authorization ?? "";
     const presentedCredential = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     try {
-      const { policy: activePolicy, credentials } = await policySource();
-      const workspace =
-        typeof workspaceId === "string"
-          ? activePolicy.workspaces.find(({ id }) => id === workspaceId)
-          : undefined;
-      if (
-        !workspace ||
-        !presentedCredential ||
-        !secretMatches(presentedCredential, credentials.get(workspace.id) ?? "")
-      ) {
+      const workspace = typeof workspaceId === "string" ? workspaces.get(workspaceId) : undefined;
+      const credentialMatches = secretMatches(
+        presentedCredential,
+        (typeof workspaceId === "string" ? credentials.get(workspaceId) : undefined) ??
+          DUMMY_WORKSPACE_CREDENTIAL,
+      );
+      if (!workspace || !presentedCredential || !credentialMatches) {
         json(response, 401, { error: "workspace_unauthorized" });
         return;
       }
@@ -405,7 +350,7 @@ export function createBrokerServer({
         json(response, 403, { error: "repository_denied" });
         return;
       }
-      json(response, 200, await github.mintToken(activePolicy, repositoryId));
+      json(response, 200, await github.mintToken(policy, repositoryId));
     } catch {
       if (!response.headersSent) json(response, 502, { error: "token_unavailable" });
     }
@@ -418,24 +363,15 @@ export function createBrokerServer({
 
 export async function startBroker({
   policy,
-  getPolicy,
   github,
   readFile = fs.readFileSync,
   realpath = fs.realpathSync,
   port = 8787,
   host = "0.0.0.0",
 }) {
-  const policySource =
-    getPolicy ??
-    (async () => {
-      return {
-        policy,
-        credentials: snapshotWorkspaceCredentials(policy, { readFile, realpath }),
-      };
-    });
-  const initial = await policySource();
-  if (!getPolicy) await github.verifyPolicy(initial.policy);
-  const server = createBrokerServer({ getPolicy: policySource, github, readFile, realpath });
+  const credentials = snapshotWorkspaceCredentials(policy, { readFile, realpath });
+  await github.verifyPolicy(policy);
+  const server = createBrokerServer({ policy, credentials, github, readFile, realpath });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);
@@ -466,12 +402,13 @@ async function main() {
     appId,
     privateKey: fs.readFileSync(privateKeyFile),
   });
-  const getPolicy = createReloadingPolicy({ policyFile, github });
+  const policy = parsePolicy(fs.readFileSync(policyFile, "utf8"));
   if (command.verifyOnly) {
-    await getPolicy();
+    snapshotWorkspaceCredentials(policy, { readFile: fs.readFileSync, realpath: fs.realpathSync });
+    await github.verifyPolicy(policy);
     return;
   }
-  await startBroker({ getPolicy, github, port });
+  await startBroker({ policy, github, port });
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {

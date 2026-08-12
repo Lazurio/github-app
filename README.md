@@ -73,10 +73,11 @@ The response contains the installation token and GitHub expiry timestamp with
 `Cache-Control: no-store`. `GET /health` returns `204` only after startup
 policy verification has succeeded.
 
-The broker rereads the mounted policy before every token request. A changed
-policy is parsed and reverified against GitHub before becoming active; an
-invalid or drifted replacement fails closed while the prior policy is never
-used for that request.
+The broker parses the policy and Workspace credentials once, verifies the exact
+live GitHub installation and only then starts listening. Runtime requests never
+trigger installation-wide GitHub verification. Policy or credential changes
+become active only through a verified service restart; deployment automation
+must recreate the workload whenever either mounted input changes.
 
 Operators can revalidate the same live contract without starting another
 listener:
