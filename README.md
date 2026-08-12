@@ -16,6 +16,7 @@ The broker makes one machine authorization decision:
 ```text
 Workspace id + Workspace credential + repository id
     -> exact deployment policy
+    -> immutable GitHub App id and slug
     -> live GitHub App installation grant
     -> one-repository installation token
 ```

@@ -29,6 +29,11 @@ export function parsePolicy(raw) {
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("policy must be an object");
   if (input.schema_version !== POLICY_SCHEMA) fail("unsupported policy schema");
 
+  const appId = positiveInteger(input.github_app?.id, "github_app.id");
+  const appSlug = input.github_app?.slug;
+  if (typeof appSlug !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,99})$/.test(appSlug)) {
+    fail("github_app.slug is invalid");
+  }
   const ownerId = positiveInteger(input.github_owner?.id, "github_owner.id");
   const ownerLogin = input.github_owner?.login;
   if (typeof ownerLogin !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(ownerLogin)) {
@@ -111,6 +116,7 @@ export function parsePolicy(raw) {
 
   return Object.freeze({
     schema_version: POLICY_SCHEMA,
+    github_app: Object.freeze({ id: appId, slug: appSlug }),
     github_owner: Object.freeze({ id: ownerId, login: ownerLogin }),
     installation_id: installationId,
     installation_permissions: Object.freeze({ ...installationPermissions }),
@@ -156,8 +162,13 @@ export function createGithubClient({ appId, privateKey, fetchImpl = fetch, now =
   }
 
   async function verifyPolicy(policy) {
+    if (String(policy.github_app.id) !== String(appId)) {
+      fail("configured GitHub App id differs from policy");
+    }
     const installation = await request(`/app/installations/${policy.installation_id}`);
     if (
+      installation?.app_id !== policy.github_app.id ||
+      installation?.app_slug !== policy.github_app.slug ||
       installation?.account?.id !== policy.github_owner.id ||
       installation?.account?.login !== policy.github_owner.login ||
       installation?.target_type !== "Organization" ||

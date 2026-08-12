@@ -1,5 +1,9 @@
 {
   "schema_version": "lazurio.github_app_broker.policy.v1",
+  "github_app": {
+    "id": 1234,
+    "slug": "customer-app"
+  },
   "github_owner": {
     "id": 1001,
     "login": "example-organization"

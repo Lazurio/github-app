@@ -19,6 +19,7 @@ const secretByPath = new Map([
 function policyFixture() {
   return {
     schema_version: "lazurio.github_app_broker.policy.v1",
+    github_app: { id: 42, slug: "example-app" },
     github_owner: { id: 1001, login: "example-org" },
     installation_id: 2001,
     installation_permissions: { contents: "write", members: "read", metadata: "read" },
@@ -184,6 +185,8 @@ test("verifies the exact live installation and immutable repository set", async 
     calls.push({ path, method: init.method, body: init.body && JSON.parse(init.body) });
     if (path === "/app/installations/2001" && init.method === "GET") {
       return jsonResponse({
+        app_id: 42,
+        app_slug: "example-app",
         account: { id: 1001, login: "example-org" },
         target_type: "Organization",
         repository_selection: "selected",
@@ -219,6 +222,8 @@ test("rejects live permission expansion even when required contents access remai
   const fetchImpl = async () =>
     jsonResponse({
       account: { id: 1001, login: "example-org" },
+      app_id: 42,
+      app_slug: "example-app",
       target_type: "Organization",
       repository_selection: "selected",
       permissions: {
@@ -230,6 +235,37 @@ test("rejects live permission expansion even when required contents access remai
     });
   const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
   await assert.rejects(() => github.verifyPolicy(policy), /permissions differ from policy/);
+});
+
+test("rejects a different configured or live GitHub App identity", async () => {
+  const policy = parsePolicy(policyFixture());
+  const privateKey = testPrivateKey();
+  const wrongConfiguredApp = createGithubClient({
+    appId: "43",
+    privateKey,
+    fetchImpl: async () => {
+      throw new Error("must not call GitHub for a mismatched configured App");
+    },
+  });
+  await assert.rejects(
+    () => wrongConfiguredApp.verifyPolicy(policy),
+    /configured GitHub App id differs/,
+  );
+
+  const wrongLiveApp = createGithubClient({
+    appId: "42",
+    privateKey,
+    fetchImpl: async () =>
+      jsonResponse({
+        app_id: 42,
+        app_slug: "other-app",
+        account: { id: 1001, login: "example-org" },
+        target_type: "Organization",
+        repository_selection: "selected",
+        permissions: { contents: "write", members: "read", metadata: "read" },
+      }),
+  });
+  await assert.rejects(() => wrongLiveApp.verifyPolicy(policy), /identity, selection or permissions/);
 });
 
 test("mints through repository_ids and rejects an over-scoped token response", async () => {
