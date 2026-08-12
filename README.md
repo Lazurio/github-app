@@ -77,6 +77,18 @@ policy is parsed and reverified against GitHub before becoming active; an
 invalid or drifted replacement fails closed while the prior policy is never
 used for that request.
 
+Operators can revalidate the same live contract without starting another
+listener:
+
+```sh
+node src/broker.mjs --verify-only
+```
+
+The command reads the same mounted policy, App key and Workspace credentials,
+performs the exact live GitHub readback, emits no secret or token, and exits
+non-zero on drift. Deployment automation should run it on every desired-state
+apply in addition to the startup gate.
+
 ## Container build
 
 The Dockerfile deliberately has no floating base-image default:

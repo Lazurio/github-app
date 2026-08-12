@@ -7,6 +7,7 @@ import {
   createBrokerServer,
   createGithubClient,
   createReloadingPolicy,
+  parseCommand,
   parsePolicy,
 } from "../src/broker.mjs";
 
@@ -332,6 +333,13 @@ test("policy rejects a non-canonical secret path", () => {
   const policy = policyFixture();
   policy.workspaces[0].credential_file = "/run/secrets//workspace-alpha";
   assert.throws(() => parsePolicy(policy), /canonical file/);
+});
+
+test("accepts only the server and one-shot verification commands", () => {
+  assert.deepEqual(parseCommand([]), { verifyOnly: false });
+  assert.deepEqual(parseCommand(["--verify-only"]), { verifyOnly: true });
+  assert.throws(() => parseCommand(["--unknown"]), /usage/);
+  assert.throws(() => parseCommand(["--verify-only", "extra"]), /usage/);
 });
 
 test("authenticates against the same credential snapshot that passed uniqueness", async () => {

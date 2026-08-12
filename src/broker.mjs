@@ -432,7 +432,16 @@ export async function startBroker({
   return server;
 }
 
+export function parseCommand(arguments_) {
+  if (arguments_.length === 0) return Object.freeze({ verifyOnly: false });
+  if (arguments_.length === 1 && arguments_[0] === "--verify-only") {
+    return Object.freeze({ verifyOnly: true });
+  }
+  fail("usage: broker.mjs [--verify-only]");
+}
+
 async function main() {
+  const command = parseCommand(process.argv.slice(2));
   const appId = process.env.GITHUB_APP_ID ?? "";
   const privateKeyFile = process.env.GITHUB_APP_PRIVATE_KEY_FILE ?? "";
   const policyFile = process.env.BROKER_POLICY_FILE ?? "";
@@ -447,6 +456,10 @@ async function main() {
     privateKey: fs.readFileSync(privateKeyFile),
   });
   const getPolicy = createReloadingPolicy({ policyFile, github });
+  if (command.verifyOnly) {
+    await getPolicy();
+    return;
+  }
   await startBroker({ getPolicy, github, port });
 }
 
