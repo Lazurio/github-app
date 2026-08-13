@@ -22,7 +22,12 @@ function policyFixture() {
     github_app: { id: 42, slug: "example-app" },
     github_owner: { id: 1001, login: "example-org" },
     installation_id: 2001,
-    installation_permissions: { contents: "write", members: "read", metadata: "read" },
+    installation_permissions: {
+      contents: "write",
+      members: "read",
+      metadata: "read",
+      pull_requests: "write",
+    },
     repositories: [
       { id: 3001, full_name: "example-org/alpha" },
       { id: 3002, full_name: "example-org/beta" },
@@ -161,6 +166,10 @@ test("policy rejects mutable-name drift and ambiguous Workspace credentials", ()
   const duplicateSecret = policyFixture();
   duplicateSecret.workspaces[1].credential_file = duplicateSecret.workspaces[0].credential_file;
   assert.throws(() => parsePolicy(duplicateSecret), /credential files must be unique/);
+
+  const missingPullRequests = policyFixture();
+  delete missingPullRequests.installation_permissions.pull_requests;
+  assert.throws(() => parsePolicy(missingPullRequests), /pull_requests: write/);
 });
 
 function jsonResponse(body, status = 200) {
@@ -190,7 +199,12 @@ test("verifies the exact live installation and immutable repository set", async 
         account: { id: 1001, login: "example-org" },
         target_type: "Organization",
         repository_selection: "selected",
-        permissions: { contents: "write", members: "read", metadata: "read" },
+        permissions: {
+          contents: "write",
+          members: "read",
+          metadata: "read",
+          pull_requests: "write",
+        },
       });
     }
     if (path === "/app/installations/2001/access_tokens" && init.method === "POST") {
@@ -231,6 +245,7 @@ test("rejects live permission expansion even when required contents access remai
         contents: "write",
         members: "read",
         metadata: "read",
+        pull_requests: "write",
       },
     });
   const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
@@ -262,20 +277,29 @@ test("rejects a different configured or live GitHub App identity", async () => {
         account: { id: 1001, login: "example-org" },
         target_type: "Organization",
         repository_selection: "selected",
-        permissions: { contents: "write", members: "read", metadata: "read" },
+        permissions: {
+          contents: "write",
+          members: "read",
+          metadata: "read",
+          pull_requests: "write",
+        },
       }),
   });
   await assert.rejects(() => wrongLiveApp.verifyPolicy(policy), /identity, selection or permissions/);
 });
 
-test("mints through repository_ids and rejects an over-scoped token response", async () => {
+test("mints through repository_ids and rejects under- or over-scoped responses", async () => {
   const policy = parsePolicy(policyFixture());
   const now = 1_700_000_000_000;
-  let responsePermissions = { contents: "write", metadata: "read" };
+  let responsePermissions = {
+    contents: "write",
+    metadata: "read",
+    pull_requests: "write",
+  };
   const fetchImpl = async (_url, init) => {
     assert.deepEqual(JSON.parse(init.body), {
       repository_ids: [3001],
-      permissions: { contents: "write" },
+      permissions: { contents: "write", pull_requests: "write" },
     });
     return jsonResponse({
       token: "ghs_scoped_synthetic_token",
@@ -296,7 +320,18 @@ test("mints through repository_ids and rejects an over-scoped token response", a
     repository_id: 3001,
   });
 
-  responsePermissions = { administration: "write", contents: "write", metadata: "read" };
+  responsePermissions = { contents: "write", metadata: "read" };
+  await assert.rejects(
+    () => github.mintToken(policy, 3001),
+    /outside the requested repository or permission scope/,
+  );
+
+  responsePermissions = {
+    administration: "write",
+    contents: "write",
+    metadata: "read",
+    pull_requests: "write",
+  };
   await assert.rejects(
     () => github.mintToken(policy, 3001),
     /outside the requested repository or permission scope/,
