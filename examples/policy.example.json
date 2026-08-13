@@ -11,6 +11,7 @@
   "installation_id": 2001,
   "installation_permissions": {
     "contents": "write",
+    "pull_requests": "write",
     "metadata": "read"
   },
   "repositories": [
