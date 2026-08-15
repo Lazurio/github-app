@@ -23,6 +23,7 @@ function policyFixture() {
     github_owner: { id: 1001, login: "example-org" },
     installation_id: 2001,
     installation_permissions: {
+      checks: "read",
       contents: "write",
       members: "read",
       metadata: "read",
@@ -170,6 +171,10 @@ test("policy rejects mutable-name drift and ambiguous Workspace credentials", ()
   const missingPullRequests = policyFixture();
   delete missingPullRequests.installation_permissions.pull_requests;
   assert.throws(() => parsePolicy(missingPullRequests), /pull_requests: write/);
+
+  const missingChecks = policyFixture();
+  delete missingChecks.installation_permissions.checks;
+  assert.throws(() => parsePolicy(missingChecks), /checks: read/);
 });
 
 function jsonResponse(body, status = 200) {
@@ -200,6 +205,7 @@ test("verifies the exact live installation and immutable repository set", async 
         target_type: "Organization",
         repository_selection: "selected",
         permissions: {
+          checks: "read",
           contents: "write",
           members: "read",
           metadata: "read",
@@ -242,6 +248,7 @@ test("rejects live permission expansion even when required contents access remai
       repository_selection: "selected",
       permissions: {
         administration: "write",
+        checks: "read",
         contents: "write",
         members: "read",
         metadata: "read",
@@ -278,6 +285,7 @@ test("rejects a different configured or live GitHub App identity", async () => {
         target_type: "Organization",
         repository_selection: "selected",
         permissions: {
+          checks: "read",
           contents: "write",
           members: "read",
           metadata: "read",
@@ -292,6 +300,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
   const policy = parsePolicy(policyFixture());
   const now = 1_700_000_000_000;
   let responsePermissions = {
+    checks: "read",
     contents: "write",
     metadata: "read",
     pull_requests: "write",
@@ -299,7 +308,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
   const fetchImpl = async (_url, init) => {
     assert.deepEqual(JSON.parse(init.body), {
       repository_ids: [3001],
-      permissions: { contents: "write", pull_requests: "write" },
+      permissions: { checks: "read", contents: "write", pull_requests: "write" },
     });
     return jsonResponse({
       token: "ghs_scoped_synthetic_token",
@@ -320,7 +329,17 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     repository_id: 3001,
   });
 
-  responsePermissions = { contents: "write", metadata: "read" };
+  responsePermissions = {
+    contents: "write",
+    metadata: "read",
+    pull_requests: "write",
+  };
+  await assert.rejects(
+    () => github.mintToken(policy, 3001),
+    /outside the requested repository or permission scope/,
+  );
+
+  responsePermissions = { checks: "read", contents: "write", metadata: "read" };
   await assert.rejects(
     () => github.mintToken(policy, 3001),
     /outside the requested repository or permission scope/,
@@ -328,6 +347,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
 
   responsePermissions = {
     administration: "write",
+    checks: "read",
     contents: "write",
     metadata: "read",
     pull_requests: "write",

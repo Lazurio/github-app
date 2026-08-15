@@ -6,9 +6,14 @@ import path from "node:path";
 
 const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v1";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.2";
+const USER_AGENT = "lazurio-github-app-broker/0.3";
 const MAX_BODY_BYTES = 1024;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
+const TOKEN_PERMISSIONS = Object.freeze({
+  checks: "read",
+  contents: "write",
+  pull_requests: "write",
+});
 
 function fail(message) {
   throw new Error(message);
@@ -47,6 +52,7 @@ export function parsePolicy(raw) {
     !installationPermissions ||
     typeof installationPermissions !== "object" ||
     Array.isArray(installationPermissions) ||
+    installationPermissions.checks !== "read" ||
     installationPermissions.contents !== "write" ||
     installationPermissions.pull_requests !== "write" ||
     Object.entries(installationPermissions).some(
@@ -54,7 +60,7 @@ export function parsePolicy(raw) {
     )
   ) {
     fail(
-      "installation_permissions must be exact and include contents: write plus pull_requests: write",
+      "installation_permissions must be exact and include checks: read, contents: write and pull_requests: write",
     );
   }
 
@@ -224,7 +230,7 @@ export function createGithubClient({ appId, privateKey, fetchImpl = fetch, now =
       method: "POST",
       body: {
         repository_ids: [repositoryId],
-        permissions: { contents: "write", pull_requests: "write" },
+        permissions: TOKEN_PERMISSIONS,
       },
     });
     const expiresAt = Date.parse(result?.expires_at ?? "");
@@ -238,11 +244,13 @@ export function createGithubClient({ appId, privateKey, fetchImpl = fetch, now =
       expiresAt > now() + 65 * 60 * 1000 ||
       returnedRepositories.length !== 1 ||
       returnedRepositories[0]?.id !== repositoryId ||
+      returnedPermissions.checks !== "read" ||
       returnedPermissions.contents !== "write" ||
       returnedPermissions.pull_requests !== "write" ||
       Object.entries(returnedPermissions).some(
         ([permission, level]) =>
           !(
+            (permission === "checks" && level === "read") ||
             (permission === "contents" && level === "write") ||
             (permission === "pull_requests" && level === "write") ||
             (permission === "metadata" && level === "read")
