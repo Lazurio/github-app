@@ -9,9 +9,10 @@ dependency-light and customer-neutral.
 2. Authorization uses immutable Workspace and GitHub repository ids. Provider
    names may be asserted but never select a different object after a rename.
 3. The App private key never leaves the broker workload.
-4. A token is limited to one repository and exactly `checks: read`,
-   `contents: write` and `pull_requests: write`, and expires on GitHub's
-   installation-token schedule.
+4. A token is limited to one repository and exactly `actions: read`,
+   `checks: read`, `contents: write` and `pull_requests: write` (plus GitHub's
+   automatic `metadata: read`), and expires on GitHub's installation-token
+   schedule.
 5. Workspace credentials and installation tokens are never logged, committed,
    stored in Git configuration or persisted by this service.
 6. The broker authorizes a Workspace and repository, never a browser user.

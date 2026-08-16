@@ -10,6 +10,7 @@
   },
   "installation_id": 2001,
   "installation_permissions": {
+    "actions": "read",
     "checks": "read",
     "contents": "write",
     "pull_requests": "write",

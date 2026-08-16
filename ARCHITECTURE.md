@@ -24,12 +24,13 @@ not listen if any assertion differs. The mounted policy is read at every token
 request; a changed file is parsed and live-verified before it replaces the
 last accepted policy, so a Workspace allowlist removal applies on the next
 request without restarting the process. Every token request still asks GitHub
-to mint a new one-repository token with exactly `checks: read`,
-`contents: write` and `pull_requests: write`; removal of a live repository
-grant therefore fails the next issuance without waiting for a local cache.
-Read-only Checks access lets the standard GitHub CLI render check runs in a
-pull-request view. It does not grant permission to create, update or rerun a
-check.
+to mint a new one-repository token with exactly `actions: read`,
+`checks: read`, `contents: write` and `pull_requests: write`; removal of a live
+repository grant therefore fails the next issuance without waiting for a local
+cache.
+Read-only Checks and Actions access lets the standard GitHub CLI render check
+runs and their workflow-run context in a pull-request view. Neither permission
+grants authority to create, update, rerun or cancel a check or workflow run.
 
 ## What this service does not do
 
