@@ -3,8 +3,8 @@
 Public, auditable source for the small credential boundary used by Lazurio
 Team Workspaces. The broker exchanges an authenticated Workspace request for a
 short-lived GitHub App installation token restricted to one immutable
-repository id and exactly `checks: read`, `contents: write` plus
-`pull_requests: write`.
+repository id and exactly `actions: read`, `checks: read`, `contents: write`
+plus `pull_requests: write`.
 
 The source is public so customers can review what handles the App private key.
 Public source alone is not deployment proof: an operator must also record the
@@ -27,9 +27,10 @@ Workspace id + Workspace credential + repository id
 - The GitHub App private key exists only in the broker workload.
 - A Workspace credential authorizes only that Workspace's configured
   repository ids.
-- A minted token can read check runs, change repository contents and create or
-  update pull requests only for that one repository; it receives no check
-  write, administration, membership or cross-repository authority.
+- A minted token can read check and workflow-run context, change repository
+  contents and create or update pull requests only for that one repository; it
+  receives no Actions or Checks write, administration, membership or
+  cross-repository authority.
 - Repository names are assertions for human readback; immutable GitHub ids are
   the authorization keys.
 - Installation tokens are neither logged nor written to disk by this service.
