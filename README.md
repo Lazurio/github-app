@@ -137,6 +137,12 @@ The adapter has four command classes:
    scoped token, and invoke real `gh` with the token only in the child process
    environment.
 
+Current T3 PR operations explicitly pass `--hostname github.com` to official
+`gh`. The adapter accepts only that exact host on repository commands; the
+discovery/viewer envelopes remain exact, a missing value or any other host is
+denied, and the argument is forwarded unchanged rather than interpreted as a
+second authority.
+
 The host-level authenticated indicator means only that the broker accepted a
 fresh proof for the first deterministic repository in the validated Team
 policy. It is not an Organization-wide capability claim. Every actual command

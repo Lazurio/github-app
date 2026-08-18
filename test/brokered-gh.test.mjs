@@ -78,6 +78,21 @@ test("accepts only the exact T3 discovery and viewer envelopes", () => {
   assert.equal(classifyGhCommand(["pr", "list", "--help"], environment), "local");
   assert.equal(classifyGhCommand(["pr", "list"], environment), "repository");
   assert.equal(
+    classifyGhCommand(["api", "graphql", "--hostname", "github.com", "--input", "-"], environment),
+    "repository",
+  );
+  assert.equal(
+    classifyGhCommand(["pr", "view", "1", "--hostname=github.com"], environment),
+    "repository",
+  );
+  for (const args of [
+    ["api", "graphql", "--hostname"],
+    ["api", "graphql", "--hostname", "github.example"],
+    ["api", "graphql", "--hostname=github.example"],
+  ]) {
+    assert.equal(classifyGhCommand(args, environment), "denied", args.join(" "));
+  }
+  assert.equal(
     classifyGhCommand(["pr", "view", "https://github.example/Example/Alpha/pull/1"], environment),
     "denied",
   );
@@ -178,7 +193,7 @@ test("the exact viewer probe reports the machine actor only after a live proof",
 test("repository operations resolve one exact HTTPS checkout and pass only env-local token", async () => {
   let child;
   const exitCode = await runBrokeredGh({
-    args: ["pr", "list", "--repo", "github.com/Example/Alpha"],
+    args: ["pr", "list", "--repo", "github.com/Example/Alpha", "--hostname", "github.com"],
     environment: {
       ...environment,
       GITHUB_TOKEN: "ambient-personal-token",
@@ -205,7 +220,14 @@ test("repository operations resolve one exact HTTPS checkout and pass only env-l
     },
   });
   assert.equal(exitCode, 0);
-  assert.deepEqual(child.args, ["pr", "list", "--repo", "github.com/Example/Alpha"]);
+  assert.deepEqual(child.args, [
+    "pr",
+    "list",
+    "--repo",
+    "github.com/Example/Alpha",
+    "--hostname",
+    "github.com",
+  ]);
   assert.equal(child.args.includes(TOKEN), false);
   assert.equal(child.environment.GH_TOKEN, TOKEN);
   assert.equal(child.environment.GITHUB_TOKEN, undefined);

@@ -48,12 +48,22 @@ function exactArgs(actual, expected) {
 
 function hasForbiddenHostOverride(args, environment) {
   if (environment.GH_HOST && environment.GH_HOST !== "github.com") return true;
-  return args.some(
-    (argument) =>
-      argument === "--hostname" ||
-      argument.startsWith("--hostname=") ||
-      (/^https?:\/\//.test(argument) && !/^https:\/\/github\.com(?:\/|$)/.test(argument)),
-  );
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--hostname") {
+      if (args[index + 1] !== "github.com") return true;
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--hostname=")) {
+      if (argument.slice("--hostname=".length) !== "github.com") return true;
+      continue;
+    }
+    if (/^https?:\/\//.test(argument) && !/^https:\/\/github\.com(?:\/|$)/.test(argument)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function classifyGhCommand(args, environment = process.env) {
