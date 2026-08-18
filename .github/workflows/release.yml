@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 name: Lazurio for GitHub Release
 
 on:
@@ -104,9 +105,26 @@ jobs:
             SOURCE_DATE_EPOCH=${{ steps.source.outputs.source_date_epoch }}
           labels: |
             org.opencontainers.image.created=${{ steps.source.outputs.source_date_iso }}
+            org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
             org.opencontainers.image.source=https://github.com/Lazurio/github-app
             org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+
+      - name: Verify the published license payload
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE@$IMAGE_DIGEST"
+          test "$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' \
+            "$IMAGE@$IMAGE_DIGEST")" = "Apache-2.0"
+          docker run --rm --entrypoint sh "$IMAGE@$IMAGE_DIGEST" -eu -c '
+            test "$(sha256sum /usr/share/licenses/lazurio-github-app/LICENSE | cut -d" " -f1)" = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+            test "$(sha256sum /usr/share/licenses/lazurio-github-app/third-party/github-cli/LICENSE | cut -d" " -f1)" = "6da4adc42392c8485e40b4251c7e332fc3352df1947c9ffade71dd60b14a7a4f"
+            test -s /usr/share/licenses/lazurio-github-app/THIRD_PARTY_NOTICES.md
+          '
 
       - id: attest
         name: Attest the published OCI digest
@@ -128,6 +146,9 @@ jobs:
           set -euo pipefail
           mkdir -p release
           test -f "$ATTESTATION_BUNDLE"
+          install -m 0644 LICENSE release/LICENSE
+          install -m 0644 THIRD_PARTY_NOTICES.md release/THIRD_PARTY_NOTICES.md
+          install -m 0644 third_party/github-cli/LICENSE release/github-cli-MIT-LICENSE.txt
           install -m 0644 "$ATTESTATION_BUNDLE" release/attestation.jsonl
           printf '%s\n' "$BUILD_METADATA" | jq --sort-keys . > release/build-metadata.json
           docker buildx imagetools inspect "$IMAGE@$IMAGE_DIGEST" \
@@ -156,7 +177,10 @@ jobs:
                 provenance: "provenance.slsa.json",
                 build_metadata: "build-metadata.json",
                 attestation_bundle: "attestation.jsonl",
-                checksums: "SHA256SUMS"
+                checksums: "SHA256SUMS",
+                license: "LICENSE",
+                third_party_notices: "THIRD_PARTY_NOTICES.md",
+                github_cli_license: "github-cli-MIT-LICENSE.txt"
               },
               compatibility: {
                 t3_code: "lazurio-pilot-prestable-20260817.1",
@@ -177,6 +201,8 @@ jobs:
              "- Source: `\($source)`\n" +
              "- OCI image: `\($image)@\($digest)`\n" +
              "- GitHub attestation: \($attestation)\n\n" +
+             "Licensed under Apache-2.0; the release includes the complete license bundle and the redistributed GitHub CLI MIT license.\n\n" +
+             "Lazurio for GitHub is independent and is not affiliated with, sponsored by, or endorsed by GitHub, Inc.\n\n" +
              "The image has no mutable `latest` tag and contains no customer policy or secret.\n"' \
             > release/RELEASE_NOTES.md
 
@@ -184,9 +210,12 @@ jobs:
             cd release
             sha256sum \
               CHANGELOG.md \
+              LICENSE \
               RELEASE_NOTES.md \
+              THIRD_PARTY_NOTICES.md \
               attestation.jsonl \
               build-metadata.json \
+              github-cli-MIT-LICENSE.txt \
               provenance.slsa.json \
               release-evidence.json \
               sbom.spdx.json > SHA256SUMS
@@ -205,10 +234,13 @@ jobs:
             --notes-file release/RELEASE_NOTES.md \
             --latest=false \
             release/CHANGELOG.md \
+            release/LICENSE \
             release/RELEASE_NOTES.md \
             release/SHA256SUMS \
+            release/THIRD_PARTY_NOTICES.md \
             release/attestation.jsonl \
             release/build-metadata.json \
+            release/github-cli-MIT-LICENSE.txt \
             release/provenance.slsa.json \
             release/release-evidence.json \
             release/sbom.spdx.json

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import fs from "node:fs";
 
 const BROKER_ORIGIN = "http://github-token-broker:8787";
