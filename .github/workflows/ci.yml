@@ -18,3 +18,32 @@ jobs:
           node-version: "24.19.0"
       - run: npm test
       - run: npm run check
+
+  image:
+    name: Reproducible OCI image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build the exact source twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          base='node:24.19.0-bookworm@sha256:934240a162082fd8b8a2f90cd5114446443f1eba1c5378f6687167ca405e6584'
+
+          for attempt in one two; do
+            docker buildx build \
+              --build-arg "NODE_RUNTIME_IMAGE=$base" \
+              --build-arg "SOURCE_DATE_EPOCH=$source_date_epoch" \
+              --metadata-file "/tmp/$attempt.json" \
+              --no-cache \
+              --output "type=oci,dest=/tmp/$attempt.tar,rewrite-timestamp=true" \
+              --platform linux/amd64 \
+              --pull \
+              .
+          done
+
+          one="$(jq -er '."containerimage.digest"' /tmp/one.json)"
+          two="$(jq -er '."containerimage.digest"' /tmp/two.json)"
+          test "$one" = "$two"
