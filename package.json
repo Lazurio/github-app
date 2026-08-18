@@ -1,13 +1,19 @@
 {
   "name": "@lazurio/github-app-broker",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lazurio/github-app.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
-    "check": "node --check src/broker.mjs && node --check adapter/broker-client.mjs && node --check adapter/brokered-gh.mjs && node --check test/broker.test.mjs && node --check test/brokered-gh.test.mjs",
+    "check": "npm run license:check && node --check src/broker.mjs && node --check adapter/broker-client.mjs && node --check adapter/brokered-gh.mjs && node --check scripts/check-licenses.mjs && node --check test/broker.test.mjs && node --check test/brokered-gh.test.mjs",
+    "license:check": "node scripts/check-licenses.mjs",
     "test": "node --test"
   }
 }

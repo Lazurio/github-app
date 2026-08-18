@@ -3,3 +3,8 @@
 !src/**
 !adapter/
 !adapter/**
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!third_party/
+!third_party/github-cli/
+!third_party/github-cli/LICENSE

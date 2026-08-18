@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 name: CI
 
 on:
@@ -47,3 +48,20 @@ jobs:
           one="$(jq -er '."containerimage.digest"' /tmp/one.json)"
           two="$(jq -er '."containerimage.digest"' /tmp/two.json)"
           test "$one" = "$two"
+
+          docker buildx build \
+            --build-arg "NODE_RUNTIME_IMAGE=$base" \
+            --build-arg "SOURCE_DATE_EPOCH=$source_date_epoch" \
+            --load \
+            --platform linux/amd64 \
+            --pull \
+            --tag lazurio-github-app-license-check:ci \
+            .
+          test "$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' \
+            lazurio-github-app-license-check:ci)" = "Apache-2.0"
+          docker run --rm --entrypoint sh lazurio-github-app-license-check:ci -eu -c '
+            test "$(sha256sum /usr/share/licenses/lazurio-github-app/LICENSE | cut -d" " -f1)" = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+            test "$(sha256sum /usr/share/licenses/lazurio-github-app/third-party/github-cli/LICENSE | cut -d" " -f1)" = "6da4adc42392c8485e40b4251c7e332fc3352df1947c9ffade71dd60b14a7a4f"
+            test -s /usr/share/licenses/lazurio-github-app/THIRD_PARTY_NOTICES.md
+          '

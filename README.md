@@ -1,10 +1,15 @@
 # Lazurio for GitHub broker
 
-Public, auditable source for the small credential boundary used by Lazurio
-Team Workspaces. The broker exchanges an authenticated Workspace request for a
-short-lived GitHub App installation token restricted to one immutable
-repository id and exactly `actions: read`, `checks: read`, `contents: write`
-plus `pull_requests: write`.
+Open-source, publicly auditable source for the small credential boundary used
+by Lazurio Team Workspaces. The broker exchanges an authenticated Workspace
+request for a short-lived GitHub App installation token restricted to one
+immutable repository id and exactly `actions: read`, `checks: read`,
+`contents: write` plus `pull_requests: write`.
+
+Lazurio for GitHub is an independent project. It is not affiliated with,
+sponsored by, or endorsed by GitHub, Inc. GitHub and GitHub CLI are trademarks
+of GitHub, Inc.; their names are used only to identify compatibility and
+provenance.
 
 The source is public so customers can review what handles the App private key.
 Public source alone is not deployment proof: an operator must also record the
@@ -113,8 +118,8 @@ docker build \
 
 Operators must pin the complete image reference and attest the resulting image
 id. No customer policy, secret or App credential is baked into the image.
-The committed `.dockerignore` sends only the broker `src/` and reusable
-`adapter/` as build-context payload.
+The committed `.dockerignore` sends only the broker `src/`, reusable `adapter/`
+and the required license bundle as build-context payload.
 
 ## Brokered GitHub CLI adapter
 
@@ -168,7 +173,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.5.0` |
+| Adapter | `0.5.1` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
 before deployment. A proven user-only GraphQL query is a separate minimal T3
@@ -182,6 +187,15 @@ or OCI tag, publishes only `ghcr.io/lazurio/github-app:<version>` (never
 `latest`), attaches SBOM/provenance/attestation evidence, and creates the
 matching public GitHub Release. Consumers pin the resulting OCI digest, not
 the mutable tag.
+
+## License and third-party software
+
+Lazurio for GitHub is licensed under the
+[Apache License 2.0](./LICENSE). The OCI image carries this license and the
+[third-party notices](./THIRD_PARTY_NOTICES.md), including the unmodified MIT
+License for the pinned official GitHub CLI 2.97.0 distribution. Release assets
+repeat the same license bundle alongside checksums, SBOM, provenance and the
+GitHub attestation.
 
 ## Security
 
