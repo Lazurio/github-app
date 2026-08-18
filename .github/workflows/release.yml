@@ -27,6 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
+      artifact-metadata: write
       attestations: write
       contents: write
       id-token: write
@@ -109,7 +110,7 @@ jobs:
 
       - id: attest
         name: Attest the published OCI digest
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
