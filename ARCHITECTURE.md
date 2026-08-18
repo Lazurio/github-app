@@ -60,3 +60,38 @@ continue after the browser disconnects.
 Runtime evidence must identify the public source commit, the pinned base image,
 the built image id and the active policy digest. Evidence contains no secret
 values.
+
+## Brokered `gh` compatibility boundary
+
+Hosted Team Workspaces consume the adapter from the same immutable public
+release but do not receive the App private key. Their only secret is the
+separate credential for their exact Workspace broker identity.
+
+The adapter is a deny-first launcher around the official GitHub CLI, not a
+GitHub API proxy. A repository command must resolve one HTTPS GitHub checkout
+or one matching `--repo` selector, obtain a fresh token through `/v1/token`,
+and then run the real CLI. Installation tokens exist only in the child
+environment and are never cached, rendered or written to GitHub CLI config.
+The official CLI remains responsible for pull requests, REST and GraphQL.
+
+T3 Code performs two host-level discovery calls that are not repository API
+operations. The adapter recognizes only their exact argument envelopes:
+
+- `gh auth status --json hosts` performs a live token proof for the first
+  deterministic repository in the validated Team policy, discards the token,
+  and emits the official JSON host shape for `lazurio-for-github[bot]`;
+- `gh api user --jq .login` performs the same proof and emits that machine
+  actor without calling GitHub's user endpoint.
+
+A failed proof returns the official unauthenticated host shape and a non-zero
+exit. The result is deliberately not cached, so repository or installation
+revocation affects the next discovery and operation without restarting the
+Workspace. This host signal never substitutes for per-repository
+authorization.
+
+Credential management, `gh config`, aliases, extensions, host overrides and
+multi-repository search remain unavailable. The isolated config directory is
+root-owned and read-only; pager, browser and editor inheritance is removed.
+If a future pinned T3 release requires a user-only GraphQL field unsupported
+by an installation token, the adapter fails visibly. Such evidence may justify
+a separate bounded T3 compatibility change, never request rewriting here.

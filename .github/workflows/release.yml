@@ -1,0 +1,214 @@
+name: Lazurio for GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable semantic-version tag to publish
+        required: true
+        type: string
+      expected_source_sha:
+        description: Exact 40-character source commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: none
+
+concurrency:
+  group: lazurio-github-app-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish immutable broker and adapter image
+    if: github.repository == 'Lazurio/github-app'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    env:
+      IMAGE: ghcr.io/lazurio/github-app
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      SOURCE_SHA: ${{ inputs.expected_source_sha }}
+    steps:
+      - id: source
+        name: Fetch and verify the exact release source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+
+          git init .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch --filter=blob:none --no-tags origin "$GITHUB_REF"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "v$(node -p 'require("./package.json").version')" = "$RELEASE_TAG"
+
+          git fetch --filter=blob:none --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main
+
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
+          echo "source_date_iso=$(date -u -d "@$source_date_epoch" +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse an existing release or image tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $RELEASE_TAG already exists." >&2
+            exit 1
+          fi
+          if docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "OCI tag $IMAGE:$RELEASE_TAG already exists and will not be overwritten." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - id: build
+        name: Build and publish the immutable image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            NODE_RUNTIME_IMAGE=node:24.19.0-bookworm@sha256:934240a162082fd8b8a2f90cd5114446443f1eba1c5378f6687167ca405e6584
+            SOURCE_DATE_EPOCH=${{ steps.source.outputs.source_date_epoch }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.source.outputs.source_date_iso }}
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.source=https://github.com/Lazurio/github-app
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+
+      - id: attest
+        name: Attest the published OCI digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Assemble immutable release evidence
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          test -f "$ATTESTATION_BUNDLE"
+          install -m 0644 "$ATTESTATION_BUNDLE" release/attestation.jsonl
+          printf '%s\n' "$BUILD_METADATA" | jq --sort-keys . > release/build-metadata.json
+          docker buildx imagetools inspect "$IMAGE@$IMAGE_DIGEST" \
+            --format '{{ json .SBOM }}' | jq --sort-keys . > release/sbom.spdx.json
+          docker buildx imagetools inspect "$IMAGE@$IMAGE_DIGEST" \
+            --format '{{ json .Provenance }}' | jq --sort-keys . > release/provenance.slsa.json
+          git log --no-merges -n 50 --pretty='format:- %s (%h)' "$SOURCE_SHA" > release/CHANGELOG.md
+
+          jq -n --sort-keys \
+            --arg repository "https://github.com/$GITHUB_REPOSITORY" \
+            --arg source "$SOURCE_SHA" \
+            --arg tag "$RELEASE_TAG" \
+            --arg image "$IMAGE" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg attestation "$ATTESTATION_URL" \
+            --arg run "$RUN_URL" \
+            '{
+              schema_version: "lazurio.github_app.release.v1",
+              source: {repository: $repository, commit: $source, tag: $tag},
+              artifact: {
+                image: $image,
+                digest: $digest,
+                adapter_path: "/opt/lazurio/github-app/adapter",
+                broker_path: "/opt/lazurio/github-app/src/broker.mjs",
+                sbom: "sbom.spdx.json",
+                provenance: "provenance.slsa.json",
+                build_metadata: "build-metadata.json",
+                attestation_bundle: "attestation.jsonl",
+                checksums: "SHA256SUMS"
+              },
+              compatibility: {
+                t3_code: "lazurio-pilot-prestable-20260817.1",
+                github_cli: "2.97.0",
+                node: "24.19.0"
+              },
+              validation: {workflow_run: $run, attestation: $attestation}
+            }' > release/release-evidence.json
+
+          jq -nr \
+            --arg tag "$RELEASE_TAG" \
+            --arg source "$SOURCE_SHA" \
+            --arg image "$IMAGE" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg attestation "$ATTESTATION_URL" \
+            '"# Lazurio for GitHub \($tag)\n\n" +
+             "Immutable broker and brokered-gh adapter release.\n\n" +
+             "- Source: `\($source)`\n" +
+             "- OCI image: `\($image)@\($digest)`\n" +
+             "- GitHub attestation: \($attestation)\n\n" +
+             "The image has no mutable `latest` tag and contains no customer policy or secret.\n"' \
+            > release/RELEASE_NOTES.md
+
+          (
+            cd release
+            sha256sum \
+              CHANGELOG.md \
+              RELEASE_NOTES.md \
+              attestation.jsonl \
+              build-metadata.json \
+              provenance.slsa.json \
+              release-evidence.json \
+              sbom.spdx.json > SHA256SUMS
+          )
+
+      - name: Publish the matching GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Lazurio for GitHub $RELEASE_TAG" \
+            --notes-file release/RELEASE_NOTES.md \
+            --latest=false \
+            release/CHANGELOG.md \
+            release/RELEASE_NOTES.md \
+            release/SHA256SUMS \
+            release/attestation.jsonl \
+            release/build-metadata.json \
+            release/provenance.slsa.json \
+            release/release-evidence.json \
+            release/sbom.spdx.json

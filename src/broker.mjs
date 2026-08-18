@@ -6,7 +6,7 @@ import path from "node:path";
 
 const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v1";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.4";
+const USER_AGENT = "lazurio-github-app-broker/0.5";
 const MAX_BODY_BYTES = 1024;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
 const TOKEN_PERMISSIONS = Object.freeze({

@@ -10,6 +10,11 @@ The source is public so customers can review what handles the App private key.
 Public source alone is not deployment proof: an operator must also record the
 exact source commit, immutable runtime image and deployment attestation.
 
+The same immutable image also carries the small `brokered-gh` adapter used by
+Hosted Team Workspaces. The adapter keeps the official GitHub CLI as the only
+GitHub API implementation while replacing persistent human CLI credentials
+with a fresh, one-repository installation token for each operation.
+
 ## Trust boundary
 
 The broker makes one machine authorization decision:
@@ -108,7 +113,75 @@ docker build \
 
 Operators must pin the complete image reference and attest the resulting image
 id. No customer policy, secret or App credential is baked into the image.
-The committed `.dockerignore` sends only `src/` as build context input.
+The committed `.dockerignore` sends only the broker `src/` and reusable
+`adapter/` as build-context payload.
+
+## Brokered GitHub CLI adapter
+
+The reusable adapter is shipped in the image at
+`/opt/lazurio/github-app/adapter`. A Workspace image copies the two JavaScript
+files from an exact OCI digest, installs the official `gh` binary separately
+as `/usr/local/libexec/lazurio/gh-real`, creates the root-owned read-only
+directory `/usr/local/share/lazurio/gh-config`, and exposes
+`adapter/brokered-gh.mjs` as `gh`.
+
+The adapter has four command classes:
+
+1. local help/version invokes real `gh` without any token;
+2. exactly `gh auth status --json hosts` and `gh api user --jq .login`
+   perform an uncached live broker proof and report the truthful machine actor
+   `lazurio-for-github[bot]`;
+3. all other `auth`, `config`, `alias`, `extension`, host override and
+   cross-repository `search` surfaces fail closed; and
+4. repository commands resolve one exact approved repository, mint a fresh
+   scoped token, and invoke real `gh` with the token only in the child process
+   environment.
+
+Current T3 PR operations explicitly pass `--hostname github.com` to official
+`gh`. The adapter accepts only that exact host on repository commands; the
+discovery/viewer envelopes remain exact, a missing value or any other host is
+denied, and the argument is forwarded unchanged rather than interpreted as a
+second authority.
+
+The host-level authenticated indicator means only that the broker accepted a
+fresh proof for the first deterministic repository in the validated Team
+policy. It is not an Organization-wide capability claim. Every actual command
+resolves and authorizes its own repository again.
+
+Required Workspace environment:
+
+- `GITHUB_REPOSITORY_POLICY_JSON`: exact `OWNER/REPO` to immutable repository
+  id mapping;
+- `GITHUB_TOKEN_BROKER_URL=http://github-token-broker:8787`;
+- `GITHUB_BROKER_WORKSPACE_ID`: immutable lowercase Workspace id; and
+- `GITHUB_BROKER_CLIENT_CREDENTIAL_FILE=/run/secrets/github_broker_client_token`.
+
+The adapter does not persist `hosts.yml`, a PAT or an installation token. It
+forces `GH_PAGER=cat`, removes browser/editor/pager overrides, uses an isolated
+read-only `GH_CONFIG_DIR`, denies multi-repository search, and never rewrites a
+REST or GraphQL request.
+
+### Compatibility matrix
+
+| Component | Validated version |
+| --- | --- |
+| Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
+| GitHub CLI | `2.97.0` |
+| Node.js | `24.19.0` |
+| Adapter | `0.5.0` |
+
+Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
+before deployment. A proven user-only GraphQL query is a separate minimal T3
+review gate; the adapter must not disguise it.
+
+## Immutable releases
+
+The manual `Lazurio for GitHub Release` workflow accepts only an existing
+semantic-version tag and its exact source SHA. It refuses an existing Release
+or OCI tag, publishes only `ghcr.io/lazurio/github-app:<version>` (never
+`latest`), attaches SBOM/provenance/attestation evidence, and creates the
+matching public GitHub Release. Consumers pin the resulting OCI digest, not
+the mutable tag.
 
 ## Security
 
