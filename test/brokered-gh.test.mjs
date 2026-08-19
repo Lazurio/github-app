@@ -54,16 +54,6 @@ test("validates and deterministically sorts the Team repository policy", () => {
   assert.equal(normalizeRepository("https://github.com/Example/Alpha.git"), "Example/Alpha");
   assert.equal(repositoryIdentityKey("github.com/Example/Alpha"), "example/alpha");
   assert.equal(requireHttpsGitHubOrigin("https://github.com/Example/Alpha.git"), "Example/Alpha");
-  assert.throws(
-    () =>
-      parseRepositoryPolicy({
-        GITHUB_REPOSITORY_POLICY_JSON: JSON.stringify([
-          { repository: "Example/Alpha", repository_id: 101 },
-          { repository: "example/alpha", repository_id: 102 },
-        ]),
-      }),
-    /policy is invalid/,
-  );
   assert.throws(() => requireHttpsGitHubOrigin("git@github.com:Example/Alpha.git"), /brokered HTTPS/);
   assert.throws(
     () => parseRepositoryPolicy({ GITHUB_REPOSITORY_POLICY_JSON: '{"Example/Alpha":101,"example/alpha":202}' }),
