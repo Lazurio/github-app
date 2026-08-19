@@ -6,6 +6,7 @@ import {
   firstPolicyRepository,
   normalizeRepository,
   parseRepositoryPolicy,
+  repositoryIdentityKey,
   requestGitHubAppToken,
   requireHttpsGitHubOrigin,
 } from "../adapter/broker-client.mjs";
@@ -51,7 +52,18 @@ test("validates and deterministically sorts the Team repository policy", () => {
   ]);
   assert.equal(firstPolicyRepository(environment), "Example/Alpha");
   assert.equal(normalizeRepository("https://github.com/Example/Alpha.git"), "Example/Alpha");
+  assert.equal(repositoryIdentityKey("github.com/Example/Alpha"), "example/alpha");
   assert.equal(requireHttpsGitHubOrigin("https://github.com/Example/Alpha.git"), "Example/Alpha");
+  assert.throws(
+    () =>
+      parseRepositoryPolicy({
+        GITHUB_REPOSITORY_POLICY_JSON: JSON.stringify([
+          { repository: "Example/Alpha", repository_id: 101 },
+          { repository: "example/alpha", repository_id: 102 },
+        ]),
+      }),
+    /policy is invalid/,
+  );
   assert.throws(() => requireHttpsGitHubOrigin("git@github.com:Example/Alpha.git"), /brokered HTTPS/);
   assert.throws(
     () => parseRepositoryPolicy({ GITHUB_REPOSITORY_POLICY_JSON: '{"Example/Alpha":101,"example/alpha":202}' }),
@@ -102,7 +114,7 @@ test("accepts only the exact T3 discovery and viewer envelopes", () => {
 test("requests one fresh repo-scoped token without exposing the Workspace credential", async () => {
   let captured;
   const result = await requestGitHubAppToken({
-    repository: "Example/Alpha",
+    repository: "example/alpha",
     environment,
     readFile: () => "workspace-credential-with-at-least-32-bytes",
     fetchImpl: async (url, options) => {
@@ -191,10 +203,10 @@ test("the exact viewer probe reports the machine actor only after a live proof",
   assert.deepEqual(stdout, [`${HOSTED_GITHUB_ACTOR}\n`]);
 });
 
-test("repository operations resolve one exact HTTPS checkout and pass only env-local token", async () => {
+test("repository operations accept T3 lowercase identity and pass only an env-local token", async () => {
   let child;
   const exitCode = await runBrokeredGh({
-    args: ["pr", "list", "--repo", "github.com/Example/Alpha", "--hostname", "github.com"],
+    args: ["pr", "list", "--repo", "github.com/example/alpha", "--hostname", "github.com"],
     environment: {
       ...environment,
       GITHUB_TOKEN: "ambient-personal-token",
@@ -225,7 +237,7 @@ test("repository operations resolve one exact HTTPS checkout and pass only env-l
     "pr",
     "list",
     "--repo",
-    "github.com/Example/Alpha",
+    "github.com/example/alpha",
     "--hostname",
     "github.com",
   ]);
@@ -290,6 +302,14 @@ test("repo selection, policy and origin disagreements fail closed", () => {
   assert.equal(
     resolveGhRepository({
       args: ["pr", "list", "--repo=Example/Alpha"],
+      environment: {},
+      readOrigin: () => "https://github.com/Example/Alpha.git",
+    }),
+    "Example/Alpha",
+  );
+  assert.equal(
+    resolveGhRepository({
+      args: ["pr", "view", "26", "--repo=github.com/example/alpha"],
       environment: {},
       readOrigin: () => "https://github.com/Example/Alpha.git",
     }),
