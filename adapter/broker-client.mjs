@@ -22,6 +22,11 @@ export function normalizeRepository(value) {
   return coordinate;
 }
 
+/** GitHub owner and repository names identify the same resource regardless of letter case. */
+export function repositoryIdentityKey(value) {
+  return normalizeRepository(value).toLowerCase();
+}
+
 export function requireHttpsGitHubOrigin(value) {
   const candidate = String(value ?? "").trim();
   if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/.test(candidate)) {
@@ -54,7 +59,8 @@ export function parseRepositoryPolicy(environment = process.env) {
   });
   if (entries.length === 0) fail("Team repository policy is invalid");
   if (
-    new Set(entries.map(({ repository }) => repository.toLowerCase())).size !== entries.length ||
+    new Set(entries.map(({ repository }) => repositoryIdentityKey(repository))).size !==
+      entries.length ||
     new Set(entries.map(({ repositoryId }) => repositoryId)).size !== entries.length
   ) {
     fail("Team repository policy is invalid");
@@ -93,7 +99,10 @@ export async function requestGitHubAppToken({
 }) {
   const coordinate = normalizeRepository(repository);
   const policy = parseRepositoryPolicy(environment);
-  const policyEntry = policy.find((entry) => entry.repository === coordinate);
+  const coordinateKey = repositoryIdentityKey(coordinate);
+  const policyEntry = policy.find(
+    (entry) => repositoryIdentityKey(entry.repository) === coordinateKey,
+  );
   if (!policyEntry) fail("repository is outside the Team Workspace policy");
   const workspaceId = requireBrokerRuntime(environment);
 

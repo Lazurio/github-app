@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import {
   firstPolicyRepository,
   normalizeRepository,
+  repositoryIdentityKey,
   requestGitHubAppToken,
   requireHttpsGitHubOrigin,
 } from "./broker-client.mjs";
@@ -104,7 +105,9 @@ function explicitRepository(args, environment) {
       continue;
     }
     const parsed = normalizeRepository(value);
-    if (result && result !== parsed) fail("gh repository selectors disagree");
+    if (result && repositoryIdentityKey(result) !== repositoryIdentityKey(parsed)) {
+      fail("gh repository selectors disagree");
+    }
     result = parsed;
   }
   return result;
@@ -124,10 +127,16 @@ export function resolveGhRepository({
   const selected = explicitRepository(args, environment);
   const origin = readOrigin();
   const originRepository = origin ? requireHttpsGitHubOrigin(origin) : null;
-  if (selected && originRepository && selected !== originRepository) {
+  if (
+    selected &&
+    originRepository &&
+    repositoryIdentityKey(selected) !== repositoryIdentityKey(originRepository)
+  ) {
     fail("gh repository selector does not match the current brokered checkout");
   }
-  const repository = selected ?? originRepository;
+  // Prefer the checkout's canonical spelling when gh/T3 supplied the same GitHub identity in a
+  // different case. The original gh arguments remain untouched and official gh still executes.
+  const repository = originRepository ?? selected;
   if (!repository) fail("run gh inside an approved Team repository or pass --repo OWNER/REPO");
   return repository;
 }

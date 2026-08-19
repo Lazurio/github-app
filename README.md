@@ -173,7 +173,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.5.1` |
+| Adapter | `0.5.2` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
 before deployment. A proven user-only GraphQL query is a separate minimal T3
