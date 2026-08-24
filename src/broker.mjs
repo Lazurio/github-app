@@ -7,7 +7,7 @@ import path from "node:path";
 
 const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v1";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.5.1";
+const USER_AGENT = "lazurio-github-app-broker/0.5.3";
 const MAX_BODY_BYTES = 1024;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
 const TOKEN_PERMISSIONS = Object.freeze({
@@ -48,6 +48,10 @@ export function parsePolicy(raw) {
     fail("github_owner.login is invalid");
   }
   const installationId = positiveInteger(input.installation_id, "installation_id");
+  const installationRepositorySelection = input.installation_repository_selection ?? "selected";
+  if (!new Set(["selected", "all"]).has(installationRepositorySelection)) {
+    fail("installation_repository_selection must be selected or all");
+  }
 
   const installationPermissions = input.installation_permissions;
   if (
@@ -132,6 +136,7 @@ export function parsePolicy(raw) {
     github_app: Object.freeze({ id: appId, slug: appSlug }),
     github_owner: Object.freeze({ id: ownerId, login: ownerLogin }),
     installation_id: installationId,
+    installation_repository_selection: installationRepositorySelection,
     installation_permissions: Object.freeze({ ...installationPermissions }),
     repositories: Object.freeze(repositories),
     workspaces: Object.freeze(workspaces),
@@ -185,7 +190,7 @@ export function createGithubClient({ appId, privateKey, fetchImpl = fetch, now =
       installation?.account?.id !== policy.github_owner.id ||
       installation?.account?.login !== policy.github_owner.login ||
       installation?.target_type !== "Organization" ||
-      installation?.repository_selection !== "selected" ||
+      installation?.repository_selection !== policy.installation_repository_selection ||
       canonicalObject(installation?.permissions) !== canonicalObject(policy.installation_permissions)
     ) {
       fail("live GitHub installation identity, selection or permissions differ from policy");
@@ -213,11 +218,12 @@ export function createGithubClient({ appId, privateKey, fetchImpl = fetch, now =
         page += 1;
       }
       const expected = new Map(policy.repositories.map(({ id, full_name }) => [id, full_name]));
-      if (
-        actual.size !== total ||
-        actual.size !== expected.size ||
-        [...actual].some(([id, fullName]) => expected.get(id) !== fullName)
-      ) {
+      const configuredRepositoryMissing = [...expected].some(
+        ([id, fullName]) => actual.get(id) !== fullName,
+      );
+      const selectedInstallationHasDrift =
+        policy.installation_repository_selection === "selected" && actual.size !== expected.size;
+      if (actual.size !== total || configuredRepositoryMissing || selectedInstallationHasDrift) {
         fail("live GitHub installation repository grants differ from policy");
       }
     } finally {

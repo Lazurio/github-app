@@ -23,6 +23,7 @@ function policyFixture() {
     github_app: { id: 42, slug: "example-app" },
     github_owner: { id: 1001, login: "example-org" },
     installation_id: 2001,
+    installation_repository_selection: "selected",
     installation_permissions: {
       actions: "read",
       checks: "read",
@@ -181,6 +182,23 @@ test("policy rejects mutable-name drift and ambiguous Workspace credentials", ()
   const missingChecks = policyFixture();
   delete missingChecks.installation_permissions.checks;
   assert.throws(() => parsePolicy(missingChecks), /checks: read/);
+
+  const invalidSelection = policyFixture();
+  invalidSelection.installation_repository_selection = "unexpected";
+  assert.throws(
+    () => parsePolicy(invalidSelection),
+    /installation_repository_selection must be selected or all/,
+  );
+});
+
+test("defaults legacy policy to selected and accepts explicit all selection", () => {
+  const legacy = policyFixture();
+  delete legacy.installation_repository_selection;
+  assert.equal(parsePolicy(legacy).installation_repository_selection, "selected");
+
+  const all = policyFixture();
+  all.installation_repository_selection = "all";
+  assert.equal(parsePolicy(all).installation_repository_selection, "all");
 });
 
 function jsonResponse(body, status = 200) {
@@ -242,6 +260,133 @@ test("verifies the exact live installation and immutable repository set", async 
   const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
   await github.verifyPolicy(policy);
   assert.equal(calls.at(-1).path, "/installation/token");
+});
+
+test("accepts an all-repository installation without authorizing unlisted repositories", async () => {
+  const fixture = policyFixture();
+  fixture.installation_repository_selection = "all";
+  const policy = parsePolicy(fixture);
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname + new URL(url).search;
+    if (path === "/app/installations/2001" && init.method === "GET") {
+      return jsonResponse({
+        app_id: 42,
+        app_slug: "example-app",
+        account: { id: 1001, login: "example-org" },
+        target_type: "Organization",
+        repository_selection: "all",
+        permissions: policy.installation_permissions,
+      });
+    }
+    if (path === "/app/installations/2001/access_tokens" && init.method === "POST") {
+      assert.deepEqual(JSON.parse(init.body), { permissions: { contents: "read" } });
+      return jsonResponse({ token: "ghs_repository_probe" });
+    }
+    if (path === "/installation/repositories?per_page=100&page=1" && init.method === "GET") {
+      return jsonResponse({
+        total_count: 3,
+        repositories: [
+          { id: 3001, full_name: "example-org/alpha" },
+          { id: 3002, full_name: "example-org/beta" },
+          { id: 3999, full_name: "example-org/not-broker-authorized" },
+        ],
+      });
+    }
+    if (path === "/installation/token" && init.method === "DELETE") {
+      return jsonResponse(null, 204);
+    }
+    throw new Error(`unexpected request ${init.method} ${path}`);
+  };
+  const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
+  await github.verifyPolicy(policy);
+
+  const server = createBrokerServer({
+    policy,
+    github: {
+      mintToken: async () => {
+        throw new Error("must not mint an unlisted repository token");
+      },
+    },
+    readFile: (file) => secretByPath.get(file) ?? "",
+    realpath: (file) => file,
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    const address = server.address();
+    const response = await request(`http://127.0.0.1:${address.port}`, {
+      repositoryId: 3999,
+    });
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "repository_denied" });
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("rejects selection drift and repository-set drift in either installation mode", async () => {
+  const privateKey = testPrivateKey();
+  const installation = (selection) => ({
+    app_id: 42,
+    app_slug: "example-app",
+    account: { id: 1001, login: "example-org" },
+    target_type: "Organization",
+    repository_selection: selection,
+    permissions: parsePolicy(policyFixture()).installation_permissions,
+  });
+
+  const allFixture = policyFixture();
+  allFixture.installation_repository_selection = "all";
+  const allPolicy = parsePolicy(allFixture);
+  const selectionDrift = createGithubClient({
+    appId: "42",
+    privateKey,
+    fetchImpl: async () => jsonResponse(installation("selected")),
+  });
+  await assert.rejects(
+    () => selectionDrift.verifyPolicy(allPolicy),
+    /identity, selection or permissions differ from policy/,
+  );
+
+  async function verifyRepositorySet(policy, repositories) {
+    const fetchImpl = async (url, init) => {
+      const path = new URL(url).pathname + new URL(url).search;
+      if (path === "/app/installations/2001") {
+        return jsonResponse(installation(policy.installation_repository_selection));
+      }
+      if (path === "/app/installations/2001/access_tokens") {
+        return jsonResponse({ token: "ghs_repository_probe" });
+      }
+      if (path === "/installation/repositories?per_page=100&page=1") {
+        return jsonResponse({ total_count: repositories.length, repositories });
+      }
+      if (path === "/installation/token" && init.method === "DELETE") {
+        return jsonResponse(null, 204);
+      }
+      throw new Error(`unexpected request ${init.method} ${path}`);
+    };
+    const github = createGithubClient({ appId: "42", privateKey, fetchImpl });
+    return github.verifyPolicy(policy);
+  }
+
+  await assert.rejects(
+    () =>
+      verifyRepositorySet(parsePolicy(policyFixture()), [
+        { id: 3001, full_name: "example-org/alpha" },
+        { id: 3002, full_name: "example-org/beta" },
+        { id: 3999, full_name: "example-org/extra" },
+      ]),
+    /repository grants differ from policy/,
+  );
+  await assert.rejects(
+    () =>
+      verifyRepositorySet(allPolicy, [
+        { id: 3001, full_name: "example-org/alpha" },
+        { id: 3999, full_name: "example-org/extra" },
+      ]),
+    /repository grants differ from policy/,
+  );
 });
 
 test("rejects live permission expansion even when required contents access remains", async () => {

@@ -94,6 +94,17 @@ trigger installation-wide GitHub verification. Policy or credential changes
 become active only through a verified service restart; deployment automation
 must recreate the workload whenever either mounted input changes.
 
+`installation_repository_selection` is an explicit policy assertion with the
+values `selected` or `all`; an omitted value remains backward-compatible with
+`selected`. In `selected` mode, the live installation repository set must equal
+the policy exactly. In `all` mode, verification still requires every immutable
+repository id and asserted full name in the policy to exist, while additional
+installation repositories are expected and do not become broker-authorized.
+Every token request remains constrained to one policy repository id and one
+Workspace allowlist. An `all` installation nevertheless increases the private
+key's provider-side blast radius and should be a reviewed deployment decision,
+not an implicit fallback.
+
 Operators can revalidate the same live contract without starting another
 listener:
 
@@ -173,7 +184,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.5.2` |
+| Adapter | `0.5.3` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
 before deployment. A proven user-only GraphQL query is a separate minimal T3
