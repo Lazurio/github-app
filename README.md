@@ -168,9 +168,29 @@ Required Workspace environment:
 
 - `GITHUB_REPOSITORY_POLICY_JSON`: exact `OWNER/REPO` to immutable repository
   id mapping;
-- `GITHUB_TOKEN_BROKER_URL=http://github-token-broker:8787`;
+- `GITHUB_TOKEN_BROKER_URL`: the exact deployment-owned broker origin;
 - `GITHUB_BROKER_WORKSPACE_ID`: immutable lowercase Workspace id; and
 - `GITHUB_BROKER_CLIENT_CREDENTIAL_FILE=/run/secrets/github_broker_client_token`.
+
+The Iotor-compatible local lane keeps the fixed
+`http://github-token-broker:8787` origin only while the fixed remote config is
+absent. A remote Organization Host mounts the root-owned read-only
+`/run/config/github_broker_client.json` file with exactly this closed contract:
+
+```json
+{
+  "schema_version": "lazurio.github_broker_client.v1",
+  "origin": "https://github-broker.example.com"
+}
+```
+
+When this file exists, the adapter accepts only a canonical HTTPS origin
+without credentials, a path, query, fragment or non-default port. It discovers
+the fixed path independently of environment variables, reads it before the
+Workspace credential and requires the environment origin to match. Removing or
+changing an environment variable therefore cannot bypass or redirect the pin;
+plaintext local transport remains available only to the legacy lane with no
+mounted remote config.
 
 The adapter does not persist `hosts.yml`, a PAT or an installation token. It
 forces `GH_PAGER=cat`, removes browser/editor/pager overrides, uses an isolated
@@ -184,7 +204,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.5.3` |
+| Adapter | `0.6.0` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
 before deployment. A proven user-only GraphQL query is a separate minimal T3

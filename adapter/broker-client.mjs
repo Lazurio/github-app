@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import fs from "node:fs";
+import { isIP } from "node:net";
 
-const BROKER_ORIGIN = "http://github-token-broker:8787";
+const LOCAL_BROKER_ORIGIN = "http://github-token-broker:8787";
+const BROKER_CONFIG_FILE = "/run/config/github_broker_client.json";
 const CREDENTIAL_FILE = "/run/secrets/github_broker_client_token";
 const MAX_TOKEN_LIFETIME_MS = 65 * 60 * 1000;
 
@@ -75,8 +77,59 @@ export function firstPolicyRepository(environment = process.env) {
   return parseRepositoryPolicy(environment)[0].repository;
 }
 
-function requireBrokerRuntime(environment) {
-  if (environment.GITHUB_TOKEN_BROKER_URL !== BROKER_ORIGIN) {
+export function parseBrokerClientConfig(raw) {
+  let input;
+  try {
+    input = JSON.parse(raw);
+  } catch {
+    fail("GitHub token broker client config is invalid");
+  }
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    Object.keys(input).sort().join(",") !== "origin,schema_version" ||
+    input.schema_version !== "lazurio.github_broker_client.v1" ||
+    typeof input.origin !== "string"
+  ) {
+    fail("GitHub token broker client config is invalid");
+  }
+  let url;
+  try {
+    url = new URL(input.origin);
+  } catch {
+    fail("GitHub token broker client config is invalid");
+  }
+  const remoteHttps =
+    url.protocol === "https:" &&
+    (url.port === "" || url.port === "443") &&
+    /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(url.hostname) &&
+    isIP(url.hostname) === 0 &&
+    !/^(?:localhost|127(?:\.[0-9]+){3}|0\.0\.0\.0|\[?::1\]?)$/.test(url.hostname) &&
+    url.username === "" &&
+    url.password === "" &&
+    url.pathname === "/" &&
+    url.search === "" &&
+    url.hash === "" &&
+    url.origin === input.origin;
+  if (!remoteHttps) {
+    fail("GitHub token broker client config is invalid");
+  }
+  return Object.freeze({ origin: input.origin });
+}
+
+function requireBrokerRuntime(environment, readFile, exists) {
+  let brokerOrigin = LOCAL_BROKER_ORIGIN;
+  if (exists(BROKER_CONFIG_FILE)) {
+    let raw;
+    try {
+      raw = readFile(BROKER_CONFIG_FILE, "utf8");
+    } catch {
+      fail("GitHub token broker client config is unavailable");
+    }
+    brokerOrigin = parseBrokerClientConfig(raw).origin;
+  }
+  if (environment.GITHUB_TOKEN_BROKER_URL !== brokerOrigin) {
     fail("GitHub token broker endpoint is invalid");
   }
   const workspaceId = environment.GITHUB_BROKER_WORKSPACE_ID ?? "";
@@ -86,13 +139,14 @@ function requireBrokerRuntime(environment) {
   if (environment.GITHUB_BROKER_CLIENT_CREDENTIAL_FILE !== CREDENTIAL_FILE) {
     fail("Workspace broker credential path is invalid");
   }
-  return workspaceId;
+  return Object.freeze({ workspaceId, brokerOrigin });
 }
 
 export async function requestGitHubAppToken({
   repository,
   environment = process.env,
   readFile = fs.readFileSync,
+  exists = fs.existsSync,
   fetchImpl = fetch,
   now = () => Date.now(),
   timeoutMs = 5_000,
@@ -104,7 +158,7 @@ export async function requestGitHubAppToken({
     (entry) => repositoryIdentityKey(entry.repository) === coordinateKey,
   );
   if (!policyEntry) fail("repository is outside the Team Workspace policy");
-  const workspaceId = requireBrokerRuntime(environment);
+  const { workspaceId, brokerOrigin } = requireBrokerRuntime(environment, readFile, exists);
 
   const clientCredential = readFile(CREDENTIAL_FILE, "utf8").trim();
   if (clientCredential.length < 32 || /\s/.test(clientCredential)) {
@@ -113,7 +167,7 @@ export async function requestGitHubAppToken({
 
   let response;
   try {
-    response = await fetchImpl(`${BROKER_ORIGIN}/v1/token`, {
+    response = await fetchImpl(`${brokerOrigin}/v1/token`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${clientCredential}`,
