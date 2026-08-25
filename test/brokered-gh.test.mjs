@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   firstPolicyRepository,
   normalizeRepository,
+  parseBrokerClientConfig,
   parseRepositoryPolicy,
   repositoryIdentityKey,
   requestGitHubAppToken,
@@ -118,6 +119,108 @@ test("requests one fresh repo-scoped token without exposing the Workspace creden
   assert.deepEqual(JSON.parse(captured.options.body), { repository_id: 101 });
   assert.equal(captured.options.headers["X-Lazurio-Workspace-ID"], "example-management");
   assert.equal(captured.options.headers.Authorization.startsWith("Bearer "), true);
+});
+
+test("uses only a controller-pinned HTTPS broker origin for remote Workspaces", async () => {
+  const remoteOrigin = "https://github-broker.lazurio.example";
+  const remoteEnvironment = {
+    ...environment,
+    GITHUB_TOKEN_BROKER_URL: remoteOrigin,
+  };
+  const reads = [];
+  let requestedUrl;
+  const result = await requestGitHubAppToken({
+    repository: "Example/Alpha",
+    environment: remoteEnvironment,
+    readFile: (path) => {
+      reads.push(path);
+      if (path === "/run/config/github_broker_client.json") {
+        return JSON.stringify({
+          schema_version: "lazurio.github_broker_client.v1",
+          origin: remoteOrigin,
+        });
+      }
+      if (path === "/run/secrets/github_broker_client_token") {
+        return "workspace-credential-with-at-least-32-bytes";
+      }
+      throw new Error("unexpected path");
+    },
+    exists: (path) => path === "/run/config/github_broker_client.json",
+    fetchImpl: async (url) => {
+      requestedUrl = url;
+      return response(validToken());
+    },
+    now: () => NOW,
+  });
+  assert.equal(result.repositoryId, 101);
+  assert.equal(requestedUrl, `${remoteOrigin}/v1/token`);
+  assert.deepEqual(reads, [
+    "/run/config/github_broker_client.json",
+    "/run/secrets/github_broker_client_token",
+  ]);
+});
+
+test("remote broker config rejects endpoint substitution and unsafe origins", async () => {
+  const remoteEnvironment = {
+    ...environment,
+    GITHUB_TOKEN_BROKER_URL: "https://attacker.invalid",
+  };
+  await assert.rejects(
+    () => requestGitHubAppToken({
+      repository: "Example/Alpha",
+      environment: remoteEnvironment,
+      readFile: (path) => path.endsWith(".json")
+        ? JSON.stringify({
+            schema_version: "lazurio.github_broker_client.v1",
+            origin: "https://github-broker.lazurio.example",
+          })
+        : "workspace-credential-with-at-least-32-bytes",
+      exists: (path) => path === "/run/config/github_broker_client.json",
+      fetchImpl: async () => response(validToken()),
+      now: () => NOW,
+    }),
+    /endpoint is invalid/,
+  );
+  for (const origin of [
+    "http://broker.example",
+    "https://localhost",
+    "https://127.0.0.1",
+    "https://10.0.0.1",
+    "https://169.254.169.254",
+    "https://192.168.1.1",
+    "https://user@broker.example",
+    "https://broker.example/path",
+    "https://broker.example/",
+    "http://github-token-broker:8787",
+  ]) {
+    assert.throws(
+      () => parseBrokerClientConfig(JSON.stringify({
+        schema_version: "lazurio.github_broker_client.v1",
+        origin,
+      })),
+      /config is invalid/,
+      origin,
+    );
+  }
+});
+
+test("a mounted remote config cannot be bypassed by removing environment fields", async () => {
+  await assert.rejects(
+    () => requestGitHubAppToken({
+      repository: "Example/Alpha",
+      environment,
+      exists: (path) => path === "/run/config/github_broker_client.json",
+      readFile: (path) => path.endsWith(".json")
+        ? JSON.stringify({
+            schema_version: "lazurio.github_broker_client.v1",
+            origin: "https://github-broker.lazurio.example",
+          })
+        : "workspace-credential-with-at-least-32-bytes",
+      fetchImpl: async () => response(validToken()),
+      now: () => NOW,
+    }),
+    /endpoint is invalid/,
+  );
 });
 
 test("broker refusal, timeout, malformed policy and malformed response fail closed", async () => {
