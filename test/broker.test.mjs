@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { once } from "node:events";
+import http from "node:http";
 import test from "node:test";
 
 import {
@@ -85,6 +86,32 @@ function request(origin, { workspace = "alpha-team", secret = secretByPath.get("
   });
 }
 
+function requestHeadersWithoutBody(origin, { contentType, secret }) {
+  return new Promise((resolve, reject) => {
+    const client = http.request(`${origin}/v1/token`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        "Content-Length": "1048576",
+        "Content-Type": contentType,
+        "X-Lazurio-Workspace-ID": "alpha-team",
+      },
+    }, (response) => {
+      response.setEncoding("utf8");
+      let body = "";
+      response.on("data", (chunk) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        client.destroy();
+        resolve({ status: response.statusCode, body: JSON.parse(body) });
+      });
+    });
+    client.on("error", reject);
+    client.flushHeaders();
+  });
+}
+
 test("mints a non-cacheable token only for the Workspace repository id", async () => {
   await withServer(async (origin) => {
     const response = await request(origin);
@@ -112,6 +139,22 @@ test("rejects an invalid Workspace credential without calling GitHub", async () 
       throw new Error("must not be called");
     },
   );
+});
+
+test("rejects media type and credentials before reading a token body", async () => {
+  await withServer(async (origin) => {
+    const unsupported = await requestHeadersWithoutBody(origin, {
+      contentType: "text/plain",
+      secret: secretByPath.get("/run/secrets/workspace-alpha"),
+    });
+    assert.deepEqual(unsupported, { status: 415, body: { error: "unsupported_media_type" } });
+
+    const unauthorized = await requestHeadersWithoutBody(origin, {
+      contentType: "application/json",
+      secret: "wrong-secret-value-with-at-least-32-bytes",
+    });
+    assert.deepEqual(unauthorized, { status: 401, body: { error: "workspace_unauthorized" } });
+  });
 });
 
 test("rejects cross-Workspace repository access before calling GitHub", async () => {

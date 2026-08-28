@@ -285,7 +285,14 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
   if (typeof secretMatches !== "function") fail("secret matcher is missing");
   const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
 
-  return async ({ method, path, contentType = "", workspaceId, authorization = "", bodyText = "" }) => {
+  return async ({
+    method,
+    path,
+    contentType = "",
+    workspaceId,
+    authorization = "",
+    readBody = async () => "",
+  }) => {
     if (method === "GET" && path === "/health") {
       return Object.freeze({ status: 204, body: null });
     }
@@ -308,6 +315,9 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
         return Object.freeze({ status: 401, body: { error: "workspace_unauthorized" } });
       }
 
+      if (typeof readBody !== "function") fail("request body reader is missing");
+      const bodyText = await readBody();
+      if (typeof bodyText !== "string") fail("request body reader returned an invalid value");
       if (new TextEncoder().encode(bodyText).byteLength > MAX_BODY_BYTES) {
         fail("request body is too large");
       }

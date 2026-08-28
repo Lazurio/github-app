@@ -100,14 +100,13 @@ export function createBrokerServer({
   const handle = createBrokerHandler({ policy, github, credentials, secretMatches });
   const server = http.createServer(async (request, response) => {
     try {
-      const isTokenRequest = request.method === "POST" && request.url === "/v1/token";
       writeResult(response, await handle({
         method: request.method,
         path: request.url,
         contentType: request.headers["content-type"] ?? "",
         workspaceId: request.headers["x-lazurio-workspace-id"],
         authorization: request.headers.authorization ?? "",
-        bodyText: isTokenRequest ? await readBody(request) : "",
+        readBody: () => readBody(request),
       }));
     } catch {
       if (!response.headersSent) writeResult(response, { status: 502, body: { error: "token_unavailable" } });
