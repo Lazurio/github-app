@@ -8,23 +8,22 @@ predeclared Team Workspaces. Its deployment-owned policy binds:
 - one immutable GitHub Organization id and asserted login;
 - one installation id and the exact accepted permission set;
 - the exact selected repository ids and asserted full names; and
-- each immutable Workspace id to a separate credential file and repository-id
-  allowlist.
+- each immutable Workspace id to a separate deployment credential reference
+  and repository-id allowlist.
 
-Credential file paths and credential-value digests must be unique across all
-Workspaces. The broker checks both on every request without logging or storing
-the values. Authentication then uses that exact per-request credential
-snapshot rather than rereading one file, so secret rotation cannot race the
-uniqueness check. A duplicated or aliased secret fails the whole issuance path
-closed instead of enabling cross-Workspace impersonation.
+Credential references and credential values must be unique across all
+Workspaces. The Node adapter proves file-path uniqueness and snapshots all
+values before listening; the Worker adapter reconstructs one complete binding
+snapshot per request. Authentication never mixes values from two snapshots.
+A duplicated or aliased secret fails the whole issuance path closed instead of
+enabling cross-Workspace impersonation.
 
-At startup the broker verifies the live installation owner, target type,
-selected-repository mode, exact permissions and exact repository set. It does
-not listen if any assertion differs. The mounted policy is read at every token
-request; a changed file is parsed and live-verified before it replaces the
-last accepted policy, so a Workspace allowlist removal applies on the next
-request without restarting the process. Every token request still asks GitHub
-to mint a new one-repository token with exactly `actions: write`,
+Before minting a token, the active runtime verifies the live installation
+owner, target type, selected-repository mode, exact permissions and exact
+repository set. The Node adapter performs this gate before listening; the
+Worker performs it after local authorization on every valid token request.
+Every token request then asks GitHub to mint a new one-repository token with
+exactly `actions: write`,
 `checks: read`, `contents: write` and `pull_requests: write`; removal of a live
 repository grant therefore fails the next issuance without waiting for a local
 cache.
@@ -52,18 +51,50 @@ continue after the browser disconnects.
 
 ## Rotation and recovery
 
-- Replace one Workspace credential file to revoke only that Workspace, then
-  replace the client-side copy in its custody boundary.
+- Replace one Workspace credential file or Worker secret to revoke only that
+  Workspace, then replace the client-side copy in its custody boundary.
 - Remove a repository id from a Workspace policy to stop its next issuance.
   Removing a repository from the global policy also requires removing the
   matching live App installation grant because the global set is exact.
-- Rotate the App private key in deployment custody and restart only the broker.
-- Keep the prior immutable image available for rollback, but never roll back a
-  revoked credential or repository grant.
+- Rotate the App private key in deployment custody and restart the Node broker
+  or publish a new Worker secret version.
+- Keep the prior immutable image or Worker version available for source
+  rollback, but never roll back a revoked credential or repository grant.
 
-Runtime evidence must identify the public source commit, the pinned base image,
-the built image id and the active policy digest. Evidence contains no secret
-values.
+## Runtime adapters
+
+The policy parser, GitHub installation verification, one-repository token
+validation and Workspace authorization handler form one platform-neutral
+core. Node.js/OCI and Cloudflare Workers are transport and custody adapters
+around that core; neither adapter may fork the policy schema, permission set or
+authorization decisions.
+
+The Node.js adapter resolves distinct custody-mounted credential files,
+verifies the exact live GitHub installation before opening its listener and
+keeps that immutable snapshot for the process lifetime. Configuration changes
+require a verified restart.
+
+The Cloudflare adapter has no filesystem or reliable startup phase. It maps
+each immutable Workspace id to one independently rotatable Worker secret,
+validates the complete binding snapshot on each request and performs exact live
+installation verification immediately before every authorized token mint.
+Unknown credentials and denied repositories fail before this provider call.
+This deliberately trades extra GitHub readback latency for convergence without
+module-state caches. Missing or duplicated secrets fail the whole Worker
+configuration closed; neither errors nor observability contain secret values.
+
+A Cloudflare deployment is a separate service boundary. It is not a third
+workload on a Conglomerate Host or Organization Host, and it does not turn the
+Cloudflare account, DNS or Worker name into a GitHub access authority. GitHub
+installation grants remain the only repository authority; Cloudflare holds
+only the runtime secret custody needed to exercise that bounded App identity.
+Concrete account ids, routes, customer policy, secret values and deployment
+version evidence live in the restricted deployment owner.
+
+Runtime evidence must identify the public source commit and active policy
+digest. Node deployments also identify the pinned base image and built image
+id; Worker deployments identify the immutable Cloudflare version id. Evidence
+contains no secret values.
 
 ## Brokered `gh` compatibility boundary
 

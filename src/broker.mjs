@@ -3,277 +3,33 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
-import path from "node:path";
 
-const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v1";
-const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.7.0";
-const MAX_BODY_BYTES = 1024;
-const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
-const TOKEN_PERMISSIONS = Object.freeze({
-  actions: "write",
-  checks: "read",
-  contents: "write",
-  pull_requests: "write",
-});
+import {
+  MAX_BODY_BYTES,
+  createBrokerHandler,
+  createGithubClient as createSharedGithubClient,
+  parsePolicy,
+} from "./core.mjs";
+
+export { parsePolicy } from "./core.mjs";
 
 function fail(message) {
   throw new Error(message);
 }
 
-function positiveInteger(value, label) {
-  if (!Number.isSafeInteger(value) || value <= 0) fail(`${label} must be a positive integer`);
-  return value;
-}
-
-function canonicalObject(value) {
-  return JSON.stringify(
-    Object.fromEntries(Object.entries(value ?? {}).sort(([left], [right]) => left.localeCompare(right))),
-  );
-}
-
-export function parsePolicy(raw) {
-  const input = typeof raw === "string" ? JSON.parse(raw) : structuredClone(raw);
-  if (!input || typeof input !== "object" || Array.isArray(input)) fail("policy must be an object");
-  if (input.schema_version !== POLICY_SCHEMA) fail("unsupported policy schema");
-
-  const appId = positiveInteger(input.github_app?.id, "github_app.id");
-  const appSlug = input.github_app?.slug;
-  if (typeof appSlug !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,99})$/.test(appSlug)) {
-    fail("github_app.slug is invalid");
-  }
-  const ownerId = positiveInteger(input.github_owner?.id, "github_owner.id");
-  const ownerLogin = input.github_owner?.login;
-  if (typeof ownerLogin !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(ownerLogin)) {
-    fail("github_owner.login is invalid");
-  }
-  const installationId = positiveInteger(input.installation_id, "installation_id");
-  const installationRepositorySelection = input.installation_repository_selection ?? "selected";
-  if (!new Set(["selected", "all"]).has(installationRepositorySelection)) {
-    fail("installation_repository_selection must be selected or all");
-  }
-
-  const installationPermissions = input.installation_permissions;
-  if (
-    !installationPermissions ||
-    typeof installationPermissions !== "object" ||
-    Array.isArray(installationPermissions) ||
-    installationPermissions.actions !== "write" ||
-    installationPermissions.checks !== "read" ||
-    installationPermissions.contents !== "write" ||
-    installationPermissions.pull_requests !== "write" ||
-    Object.entries(installationPermissions).some(
-      ([key, value]) => !/^[a-z][a-z0-9_]*$/.test(key) || !["read", "write"].includes(value),
-    )
-  ) {
-    fail(
-      "installation_permissions must be exact and include actions: write, checks: read, contents: write and pull_requests: write",
-    );
-  }
-
-  if (!Array.isArray(input.repositories) || input.repositories.length === 0) {
-    fail("repositories must be a non-empty array");
-  }
-  const repositories = input.repositories.map((repository, index) => {
-    const id = positiveInteger(repository?.id, `repositories[${index}].id`);
-    const fullName = repository?.full_name;
-    if (
-      typeof fullName !== "string" ||
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(fullName) ||
-      fullName.split("/", 1)[0].toLowerCase() !== ownerLogin.toLowerCase()
-    ) {
-      fail(`repositories[${index}].full_name is invalid for the asserted owner`);
-    }
-    return Object.freeze({ id, full_name: fullName });
-  });
-  if (new Set(repositories.map(({ id }) => id)).size !== repositories.length) {
-    fail("repository ids must be unique");
-  }
-  if (new Set(repositories.map(({ full_name }) => full_name.toLowerCase())).size !== repositories.length) {
-    fail("repository full names must be unique");
-  }
-  const repositoryIds = new Set(repositories.map(({ id }) => id));
-
-  if (!Array.isArray(input.workspaces) || input.workspaces.length === 0) {
-    fail("workspaces must be a non-empty array");
-  }
-  const workspaces = input.workspaces.map((workspace, index) => {
-    const id = workspace?.id;
-    if (typeof id !== "string" || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) {
-      fail(`workspaces[${index}].id is invalid`);
-    }
-    const credentialFile = workspace?.credential_file;
-    if (
-      typeof credentialFile !== "string" ||
-      !/^\/run\/secrets\/[A-Za-z0-9._-]+$/.test(credentialFile) ||
-      path.posix.normalize(credentialFile) !== credentialFile
-    ) {
-      fail(`workspaces[${index}].credential_file must be a canonical file below /run/secrets`);
-    }
-    if (!Array.isArray(workspace.repository_ids) || workspace.repository_ids.length === 0) {
-      fail(`workspaces[${index}].repository_ids must be non-empty`);
-    }
-    const ids = workspace.repository_ids.map((repositoryId, repositoryIndex) => {
-      const result = positiveInteger(
-        repositoryId,
-        `workspaces[${index}].repository_ids[${repositoryIndex}]`,
-      );
-      if (!repositoryIds.has(result)) fail(`workspace ${id} references an unknown repository id`);
-      return result;
-    });
-    if (new Set(ids).size !== ids.length) fail(`workspace ${id} repeats a repository id`);
-    return Object.freeze({ id, credential_file: credentialFile, repository_ids: Object.freeze(ids) });
-  });
-  if (new Set(workspaces.map(({ id }) => id)).size !== workspaces.length) {
-    fail("workspace ids must be unique");
-  }
-  if (new Set(workspaces.map(({ credential_file }) => credential_file)).size !== workspaces.length) {
-    fail("Workspace credential files must be unique");
-  }
-
-  return Object.freeze({
-    schema_version: POLICY_SCHEMA,
-    github_app: Object.freeze({ id: appId, slug: appSlug }),
-    github_owner: Object.freeze({ id: ownerId, login: ownerLogin }),
-    installation_id: installationId,
-    installation_repository_selection: installationRepositorySelection,
-    installation_permissions: Object.freeze({ ...installationPermissions }),
-    repositories: Object.freeze(repositories),
-    workspaces: Object.freeze(workspaces),
-  });
-}
-
-function base64url(value) {
-  return Buffer.from(JSON.stringify(value)).toString("base64url");
+function nodeJwtSigner(privateKey) {
+  if (!privateKey) fail("GitHub App private key is missing");
+  return async (unsigned) =>
+    crypto.sign("RSA-SHA256", Buffer.from(unsigned), privateKey).toString("base64url");
 }
 
 export function createGithubClient({ appId, privateKey, fetchImpl = fetch, now = () => Date.now() }) {
-  if (!/^\d+$/.test(String(appId))) fail("GITHUB_APP_ID must be numeric");
-  if (!privateKey) fail("GitHub App private key is missing");
-
-  function appJwt() {
-    const timestamp = Math.floor(now() / 1000);
-    const unsigned = `${base64url({ alg: "RS256", typ: "JWT" })}.${base64url({
-      iat: timestamp - 60,
-      exp: timestamp + 540,
-      iss: String(appId),
-    })}`;
-    const signature = crypto.sign("RSA-SHA256", Buffer.from(unsigned), privateKey);
-    return `${unsigned}.${signature.toString("base64url")}`;
-  }
-
-  async function request(path, { method = "GET", authorization = `Bearer ${appJwt()}`, body } = {}) {
-    const response = await fetchImpl(`https://api.github.com${path}`, {
-      method,
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: authorization,
-        "Content-Type": "application/json",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": USER_AGENT,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(`GitHub request failed with HTTP ${response.status}`);
-    if (response.status === 204) return null;
-    return response.json();
-  }
-
-  async function verifyPolicy(policy) {
-    if (String(policy.github_app.id) !== String(appId)) {
-      fail("configured GitHub App id differs from policy");
-    }
-    const installation = await request(`/app/installations/${policy.installation_id}`);
-    if (
-      installation?.app_id !== policy.github_app.id ||
-      installation?.app_slug !== policy.github_app.slug ||
-      installation?.account?.id !== policy.github_owner.id ||
-      installation?.account?.login !== policy.github_owner.login ||
-      installation?.target_type !== "Organization" ||
-      installation?.repository_selection !== policy.installation_repository_selection ||
-      canonicalObject(installation?.permissions) !== canonicalObject(policy.installation_permissions)
-    ) {
-      fail("live GitHub installation identity, selection or permissions differ from policy");
-    }
-
-    const probe = await request(`/app/installations/${policy.installation_id}/access_tokens`, {
-      method: "POST",
-      body: { permissions: { contents: "read" } },
-    });
-    if (!probe?.token) fail("GitHub installation repository probe returned no token");
-
-    try {
-      const actual = new Map();
-      let page = 1;
-      let total = Number.POSITIVE_INFINITY;
-      while (actual.size < total && page <= 100) {
-        const response = await request(`/installation/repositories?per_page=100&page=${page}`, {
-          authorization: `Bearer ${probe.token}`,
-        });
-        total = response?.total_count;
-        if (!Number.isSafeInteger(total) || total < 0) fail("GitHub returned an invalid repository total");
-        for (const repository of response.repositories ?? []) {
-          actual.set(repository.id, repository.full_name);
-        }
-        page += 1;
-      }
-      const expected = new Map(policy.repositories.map(({ id, full_name }) => [id, full_name]));
-      const configuredRepositoryMissing = [...expected].some(
-        ([id, fullName]) => actual.get(id) !== fullName,
-      );
-      const selectedInstallationHasDrift =
-        policy.installation_repository_selection === "selected" && actual.size !== expected.size;
-      if (actual.size !== total || configuredRepositoryMissing || selectedInstallationHasDrift) {
-        fail("live GitHub installation repository grants differ from policy");
-      }
-    } finally {
-      await request("/installation/token", {
-        method: "DELETE",
-        authorization: `Bearer ${probe.token}`,
-      });
-    }
-  }
-
-  async function mintToken(policy, repositoryId) {
-    const result = await request(`/app/installations/${policy.installation_id}/access_tokens`, {
-      method: "POST",
-      body: {
-        repository_ids: [repositoryId],
-        permissions: TOKEN_PERMISSIONS,
-      },
-    });
-    const expiresAt = Date.parse(result?.expires_at ?? "");
-    const returnedRepositories = result?.repositories ?? [];
-    const returnedPermissions = result?.permissions ?? {};
-    if (
-      typeof result?.token !== "string" ||
-      result.token.length < 20 ||
-      !Number.isFinite(expiresAt) ||
-      expiresAt <= now() ||
-      expiresAt > now() + 65 * 60 * 1000 ||
-      returnedRepositories.length !== 1 ||
-      returnedRepositories[0]?.id !== repositoryId ||
-      returnedPermissions.actions !== "write" ||
-      returnedPermissions.checks !== "read" ||
-      returnedPermissions.contents !== "write" ||
-      returnedPermissions.pull_requests !== "write" ||
-      Object.entries(returnedPermissions).some(
-        ([permission, level]) =>
-          !(
-            (permission === "actions" && level === "write") ||
-            (permission === "checks" && level === "read") ||
-            (permission === "contents" && level === "write") ||
-            (permission === "pull_requests" && level === "write") ||
-            (permission === "metadata" && level === "read")
-          ),
-      )
-    ) {
-      fail("GitHub returned a token outside the requested repository or permission scope");
-    }
-    return { token: result.token, expires_at: result.expires_at, repository_id: repositoryId };
-  }
-
-  return Object.freeze({ verifyPolicy, mintToken });
+  return createSharedGithubClient({
+    appId,
+    signJwt: nodeJwtSigner(privateKey),
+    fetchImpl,
+    now,
+  });
 }
 
 function readWorkspaceCredential(file, readFile = fs.readFileSync) {
@@ -307,7 +63,12 @@ function secretMatches(actual, expected) {
   return crypto.timingSafeEqual(actualDigest, expectedDigest);
 }
 
-function json(response, status, body) {
+function writeResult(response, { status, body }) {
+  if (status === 204) {
+    response.writeHead(status, { "Cache-Control": "no-store" });
+    response.end();
+    return;
+  }
   const payload = JSON.stringify(body);
   response.writeHead(status, {
     "Cache-Control": "no-store",
@@ -319,14 +80,14 @@ function json(response, status, body) {
   response.end(payload);
 }
 
-async function readJsonBody(request) {
+async function readBody(request) {
   let body = "";
   request.setEncoding("utf8");
   for await (const chunk of request) {
     body += chunk;
-    if (Buffer.byteLength(body) > MAX_BODY_BYTES) fail("request body is too large");
+    if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw new Error("request body is too large");
   }
-  return JSON.parse(body);
+  return body;
 }
 
 export function createBrokerServer({
@@ -336,47 +97,20 @@ export function createBrokerServer({
   realpath = fs.realpathSync,
   credentials = snapshotWorkspaceCredentials(policy, { readFile, realpath }),
 }) {
-  const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
-
+  const handle = createBrokerHandler({ policy, github, credentials, secretMatches });
   const server = http.createServer(async (request, response) => {
-    if (request.method === "GET" && request.url === "/health") {
-      response.writeHead(204, { "Cache-Control": "no-store" });
-      response.end();
-      return;
-    }
-    if (request.method !== "POST" || request.url !== "/v1/token") {
-      json(response, 404, { error: "not_found" });
-      return;
-    }
-    if (!request.headers["content-type"]?.toLowerCase().startsWith("application/json")) {
-      json(response, 415, { error: "unsupported_media_type" });
-      return;
-    }
-
-    const workspaceId = request.headers["x-lazurio-workspace-id"];
-    const authorization = request.headers.authorization ?? "";
-    const presentedCredential = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     try {
-      const workspace = typeof workspaceId === "string" ? workspaces.get(workspaceId) : undefined;
-      const credentialMatches = secretMatches(
-        presentedCredential,
-        (typeof workspaceId === "string" ? credentials.get(workspaceId) : undefined) ??
-          DUMMY_WORKSPACE_CREDENTIAL,
-      );
-      if (!workspace || !presentedCredential || !credentialMatches) {
-        json(response, 401, { error: "workspace_unauthorized" });
-        return;
-      }
-
-      const body = await readJsonBody(request);
-      const repositoryId = body?.repository_id;
-      if (!Number.isSafeInteger(repositoryId) || !workspace.repository_ids.includes(repositoryId)) {
-        json(response, 403, { error: "repository_denied" });
-        return;
-      }
-      json(response, 200, await github.mintToken(policy, repositoryId));
+      const isTokenRequest = request.method === "POST" && request.url === "/v1/token";
+      writeResult(response, await handle({
+        method: request.method,
+        path: request.url,
+        contentType: request.headers["content-type"] ?? "",
+        workspaceId: request.headers["x-lazurio-workspace-id"],
+        authorization: request.headers.authorization ?? "",
+        bodyText: isTokenRequest ? await readBody(request) : "",
+      }));
     } catch {
-      if (!response.headersSent) json(response, 502, { error: "token_unavailable" });
+      if (!response.headersSent) writeResult(response, { status: 502, body: { error: "token_unavailable" } });
     }
   });
   server.requestTimeout = 10_000;

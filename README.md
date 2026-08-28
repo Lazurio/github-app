@@ -52,6 +52,19 @@ GitHub-backed gateway decision. See [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Runtime
 
+One platform-neutral authorization and GitHub policy core is exposed through
+two runtime adapters:
+
+- `src/broker.mjs` is the Node.js/OCI adapter for a custody-mounted service;
+- `src/worker.mjs` is the Cloudflare Workers adapter for a separately deployed
+  remote broker.
+
+The adapters do not own different policy schemas or authorization rules. A
+deployment chooses one adapter and supplies the same customer-neutral source
+with deployment-owned policy and secrets.
+
+### Node.js / OCI
+
 Requirements: Node.js 24 or newer.
 
 ```sh
@@ -117,6 +130,54 @@ The command reads the same mounted policy, App key and Workspace credentials,
 performs the exact live GitHub readback, emits no secret or token, and exits
 non-zero on drift. Deployment automation should run it on every desired-state
 apply in addition to the startup gate.
+
+### Cloudflare Workers
+
+The Worker is a separate broker service. It is not deployed on a Conglomerate
+Host or Organization Host and it receives neither their SSH credentials nor
+their filesystems. Concrete Worker names, accounts, routes, customer ids,
+policy and secrets belong to the restricted deployment owner, not this public
+repository.
+
+The Worker reads these deployment bindings:
+
+- `GITHUB_APP_ID`: the decimal App id asserted by the policy;
+- `GITHUB_APP_PRIVATE_KEY`: the App private key as unencrypted PKCS#8 PEM;
+- `BROKER_POLICY_JSON`: the same complete policy document used by the Node
+  adapter; and
+- one independent secret per Workspace, named
+  `WORKSPACE_CREDENTIAL_<WORKSPACE_ID>`, where the lowercase Workspace id is
+  uppercased and `-` becomes `_` (for example `blue-team` becomes
+  `WORKSPACE_CREDENTIAL_BLUE_TEAM`).
+
+All four classes are deployment bindings and none belongs in Git or Wrangler
+configuration. Workspace ids make the secret-binding mapping injective because
+policy ids allow only lowercase letters, digits and hyphens. Credential values
+must remain unique. A missing, malformed or duplicated binding makes the
+Worker return `503 configuration_unavailable` without disclosing which secret
+failed.
+
+Unlike the always-on Node process, a Worker has no trustworthy startup phase.
+It therefore parses the policy and credential snapshot on each request and,
+after a valid Workspace credential and repository allowlist match, verifies
+the exact live GitHub installation immediately before every token mint. Bad
+credentials and denied repositories never trigger GitHub traffic. `GET
+/health` proves only that the current Worker bindings form a valid local
+configuration; a successful token request is the live installation proof.
+
+Prepare and validate the customer-neutral bundle locally:
+
+```sh
+npm ci
+npm test
+npm run check
+```
+
+`npm run check` includes a pinned Wrangler `--dry-run`. A real deployment must
+use the deployment-owned Cloudflare account and explicit Worker name, load all
+secrets through Cloudflare secret custody, then record the exact public source
+commit and resulting immutable Worker version id. This repository deliberately
+does not declare an account id, customer route or shared production Worker.
 
 ## Container build
 
@@ -210,7 +271,8 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.7.0` |
+| Adapter | `0.8.0` |
+| Cloudflare Wrangler | `4.127.1` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
 before deployment. A proven user-only GraphQL query is a separate minimal T3
