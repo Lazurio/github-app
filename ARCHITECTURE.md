@@ -24,13 +24,17 @@ not listen if any assertion differs. The mounted policy is read at every token
 request; a changed file is parsed and live-verified before it replaces the
 last accepted policy, so a Workspace allowlist removal applies on the next
 request without restarting the process. Every token request still asks GitHub
-to mint a new one-repository token with exactly `actions: read`,
+to mint a new one-repository token with exactly `actions: write`,
 `checks: read`, `contents: write` and `pull_requests: write`; removal of a live
 repository grant therefore fails the next issuance without waiting for a local
 cache.
-Read-only Checks and Actions access lets the standard GitHub CLI render check
-runs and their workflow-run context in a pull-request view. Neither permission
-grants authority to create, update, rerun or cancel a check or workflow run.
+Read-only Checks access and Actions write access let the standard GitHub CLI
+render check runs and their workflow-run context and explicitly rerun a failed
+workflow without a synthetic commit or human credential. GitHub exposes no
+rerun-only installation permission: `actions: write` also authorizes other
+Actions mutations in the same repository. The remaining boundaries therefore
+stay material: one immutable repository per short-lived token, an exact
+Workspace repository allowlist and no Checks write access.
 
 ## What this service does not do
 
@@ -95,3 +99,9 @@ root-owned and read-only; pager, browser and editor inheritance is removed.
 If a future pinned T3 release requires a user-only GraphQL field unsupported
 by an installation token, the adapter fails visibly. Such evidence may justify
 a separate bounded T3 compatibility change, never request rewriting here.
+
+The adapter deliberately remains a compatibility launcher for the official
+CLI rather than claiming a false command-level security boundary. A Workspace
+that can receive this token can use the full repository-scoped Actions write
+permission GitHub defines; operator policy and review must accept that exact
+provider capability before rollout.
