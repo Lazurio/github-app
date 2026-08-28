@@ -3,5 +3,6 @@ node_modules/
 .env.*
 !.env.example
 .worktrees/
+.wrangler/
 coverage/
 *.log

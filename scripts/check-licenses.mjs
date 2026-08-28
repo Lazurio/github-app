@@ -48,12 +48,15 @@ assert.match(releaseWorkflow, /org\.opencontainers\.image\.licenses=Apache-2\.0/
 assert.match(releaseWorkflow, /third-party\/github-cli\/LICENSE/);
 
 for (const file of [
+  "src/core.mjs",
   "src/broker.mjs",
+  "src/worker.mjs",
   "adapter/broker-client.mjs",
   "adapter/brokered-gh.mjs",
   "scripts/check-licenses.mjs",
   "test/broker.test.mjs",
   "test/brokered-gh.test.mjs",
+  "test/worker.test.mjs",
   ".github/workflows/ci.yml",
   ".github/workflows/release.yml",
 ]) {
