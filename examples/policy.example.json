@@ -11,7 +11,7 @@
   "installation_id": 2001,
   "installation_repository_selection": "selected",
   "installation_permissions": {
-    "actions": "read",
+    "actions": "write",
     "checks": "read",
     "contents": "write",
     "pull_requests": "write",
