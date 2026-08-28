@@ -82,6 +82,13 @@ test("accepts only the exact T3 discovery and viewer envelopes", () => {
   assert.equal(classifyGhCommand(["pr", "list", "--help"], environment), "local");
   assert.equal(classifyGhCommand(["pr", "list"], environment), "repository");
   assert.equal(
+    classifyGhCommand(
+      ["run", "rerun", "33188102618", "--repo", "Example/Alpha"],
+      environment,
+    ),
+    "repository",
+  );
+  assert.equal(
     classifyGhCommand(["api", "graphql", "--hostname", "github.com", "--input", "-"], environment),
     "repository",
   );
