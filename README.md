@@ -3,7 +3,7 @@
 Open-source, publicly auditable source for the small credential boundary used
 by Lazurio Team Workspaces. The broker exchanges an authenticated Workspace
 request for a short-lived GitHub App installation token restricted to one
-immutable repository id and exactly `actions: read`, `checks: read`,
+immutable repository id and exactly `actions: write`, `checks: read`,
 `contents: write` plus `pull_requests: write`.
 
 Lazurio for GitHub is an independent project. It is not affiliated with,
@@ -37,10 +37,11 @@ Workspace id + Workspace credential + repository id
 - The GitHub App private key exists only in the broker workload.
 - A Workspace credential authorizes only that Workspace's configured
   repository ids.
-- A minted token can read check and workflow-run context, change repository
-  contents and create or update pull requests only for that one repository; it
-  receives no Actions or Checks write, administration, membership or
-  cross-repository authority.
+- A minted token can read checks, rerun workflows, change repository contents
+  and create or update pull requests only for that one repository. GitHub has
+  no rerun-only installation permission, so `actions: write` also permits
+  other Actions mutations in that repository; the token still receives no
+  Checks write, administration, membership or cross-repository authority.
 - Repository names are assertions for human readback; immutable GitHub ids are
   the authorization keys.
 - Installation tokens are neither logged nor written to disk by this service.
@@ -153,6 +154,11 @@ The adapter has four command classes:
    scoped token, and invoke real `gh` with the token only in the child process
    environment.
 
+`gh run rerun <run-id> --repo OWNER/REPO` follows the fourth class. It uses the
+same one-repository token as other repository commands and does not require a
+human `gh auth` login or a synthetic source commit. The adapter does not claim
+to narrow GitHub's `actions: write` permission to that single verb.
+
 Current T3 PR operations explicitly pass `--hostname github.com` to official
 `gh`. The adapter accepts only that exact host on repository commands; the
 discovery/viewer envelopes remain exact, a missing value or any other host is
@@ -204,7 +210,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.6.0` |
+| Adapter | `0.7.0` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
 before deployment. A proven user-only GraphQL query is a separate minimal T3
