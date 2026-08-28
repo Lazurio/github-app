@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  MAX_BODY_BYTES,
   createBrokerHandler,
   createGithubClient,
   parsePolicy,
@@ -50,24 +51,51 @@ function bytesToBase64url(bytes) {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
-export function createWorkerJwtSigner(privateKey, subtle = crypto.subtle) {
+export async function createWorkerJwtSigner(privateKey, subtle = crypto.subtle) {
   const keyBytes = pemBytes(privateKey);
-  let importedKey;
+  const importedKey = await subtle.importKey(
+    "pkcs8",
+    keyBytes,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
   return async (unsigned) => {
-    importedKey ??= subtle.importKey(
-      "pkcs8",
-      keyBytes,
-      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-      false,
-      ["sign"],
-    );
     const signature = await subtle.sign(
       "RSASSA-PKCS1-v1_5",
-      await importedKey,
+      importedKey,
       new TextEncoder().encode(unsigned),
     );
     return bytesToBase64url(new Uint8Array(signature));
   };
+}
+
+async function readWorkerBody(request) {
+  const declaredLength = request.headers.get("content-length");
+  if (/^\d+$/.test(declaredLength ?? "") && Number(declaredLength) > MAX_BODY_BYTES) {
+    fail("request body is too large");
+  }
+  if (!request.body) return "";
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let body = "";
+  let byteLength = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      byteLength += value.byteLength;
+      if (byteLength > MAX_BODY_BYTES) {
+        await reader.cancel("request body is too large");
+        fail("request body is too large");
+      }
+      body += decoder.decode(value, { stream: true });
+    }
+    return body + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function workerSecretMatches(actual, expected, subtle = crypto.subtle) {
@@ -103,10 +131,10 @@ function configurationUnavailable() {
   return workerResponse({ status: 503, body: { error: "configuration_unavailable" } });
 }
 
-function defaultGithub({ appId, privateKey, fetchImpl }) {
+async function defaultGithub({ appId, privateKey, fetchImpl }) {
   return createGithubClient({
     appId,
-    signJwt: createWorkerJwtSigner(privateKey),
+    signJwt: await createWorkerJwtSigner(privateKey),
     fetchImpl,
   });
 }
@@ -122,7 +150,7 @@ export function createWorkerEntrypoint({ createGithub = defaultGithub, fetchImpl
         const appId = requiredBinding(env, "GITHUB_APP_ID");
         if (String(policy.github_app.id) !== appId) fail("configured GitHub App id differs from policy");
         credentials = workerCredentials(policy, env);
-        github = createGithub({
+        github = await createGithub({
           appId,
           privateKey: requiredBinding(env, "GITHUB_APP_PRIVATE_KEY"),
           fetchImpl,
@@ -147,20 +175,13 @@ export function createWorkerEntrypoint({ createGithub = defaultGithub, fetchImpl
         secretMatches: workerSecretMatches,
       });
       const url = new URL(request.url);
-      const isTokenRequest = request.method === "POST" && url.pathname === "/v1/token" && !url.search;
-      let bodyText = "";
-      try {
-        if (isTokenRequest) bodyText = await request.text();
-      } catch {
-        return workerResponse({ status: 502, body: { error: "token_unavailable" } });
-      }
       return workerResponse(await handle({
         method: request.method,
         path: `${url.pathname}${url.search}`,
         contentType: request.headers.get("content-type") ?? "",
         workspaceId: request.headers.get("x-lazurio-workspace-id") ?? undefined,
         authorization: request.headers.get("authorization") ?? "",
-        bodyText,
+        readBody: () => readWorkerBody(request),
       }));
     },
   });

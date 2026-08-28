@@ -102,6 +102,10 @@ The response contains the installation token and GitHub expiry timestamp with
 `Cache-Control: no-store`. `GET /health` returns `204` only after startup
 policy verification has succeeded.
 
+Both runtime adapters reject an invalid route, media type or Workspace
+credential before consuming the request body. An authenticated token body is
+read with a hard `1024`-byte streaming limit before JSON parsing.
+
 The broker parses the policy and Workspace credentials once, verifies the exact
 live GitHub installation and only then starts listening. Runtime requests never
 trigger installation-wide GitHub verification. Policy or credential changes
@@ -163,7 +167,8 @@ after a valid Workspace credential and repository allowlist match, verifies
 the exact live GitHub installation immediately before every token mint. Bad
 credentials and denied repositories never trigger GitHub traffic. `GET
 /health` proves only that the current Worker bindings form a valid local
-configuration; a successful token request is the live installation proof.
+configuration, including an importable RSA PKCS#8 App key; a successful token
+request is the live installation proof.
 
 Prepare and validate the customer-neutral bundle locally:
 
