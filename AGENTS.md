@@ -19,6 +19,11 @@ dependency-light and customer-neutral.
 7. No customer-specific policy, ids or credentials belong in this public repo.
 8. Every behavior change requires focused tests for the positive path and
    cross-Workspace / cross-repository denial.
+9. Every Workspace is bound to exactly one immutable GitHub Team id, and every
+   token issuance verifies live that the Team exists and holds a write-capable
+   grant on the exact repository, failing closed with `team_grant_missing`.
+   Nothing from that readback is cached; the policy, the Dashboard and any
+   derived mapping are reviewed inputs, never a second ACL.
 
 `actions: write` is GitHub's smallest installation-token permission that can
 rerun a workflow. GitHub does not provide a rerun-only token capability, so
