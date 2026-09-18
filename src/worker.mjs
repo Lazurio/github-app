@@ -155,16 +155,26 @@ export function createWorkerEntrypoint({ createGithub = defaultGithub, fetchImpl
           privateKey: requiredBinding(env, "GITHUB_APP_PRIVATE_KEY"),
           fetchImpl,
         });
-        if (!github || typeof github.verifyPolicy !== "function" || typeof github.mintToken !== "function") {
+        if (
+          !github ||
+          typeof github.verifyPolicy !== "function" ||
+          typeof github.verifyTeamGrant !== "function" ||
+          typeof github.mintToken !== "function"
+        ) {
           fail("GitHub client is invalid");
         }
       } catch {
         return configurationUnavailable();
       }
 
+      // No trustworthy startup phase: the exact live installation is verified before the
+      // Team grant on every authorized request, and both precede the one-repository mint.
       const verifiedGithub = Object.freeze({
-        async mintToken(activePolicy, repositoryId) {
+        async verifyTeamGrant(activePolicy, workspace, repositoryId) {
           await github.verifyPolicy(activePolicy);
+          return github.verifyTeamGrant(activePolicy, workspace, repositoryId);
+        },
+        mintToken(activePolicy, repositoryId) {
           return github.mintToken(activePolicy, repositoryId);
         },
       });
