@@ -41,7 +41,11 @@ Workspace id + Workspace credential + repository id
 - Every Workspace is bound to exactly one immutable GitHub Team id, and every
   token requires that Team to hold a live write-capable grant on the exact
   repository. GitHub Team membership and repository grants are the only
-  access authority; the policy is a reviewed allowlist, never a second ACL.
+  grant authority; the policy never grants anything GitHub has not granted
+  and never replaces GitHub's ACL. Its `repository_ids` allowlist is still
+  part of the admission decision as a separate deny-only gate: a repository
+  outside the allowlist is refused before the live Team grant is even read,
+  even if the GitHub Team holds a write grant on it.
 - A minted token can read checks, rerun workflows, change repository contents
   and create or update pull requests only for that one repository. GitHub has
   no rerun-only installation permission, so `actions: write` also permits
@@ -126,7 +130,11 @@ The response contains the installation token and GitHub expiry timestamp with
 `Cache-Control: no-store`. `GET /health` returns `204` only after startup
 policy verification has succeeded.
 
-Every `POST /v1/token` passes these gates in order; a failed gate mints nothing:
+Every `POST /v1/token` passes these gates in order; a failed gate never issues
+a scoped repository token. The Team gate itself first mints a short-lived
+`members: read` probe token, performs the Team read and revokes the probe, so
+a Team or grant refusal has already cost that probe mint and revocation — it
+only guarantees that no final repository token exists:
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
@@ -167,7 +175,8 @@ accepted token request costs:
 | --- | --- |
 | Node adapter, accepted `POST /v1/token` | 5 (Team gate 4 + scoped mint 1) |
 | Worker adapter, accepted `POST /v1/token` | 9 (live installation gate 4 + Team gate 4 + scoped mint 1) |
-| `policy check --live` | 4 + 3 × Workspaces + allowlisted grants (installation gate, then one probe mint and revocation plus one Team read per Workspace, plus one grant read per `repository_ids` entry) |
+| `policy check --live`, fully successful (maximum) | 4 + 3 × Workspaces + allowlisted grants (installation gate, then one probe mint and revocation plus one Team read per Workspace, plus one grant read per `repository_ids` entry) |
+| `policy check --live`, Workspace with a missing Team | 4 + 3 × Workspaces and no `/repos/` grant reads for that Workspace: the Team read refuses every grant row early, so the per-repository GETs are skipped (a one-Workspace, one-repository missing-Team policy costs 7 requests) |
 
 The installation gate counts one `/installation/repositories` page; an
 installation with more than 100 repositories adds one request per further
@@ -175,8 +184,9 @@ page. Denied credentials and denied repositories cost zero GitHub requests.
 
 All of these requests draw on the installation's GitHub rate limit. A
 rate-limit or quota response, like any other GitHub failure, fails closed as
-`502 token_unavailable` (or a non-zero `policy check --live` exit) and mints
-nothing; there is no readback cache to fall back on. Operators sizing a
+`502 token_unavailable` (or a non-zero `policy check --live` exit) and issues
+no scoped repository token; the Team gate's probe token may already have been
+minted and revoked by then. There is no readback cache to fall back on. Operators sizing a
 deployment must budget the per-mint Worker cost and the readback cost of a
 large policy accordingly.
 

@@ -57,8 +57,10 @@ and the repository-permissions media type, revokes the probe, and only then
 mints the one-repository token. A missing Team, an identity that differs from
 the policy assertions, a missing grant, a `pull`/`triage`-only grant or a
 repository id mismatch is refused with `403 team_grant_missing`; a GitHub
-outage, rate-limit or quota response is `502 token_unavailable`. Both refusals
-mint nothing and nothing from the readback is retained between requests, so
+outage, rate-limit or quota response is `502 token_unavailable`. Neither
+refusal issues a repository token — the only token minted before the decision
+is the short-lived probe, already revoked — and nothing from the readback is
+retained between requests, so
 the only window in which a revoked grant can still act is the lifetime of a
 token already issued.
 
