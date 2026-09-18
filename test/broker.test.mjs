@@ -988,10 +988,16 @@ test("Team grant outages fail closed as token_unavailable and cross-Workspace ch
 
 test("policy check --live reads back every Team grant and prints a secret-free table", async () => {
   const policy = parsePolicy(policyFixture());
-  const summary = formatPolicySummary(policy);
-  assert.match(summary, /lazurio\.github_app_broker\.policy\.v2 owner=example-org installation=2001/);
-  assert.match(summary, /alpha-team {2}4001 {2}alpha-team {2}1/);
-  assert.match(summary, /beta-team {2}4002 {2}- {2}1/);
+  assert.equal(
+    formatPolicySummary(policy),
+    [
+      "lazurio.github_app_broker.policy.v2 owner=example-org installation=2001",
+      "WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORIES",
+      "alpha-team  4001     alpha-team  1",
+      "beta-team   4002     -           1",
+      "",
+    ].join("\n"),
+  );
 
   const probes = [];
   const github = {
