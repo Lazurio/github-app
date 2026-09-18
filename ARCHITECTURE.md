@@ -57,9 +57,17 @@ and the repository-permissions media type, revokes the probe, and only then
 mints the one-repository token. A missing Team, an identity that differs from
 the policy assertions, a missing grant, a `pull`/`triage`-only grant or a
 repository id mismatch is refused with `403 team_grant_missing`; a GitHub
-outage is `502 token_unavailable`. Both refusals mint nothing and nothing from
-the readback is retained between requests, so the only window in which a
-revoked grant can still act is the lifetime of a token already issued.
+outage, rate-limit or quota response is `502 token_unavailable`. Both refusals
+mint nothing and nothing from the readback is retained between requests, so
+the only window in which a revoked grant can still act is the lifetime of a
+token already issued.
+
+This convergence is paid in GitHub requests, deliberately without a cache: the
+Team gate is four requests (probe mint, two reads, probe revocation), so an
+accepted Node request costs five GitHub requests and an accepted Worker
+request nine, because the Worker also repeats the installation gate. Rate
+limiting therefore degrades issuance to fail-closed refusals rather than to
+stale allows; the README documents the per-path budget.
 
 The Node adapter still performs the installation gate once before listening;
 the Team gate is per request in both adapters because it is the revocation
