@@ -167,9 +167,10 @@ installation-token schedule.
 
 #### GitHub request budget
 
-The Team gate itself costs four GitHub requests: the probe token mint, the two
-reads above and the probe revocation. Including the final scoped mint, one
-accepted token request costs:
+A successful Team gate costs four GitHub requests: the probe token mint, the
+two reads above and the probe revocation. A missing Team refuses early after
+three (probe mint, Team read, probe revocation) and never reads the repository
+grant. Including the final scoped mint, one accepted token request costs:
 
 | Path | GitHub requests |
 | --- | --- |

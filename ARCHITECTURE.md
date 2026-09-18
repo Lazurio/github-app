@@ -48,8 +48,13 @@ Team or two Workspaces claim the same Team. Team ids are immutable on GitHub;
 a Team deleted and recreated under the same name has a new id and is a
 different Team for the broker.
 
-The live GitHub Team membership and Team-to-repository grants are the sole
-access authority. On every token request, after the credential and allowlist
+The live GitHub Team membership and Team-to-repository grants are the only
+grant authority: the policy never grants anything GitHub has not granted and
+never replaces GitHub's ACL. The policy's `workspace.repository_ids` allowlist
+is nevertheless a separate, deny-only admission gate that decides which live
+grants the broker will use at all: a repository outside the allowlist is
+refused before the Team grant is read, even when the Team holds a write grant
+on it. On every token request, after the credential and allowlist
 checks, the runtime mints a `members: read` probe token, reads the Team by
 `/organizations/{org_id}/team/{team_id}`, checks the Team's grant on the exact
 repository with `/organizations/{org_id}/team/{team_id}/repos/{owner}/{repo}`
@@ -64,10 +69,12 @@ retained between requests, so
 the only window in which a revoked grant can still act is the lifetime of a
 token already issued.
 
-This convergence is paid in GitHub requests, deliberately without a cache: the
-Team gate is four requests (probe mint, two reads, probe revocation), so an
-accepted Node request costs five GitHub requests and an accepted Worker
-request nine, because the Worker also repeats the installation gate. Rate
+This convergence is paid in GitHub requests, deliberately without a cache: a
+successful Team gate is four requests (probe mint, two reads, probe
+revocation), so an accepted Node request costs five GitHub requests and an
+accepted Worker request nine, because the Worker also repeats the installation
+gate. A missing Team refuses early after three requests (probe mint, Team read,
+probe revocation) and never reads the repository grant. Rate
 limiting therefore degrades issuance to fail-closed refusals rather than to
 stale allows; the README documents the per-path budget.
 
