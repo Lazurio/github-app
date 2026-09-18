@@ -8,8 +8,8 @@ predeclared Team Workspaces. Its deployment-owned policy binds:
 - one immutable GitHub Organization id and asserted login;
 - one installation id and the exact accepted permission set;
 - the exact selected repository ids and asserted full names; and
-- each immutable Workspace id to a separate deployment credential reference
-  and repository-id allowlist.
+- each immutable Workspace id to exactly one immutable GitHub Team id, a
+  separate deployment credential reference and a repository-id allowlist.
 
 Credential references and credential values must be unique across all
 Workspaces. The Node adapter proves file-path uniqueness and snapshots all
@@ -27,6 +27,9 @@ exactly `actions: write`,
 `checks: read`, `contents: write` and `pull_requests: write`; removal of a live
 repository grant therefore fails the next issuance without waiting for a local
 cache.
+Between the installation gate and the mint, the runtime performs the Team gate
+described below; it is the step that turns a live GitHub Team grant into the
+authority for the token.
 Read-only Checks access and Actions write access let the standard GitHub CLI
 render check runs and their workflow-run context and explicitly rerun a failed
 workflow without a synthetic commit or human credential. GitHub exposes no
@@ -34,6 +37,62 @@ rerun-only installation permission: `actions: write` also authorizes other
 Actions mutations in the same repository. The remaining boundaries therefore
 stay material: one immutable repository per short-lived token, an exact
 Workspace repository allowlist and no Checks write access.
+
+## Team binding and live grant verification
+
+A Hosted Team Workspace has no human GitHub identity; its GitHub identity is
+the App, reached through this broker, acting for exactly one GitHub Team. The
+policy therefore binds each Workspace to one immutable numeric
+`github_team_id`, and the parser refuses a policy where a Workspace has no
+Team or two Workspaces claim the same Team. Team ids are immutable on GitHub;
+a Team deleted and recreated under the same name has a new id and is a
+different Team for the broker.
+
+The live GitHub Team membership and Team-to-repository grants are the only
+grant authority: the policy never grants anything GitHub has not granted and
+never replaces GitHub's ACL. The policy's `workspace.repository_ids` allowlist
+is nevertheless a separate, deny-only admission gate that decides which live
+grants the broker will use at all: a repository outside the allowlist is
+refused before the Team grant is read, even when the Team holds a write grant
+on it. On every token request, after the credential and allowlist
+checks, the runtime mints a `members: read` probe token, reads the Team by
+`/organizations/{org_id}/team/{team_id}`, checks the Team's grant on the exact
+repository with `/organizations/{org_id}/team/{team_id}/repos/{owner}/{repo}`
+and the repository-permissions media type, revokes the probe, and only then
+mints the one-repository token. A missing Team, an identity that differs from
+the policy assertions, a missing grant, a `pull`/`triage`-only grant or a
+repository id mismatch is refused with `403 team_grant_missing`; a GitHub
+outage, rate-limit or quota response is `502 token_unavailable`. Neither
+refusal issues a repository token — the only token minted before the decision
+is the short-lived probe, already revoked — and nothing from the readback is
+retained between requests, so
+the only window in which a revoked grant can still act is the lifetime of a
+token already issued.
+
+This convergence is paid in GitHub requests, deliberately without a cache: a
+successful Team gate is four requests (probe mint, two reads, probe
+revocation), so an accepted Node request costs five GitHub requests and an
+accepted Worker request nine, because the Worker also repeats the installation
+gate. A missing Team refuses early after three requests (probe mint, Team read,
+probe revocation) and never reads the repository grant. Rate
+limiting therefore degrades issuance to fail-closed refusals rather than to
+stale allows; the README documents the per-path budget.
+
+The Node adapter still performs the installation gate once before listening;
+the Team gate is per request in both adapters because it is the revocation
+path. A Workspace whose Team temporarily lacks a grant does not stop the
+service for other Workspaces; it is refused per request.
+
+`policy check --live` is the same verification run over every Workspace and
+every allowlisted repository at once. It is the migration and readback gate an
+operator runs before deploying a policy and exits non-zero on any refused
+row; the rows never contain a token or credential.
+
+The Lazurio Dashboard is a read-only lens over this contract. It may show the
+desired Team-to-repository mapping and derive a reviewed policy input, but
+that input is reviewed and published in the owner Deployment Repository and
+grants nothing by itself. Neither the Dashboard nor the policy is a second
+ACL: the broker's live check against GitHub is the authority for every token.
 
 ## What this service does not do
 
@@ -53,6 +112,10 @@ continue after the browser disconnects.
 
 - Replace one Workspace credential file or Worker secret to revoke only that
   Workspace, then replace the client-side copy in its custody boundary.
+- Remove the GitHub Team's grant on a repository, or delete the Team, to
+  refuse that Workspace's next token for the repository without touching the
+  policy or restarting the broker; the reviewed policy then converges by
+  removing the stale repository id or Workspace.
 - Remove a repository id from a Workspace policy to stop its next issuance.
   Removing a repository from the global policy also requires removing the
   matching live App installation grant because the global set is exact.
@@ -63,9 +126,9 @@ continue after the browser disconnects.
 
 ## Runtime adapters
 
-The policy parser, GitHub installation verification, one-repository token
-validation and Workspace authorization handler form one platform-neutral
-core. Node.js/OCI and Cloudflare Workers are transport and custody adapters
+The policy parser, GitHub installation verification, live Team grant
+verification, one-repository token validation and Workspace authorization
+handler form one platform-neutral core. Node.js/OCI and Cloudflare Workers are transport and custody adapters
 around that core; neither adapter may fork the policy schema, permission set or
 authorization decisions.
 

@@ -6,12 +6,14 @@ import http from "node:http";
 
 import {
   MAX_BODY_BYTES,
+  checkPolicyLive,
   createBrokerHandler,
   createGithubClient as createSharedGithubClient,
+  formatPolicyCheckTable,
   parsePolicy,
 } from "./core.mjs";
 
-export { parsePolicy } from "./core.mjs";
+export { checkPolicyLive, formatPolicyCheckTable, parsePolicy } from "./core.mjs";
 
 function fail(message) {
   throw new Error(message);
@@ -136,16 +138,70 @@ export async function startBroker({
   return server;
 }
 
+const USAGE = "usage: broker.mjs [--verify-only | policy check [--live]]";
+
 export function parseCommand(arguments_) {
-  if (arguments_.length === 0) return Object.freeze({ verifyOnly: false });
-  if (arguments_.length === 1 && arguments_[0] === "--verify-only") {
-    return Object.freeze({ verifyOnly: true });
-  }
-  fail("usage: broker.mjs [--verify-only]");
+  const joined = arguments_.join(" ");
+  if (joined === "") return Object.freeze({ mode: "serve" });
+  if (joined === "--verify-only") return Object.freeze({ mode: "verify" });
+  if (joined === "policy check") return Object.freeze({ mode: "policy-check", live: false });
+  if (joined === "policy check --live") return Object.freeze({ mode: "policy-check", live: true });
+  fail(USAGE);
+}
+
+/** Offline summary of the parsed Team binding; no GitHub traffic and no secret. */
+export function formatPolicySummary(policy) {
+  const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG", "REPOSITORIES"];
+  const rows = policy.workspaces.map((workspace) => [
+    workspace.id,
+    String(workspace.github_team_id),
+    workspace.github_team_slug ?? "-",
+    String(workspace.repository_ids.length),
+  ]);
+  const widths = header.map((title, column) => Math.max(title.length, ...rows.map((row) => row[column].length)));
+  const line = (values) => values.map((value, column) => value.padEnd(widths[column])).join("  ").trimEnd();
+  return [
+    `${policy.schema_version} owner=${policy.github_owner.login} installation=${policy.installation_id}`,
+    line(header),
+    ...rows.map(line),
+  ].join("\n") + "\n";
+}
+
+/**
+ * `policy check [--live]` is the migration and readback gate an operator runs before a
+ * policy is deployed. It runs on the operator's machine, so the policy and App key may
+ * be read from any custody path; only the serving commands require the runtime mounts.
+ */
+async function runPolicyCheck({ live, env, write }) {
+  const policyFile = env.BROKER_POLICY_FILE ?? "";
+  if (policyFile === "") fail("BROKER_POLICY_FILE must name the policy to check");
+  const policy = parsePolicy(fs.readFileSync(policyFile, "utf8"));
+  write(formatPolicySummary(policy));
+  if (!live) return true;
+
+  const privateKeyFile = env.GITHUB_APP_PRIVATE_KEY_FILE ?? "";
+  if (privateKeyFile === "") fail("GITHUB_APP_PRIVATE_KEY_FILE must name the App private key for a live check");
+  const github = createGithubClient({
+    appId: env.GITHUB_APP_ID ?? "",
+    privateKey: fs.readFileSync(privateKeyFile),
+  });
+  const result = await checkPolicyLive({ policy, github });
+  write(formatPolicyCheckTable(result.rows));
+  return result.ok;
 }
 
 async function main() {
   const command = parseCommand(process.argv.slice(2));
+  if (command.mode === "policy-check") {
+    const ok = await runPolicyCheck({
+      live: command.live,
+      env: process.env,
+      write: (text) => process.stdout.write(text),
+    });
+    if (!ok) process.exitCode = 1;
+    return;
+  }
+
   const appId = process.env.GITHUB_APP_ID ?? "";
   const privateKeyFile = process.env.GITHUB_APP_PRIVATE_KEY_FILE ?? "";
   const policyFile = process.env.BROKER_POLICY_FILE ?? "";
@@ -160,7 +216,7 @@ async function main() {
     privateKey: fs.readFileSync(privateKeyFile),
   });
   const policy = parsePolicy(fs.readFileSync(policyFile, "utf8"));
-  if (command.verifyOnly) {
+  if (command.mode === "verify") {
     snapshotWorkspaceCredentials(policy, { readFile: fs.readFileSync, realpath: fs.realpathSync });
     await github.verifyPolicy(policy);
     return;

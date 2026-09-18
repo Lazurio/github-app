@@ -1,5 +1,5 @@
 {
-  "schema_version": "lazurio.github_app_broker.policy.v1",
+  "schema_version": "lazurio.github_app_broker.policy.v2",
   "github_app": {
     "id": 1234,
     "slug": "customer-app"
@@ -14,8 +14,9 @@
     "actions": "write",
     "checks": "read",
     "contents": "write",
-    "pull_requests": "write",
-    "metadata": "read"
+    "members": "read",
+    "metadata": "read",
+    "pull_requests": "write"
   },
   "repositories": [
     {
@@ -26,6 +27,8 @@
   "workspaces": [
     {
       "id": "example-team",
+      "github_team_id": 4001,
+      "github_team_slug": "example-team",
       "credential_file": "/run/secrets/workspace-example-team",
       "repository_ids": [3001]
     }
