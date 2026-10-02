@@ -41,8 +41,12 @@ stay material: one immutable repository per short-lived token, an exact
 Workspace repository allowlist and no Checks write access.
 
 `workflows: write` lets a Workspace push commits that change
-`.github/workflows/`. A changed workflow runs with that repository's Actions
-secrets, so this is the same authority a Team member with a write grant
+`.github/workflows/`. Editing a workflow does not by itself run it or hand it
+secrets, but a workflow it writes can, in an eligible run, reference and
+exfiltrate the repository and Organization Actions secrets available to that
+run, subject to environment protections (fork-pull-request and Dependabot
+events withhold ordinary secrets, and protected environment secrets need
+approval). That is the same capability a Team member with a write grant
 already has from GitHub, and an Organization opts into it by accepting the
 App permission and declaring it in its reviewed policy. A policy without it
 mints the base set, so the release can roll out before any Organization

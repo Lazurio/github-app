@@ -140,7 +140,7 @@ policy verification has succeeded.
 
 Every `POST /v1/token` passes these gates in order; a failed gate never issues
 a scoped repository token. The Team gate itself first mints a short-lived
-`members: read` probe token, performs the Team read and revokes the probe, so
+`members: read` plus `metadata: read` probe token, performs the Team read and revokes the probe, so
 a Team or grant refusal has already cost that probe mint and revocation — it
 only guarantees that no final repository token exists:
 
