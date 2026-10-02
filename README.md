@@ -152,8 +152,8 @@ only guarantees that no final repository token exists:
 | `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, or the mint left the requested scope. |
 | `415` | `unsupported_media_type` | Body is not JSON. |
 
-The Team gate runs live on every mint with a short-lived `members: read` probe
-token that is revoked immediately afterwards. Its two read requests are
+The Team gate runs live on every mint with a short-lived `members: read` plus
+`metadata: read` probe token that is revoked immediately afterwards. Its two read requests are
 addressed by immutable ids:
 
 1. `GET /organizations/{org_id}/team/{team_id}` proves the Team still exists in
@@ -165,6 +165,9 @@ addressed by immutable ids:
    repository id to match and `push`, `maintain` or `admin` to be `true`. A
    `404` means no grant (Organization `members: read`; GitHub also lists this
    endpoint under repository `administration: read`, which is not required).
+   The probe also needs repository `metadata: read`: without it GitHub
+   answers `404` for every private repository the probe cannot see, which
+   would look like a missing grant.
 
 The `{owner}/{repo}` path segment is the policy's asserted `full_name`, whose
 immutable id was already proven against the live installation. A repository
@@ -253,7 +256,8 @@ Without `--live` the command only parses the policy and prints the Workspace
 to Team binding; it needs no key and makes no GitHub call. With `--live` it
 first performs the same installation verification as `--verify-only`, then
 reads back every `repository_ids` entry of every Workspace with one
-`members: read` probe token per Workspace, and prints one row per grant:
+`members: read` plus `metadata: read` probe token per Workspace, and prints one
+row per grant:
 
 ```text
 WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY         ROLE   STATUS   DETAIL

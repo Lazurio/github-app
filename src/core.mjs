@@ -23,8 +23,12 @@ const WORKFLOW_TOKEN_PERMISSIONS = Object.freeze({ ...TOKEN_PERMISSIONS, workflo
 function tokenPermissions(policy) {
   return policy.installation_permissions.workflows === "write" ? WORKFLOW_TOKEN_PERMISSIONS : TOKEN_PERMISSIONS;
 }
-/** Organization `members: read` is the GitHub App permission that reads Teams and Team repository grants. */
-const TEAM_PROBE_PERMISSIONS = Object.freeze({ members: "read" });
+/**
+ * Organization `members: read` reads Teams and Team repository grants. GitHub answers the Team
+ * repository check with 404 unless the token can also see the repository, which takes
+ * `metadata: read`; a `members: read`-only probe therefore refuses every private repository.
+ */
+const TEAM_PROBE_PERMISSIONS = Object.freeze({ members: "read", metadata: "read" });
 /** Custom media type that makes the Team repository check return the repository with its `permissions`. */
 const REPOSITORY_PERMISSIONS_MEDIA_TYPE = "application/vnd.github.v3.repository+json";
 

@@ -857,7 +857,7 @@ test("verifies the live Team binding and write-capable grant with a revoked memb
     "GET /organizations/1001/team/4001/repos/example-org/alpha",
     "DELETE /installation/token",
   ]);
-  assert.deepEqual(calls[0].body, { permissions: { members: "read" } });
+  assert.deepEqual(calls[0].body, { permissions: { members: "read", metadata: "read" } });
   assert.equal(calls[1].authorization, "Bearer ghs_team_probe");
   assert.equal(calls[2].accept, "application/vnd.github.v3.repository+json");
   assert.equal(calls[3].authorization, "Bearer ghs_team_probe");

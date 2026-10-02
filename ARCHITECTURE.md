@@ -65,7 +65,8 @@ is nevertheless a separate, deny-only admission gate that decides which live
 grants the broker will use at all: a repository outside the allowlist is
 refused before the Team grant is read, even when the Team holds a write grant
 on it. On every token request, after the credential and allowlist
-checks, the runtime mints a `members: read` probe token, reads the Team by
+checks, the runtime mints a `members: read` plus `metadata: read` probe token,
+reads the Team by
 `/organizations/{org_id}/team/{team_id}`, checks the Team's grant on the exact
 repository with `/organizations/{org_id}/team/{team_id}/repos/{owner}/{repo}`
 and the repository-permissions media type, revokes the probe, and only then
