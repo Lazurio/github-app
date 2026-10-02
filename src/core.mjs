@@ -13,6 +13,16 @@ const TOKEN_PERMISSIONS = Object.freeze({
   contents: "write",
   pull_requests: "write",
 });
+/**
+ * Pushing a commit that touches `.github/workflows/` needs `workflows: write`. The token asks for it
+ * only when the Organization accepted it and the reviewed policy declares it, so a deployment whose
+ * installation has not accepted the permission keeps minting the base set.
+ */
+const WORKFLOW_TOKEN_PERMISSIONS = Object.freeze({ ...TOKEN_PERMISSIONS, workflows: "write" });
+
+function tokenPermissions(policy) {
+  return policy.installation_permissions.workflows === "write" ? WORKFLOW_TOKEN_PERMISSIONS : TOKEN_PERMISSIONS;
+}
 /** Organization `members: read` is the GitHub App permission that reads Teams and Team repository grants. */
 const TEAM_PROBE_PERMISSIONS = Object.freeze({ members: "read" });
 /** Custom media type that makes the Team repository check return the repository with its `permissions`. */
@@ -415,11 +425,12 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
   }
 
   async function mintToken(policy, repositoryId) {
+    const requested = tokenPermissions(policy);
     const result = await request(`/app/installations/${policy.installation_id}/access_tokens`, {
       method: "POST",
       body: {
         repository_ids: [repositoryId],
-        permissions: TOKEN_PERMISSIONS,
+        permissions: requested,
       },
     });
     const expiresAt = Date.parse(result?.expires_at ?? "");
@@ -433,19 +444,10 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       expiresAt > now() + 65 * 60 * 1000 ||
       returnedRepositories.length !== 1 ||
       returnedRepositories[0]?.id !== repositoryId ||
-      returnedPermissions.actions !== "write" ||
-      returnedPermissions.checks !== "read" ||
-      returnedPermissions.contents !== "write" ||
-      returnedPermissions.pull_requests !== "write" ||
+      Object.entries(requested).some(([permission, level]) => returnedPermissions[permission] !== level) ||
       Object.entries(returnedPermissions).some(
         ([permission, level]) =>
-          !(
-            (permission === "actions" && level === "write") ||
-            (permission === "checks" && level === "read") ||
-            (permission === "contents" && level === "write") ||
-            (permission === "pull_requests" && level === "write") ||
-            (permission === "metadata" && level === "read")
-          ),
+          requested[permission] !== level && !(permission === "metadata" && level === "read"),
       )
     ) {
       fail("GitHub returned a token outside the requested repository or permission scope");

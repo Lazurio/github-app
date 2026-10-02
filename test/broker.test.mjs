@@ -594,6 +594,53 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
   );
 });
 
+test("asks for workflows: write only when the policy declares the accepted permission", async () => {
+  const now = 1_700_000_000_000;
+  const base = { actions: "write", checks: "read", contents: "write", pull_requests: "write" };
+  let requested;
+  let responsePermissions;
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (_url, init) => {
+      requested = JSON.parse(init.body).permissions;
+      return jsonResponse({
+        token: "ghs_scoped_synthetic_token",
+        expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: 3001 }],
+        permissions: responsePermissions,
+      });
+    },
+    now: () => now,
+  });
+
+  const withoutWorkflows = parsePolicy(policyFixture());
+  responsePermissions = { ...base, metadata: "read", workflows: "write" };
+  await assert.rejects(
+    () => github.mintToken(withoutWorkflows, 3001),
+    /outside the requested repository or permission scope/,
+  );
+  assert.deepEqual(requested, base);
+
+  const fixture = policyFixture();
+  fixture.installation_permissions = { ...fixture.installation_permissions, emails: "read", workflows: "write" };
+  const withWorkflows = parsePolicy(fixture);
+  assert.equal((await github.mintToken(withWorkflows, 3001)).repository_id, 3001);
+  assert.deepEqual(requested, { ...base, workflows: "write" });
+
+  responsePermissions = { ...base, metadata: "read" };
+  await assert.rejects(
+    () => github.mintToken(withWorkflows, 3001),
+    /outside the requested repository or permission scope/,
+  );
+
+  responsePermissions = { ...base, metadata: "read", workflows: "write", emails: "read" };
+  await assert.rejects(
+    () => github.mintToken(withWorkflows, 3001),
+    /outside the requested repository or permission scope/,
+  );
+});
+
 test("rejects duplicated Workspace credential values and aliased paths before listening", async () => {
   const policy = parsePolicy(policyFixture());
   const github = { verifyPolicy: async () => {} };

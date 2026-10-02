@@ -4,7 +4,8 @@ Open-source, publicly auditable source for the small credential boundary used
 by Lazurio Team Workspaces. The broker exchanges an authenticated Workspace
 request for a short-lived GitHub App installation token restricted to one
 immutable repository id and exactly `actions: write`, `checks: read`,
-`contents: write` plus `pull_requests: write`.
+`contents: write` plus `pull_requests: write`, and `workflows: write` where the
+Organization's policy declares it.
 
 Lazurio for GitHub is an independent project. It is not affiliated with,
 sponsored by, or endorsed by GitHub, Inc. GitHub and GitHub CLI are trademarks
@@ -107,6 +108,13 @@ Schema v2 makes the Team binding part of the contract:
   the policy is reviewed, and the slug never selects a different Team.
 - `installation_permissions.members` must be `read`: the App reads Teams and
   Team repository grants through this Organization permission.
+- `installation_permissions.workflows: write` is optional. When the
+  Organization accepted it and the policy declares it, every token also asks
+  for `workflows: write`, so a Workspace can push commits that add or change
+  `.github/workflows/` files in its repository, exactly like a Team member
+  with a write grant. Without it the token keeps the base set. Because the
+  installation gate compares permissions exactly, accept the permission and
+  deploy the policy that declares it in one short window.
 - `id`, `credential_file` and `repository_ids` keep their v1 meaning.
 
 Schema v1 is retired and rejected with a migration message. Existing v1
