@@ -4,7 +4,8 @@ Open-source, publicly auditable source for the small credential boundary used
 by Lazurio Team Workspaces. The broker exchanges an authenticated Workspace
 request for a short-lived GitHub App installation token restricted to one
 immutable repository id and exactly `actions: write`, `checks: read`,
-`contents: write` plus `pull_requests: write`.
+`contents: write` plus `pull_requests: write`, and `workflows: write` where the
+Organization's policy declares it.
 
 Lazurio for GitHub is an independent project. It is not affiliated with,
 sponsored by, or endorsed by GitHub, Inc. GitHub and GitHub CLI are trademarks
@@ -107,6 +108,13 @@ Schema v2 makes the Team binding part of the contract:
   the policy is reviewed, and the slug never selects a different Team.
 - `installation_permissions.members` must be `read`: the App reads Teams and
   Team repository grants through this Organization permission.
+- `installation_permissions.workflows: write` is optional. When the
+  Organization accepted it and the policy declares it, every token also asks
+  for `workflows: write`, so a Workspace can push commits that add or change
+  `.github/workflows/` files in its repository, exactly like a Team member
+  with a write grant. Without it the token keeps the base set. Because the
+  installation gate compares permissions exactly, accept the permission and
+  deploy the policy that declares it in one short window.
 - `id`, `credential_file` and `repository_ids` keep their v1 meaning.
 
 Schema v1 is retired and rejected with a migration message. Existing v1
@@ -132,7 +140,7 @@ policy verification has succeeded.
 
 Every `POST /v1/token` passes these gates in order; a failed gate never issues
 a scoped repository token. The Team gate itself first mints a short-lived
-`members: read` probe token, performs the Team read and revokes the probe, so
+`members: read` plus `metadata: read` probe token, performs the Team read and revokes the probe, so
 a Team or grant refusal has already cost that probe mint and revocation — it
 only guarantees that no final repository token exists:
 
@@ -144,8 +152,8 @@ only guarantees that no final repository token exists:
 | `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, or the mint left the requested scope. |
 | `415` | `unsupported_media_type` | Body is not JSON. |
 
-The Team gate runs live on every mint with a short-lived `members: read` probe
-token that is revoked immediately afterwards. Its two read requests are
+The Team gate runs live on every mint with a short-lived `members: read` plus
+`metadata: read` probe token that is revoked immediately afterwards. Its two read requests are
 addressed by immutable ids:
 
 1. `GET /organizations/{org_id}/team/{team_id}` proves the Team still exists in
@@ -157,6 +165,9 @@ addressed by immutable ids:
    repository id to match and `push`, `maintain` or `admin` to be `true`. A
    `404` means no grant (Organization `members: read`; GitHub also lists this
    endpoint under repository `administration: read`, which is not required).
+   The probe also needs repository `metadata: read`: without it GitHub
+   answers `404` for every private repository the probe cannot see, which
+   would look like a missing grant.
 
 The `{owner}/{repo}` path segment is the policy's asserted `full_name`, whose
 immutable id was already proven against the live installation. A repository
@@ -245,7 +256,8 @@ Without `--live` the command only parses the policy and prints the Workspace
 to Team binding; it needs no key and makes no GitHub call. With `--live` it
 first performs the same installation verification as `--verify-only`, then
 reads back every `repository_ids` entry of every Workspace with one
-`members: read` probe token per Workspace, and prints one row per grant:
+`members: read` plus `metadata: read` probe token per Workspace, and prints one
+row per grant:
 
 ```text
 WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY         ROLE   STATUS   DETAIL

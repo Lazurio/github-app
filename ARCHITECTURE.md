@@ -24,7 +24,9 @@ repository set. The Node adapter performs this gate before listening; the
 Worker performs it after local authorization on every valid token request.
 Every token request then asks GitHub to mint a new one-repository token with
 exactly `actions: write`,
-`checks: read`, `contents: write` and `pull_requests: write`; removal of a live
+`checks: read`, `contents: write` and `pull_requests: write`, plus
+`workflows: write` when the policy declares that the installation accepted it,
+and refuses a response with any other scope; removal of a live
 repository grant therefore fails the next issuance without waiting for a local
 cache.
 Between the installation gate and the mint, the runtime performs the Team gate
@@ -37,6 +39,18 @@ rerun-only installation permission: `actions: write` also authorizes other
 Actions mutations in the same repository. The remaining boundaries therefore
 stay material: one immutable repository per short-lived token, an exact
 Workspace repository allowlist and no Checks write access.
+
+`workflows: write` lets a Workspace push commits that change
+`.github/workflows/`. Editing a workflow does not by itself run it or hand it
+secrets, but a workflow it writes can, in an eligible run, reference and
+exfiltrate the repository and Organization Actions secrets available to that
+run, subject to environment protections (fork-pull-request and Dependabot
+events withhold ordinary secrets, and protected environment secrets need
+approval). That is the same capability a Team member with a write grant
+already has from GitHub, and an Organization opts into it by accepting the
+App permission and declaring it in its reviewed policy. A policy without it
+mints the base set, so the release can roll out before any Organization
+accepts.
 
 ## Team binding and live grant verification
 
@@ -55,7 +69,8 @@ is nevertheless a separate, deny-only admission gate that decides which live
 grants the broker will use at all: a repository outside the allowlist is
 refused before the Team grant is read, even when the Team holds a write grant
 on it. On every token request, after the credential and allowlist
-checks, the runtime mints a `members: read` probe token, reads the Team by
+checks, the runtime mints a `members: read` plus `metadata: read` probe token,
+reads the Team by
 `/organizations/{org_id}/team/{team_id}`, checks the Team's grant on the exact
 repository with `/organizations/{org_id}/team/{team_id}/repos/{owner}/{repo}`
 and the repository-permissions media type, revokes the probe, and only then
