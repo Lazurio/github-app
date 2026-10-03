@@ -2,13 +2,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import * as brokerClient from "../adapter/broker-client.mjs";
 import {
-  firstPolicyRepository,
   normalizeRepository,
   parseBrokerClientConfig,
-  parseRepositoryPolicy,
   repositoryIdentityKey,
   requestGitHubAppToken,
+  requestWorkspaceProof,
   requireHttpsGitHubOrigin,
 } from "../adapter/broker-client.mjs";
 import {
@@ -25,10 +25,6 @@ import {
 const TOKEN = "ghs_secret_token_that_must_never_be_rendered";
 const NOW = Date.parse("2026-08-18T12:00:00Z");
 const environment = {
-  GITHUB_REPOSITORY_POLICY_JSON: JSON.stringify({
-    "Example/Bravo": 202,
-    "Example/Alpha": 101,
-  }),
   GITHUB_TOKEN_BROKER_URL: "http://github-token-broker:8787",
   GITHUB_BROKER_WORKSPACE_ID: "example-management",
   GITHUB_BROKER_CLIENT_CREDENTIAL_FILE: "/run/secrets/github_broker_client_token",
@@ -38,28 +34,22 @@ function response(body, { ok = true } = {}) {
   return { ok, json: async () => body };
 }
 
-function validToken(repositoryId = 101) {
+function validToken(repositoryId = 101, repository = "Example/Alpha") {
   return {
     token: TOKEN,
     repository_id: repositoryId,
+    repository,
     expires_at: "2026-08-18T13:00:00Z",
   };
 }
 
-test("validates and deterministically sorts the Team repository policy", () => {
-  assert.deepEqual(parseRepositoryPolicy(environment), [
-    { repository: "Example/Alpha", repositoryId: 101 },
-    { repository: "Example/Bravo", repositoryId: 202 },
-  ]);
-  assert.equal(firstPolicyRepository(environment), "Example/Alpha");
+test("normalizes repository coordinates and holds no client-side repository policy", () => {
   assert.equal(normalizeRepository("https://github.com/Example/Alpha.git"), "Example/Alpha");
   assert.equal(repositoryIdentityKey("github.com/Example/Alpha"), "example/alpha");
   assert.equal(requireHttpsGitHubOrigin("https://github.com/Example/Alpha.git"), "Example/Alpha");
   assert.throws(() => requireHttpsGitHubOrigin("git@github.com:Example/Alpha.git"), /brokered HTTPS/);
-  assert.throws(
-    () => parseRepositoryPolicy({ GITHUB_REPOSITORY_POLICY_JSON: '{"Example/Alpha":101,"example/alpha":202}' }),
-    /policy is invalid/,
-  );
+  assert.equal("parseRepositoryPolicy" in brokerClient, false);
+  assert.equal("firstPolicyRepository" in brokerClient, false);
 });
 
 test("accepts only the exact T3 discovery and viewer envelopes", () => {
@@ -109,11 +99,12 @@ test("accepts only the exact T3 discovery and viewer envelopes", () => {
   );
 });
 
-test("requests one fresh repo-scoped token without exposing the Workspace credential", async () => {
+test("requests one fresh repo-scoped token by name without exposing the Workspace credential", async () => {
   let captured;
   const result = await requestGitHubAppToken({
     repository: "example/alpha",
-    environment,
+    // A leftover v0.9.0 client policy is ignored: it neither widens nor narrows the request.
+    environment: { ...environment, GITHUB_REPOSITORY_POLICY_JSON: JSON.stringify({ "Example/Bravo": 202 }) },
     readFile: () => "workspace-credential-with-at-least-32-bytes",
     fetchImpl: async (url, options) => {
       captured = { url, options };
@@ -121,9 +112,14 @@ test("requests one fresh repo-scoped token without exposing the Workspace creden
     },
     now: () => NOW,
   });
-  assert.equal(result.repositoryId, 101);
+  assert.deepEqual({ ...result }, {
+    token: TOKEN,
+    repository: "Example/Alpha",
+    repositoryId: 101,
+    expiresAt: "2026-08-18T13:00:00Z",
+  });
   assert.equal(captured.url, "http://github-token-broker:8787/v1/token");
-  assert.deepEqual(JSON.parse(captured.options.body), { repository_id: 101 });
+  assert.deepEqual(JSON.parse(captured.options.body), { repository: "example/alpha" });
   assert.equal(captured.options.headers["X-Lazurio-Workspace-ID"], "example-management");
   assert.equal(captured.options.headers.Authorization.startsWith("Bearer "), true);
 });
@@ -230,7 +226,34 @@ test("a mounted remote config cannot be bypassed by removing environment fields"
   );
 });
 
-test("broker refusal, timeout, malformed policy and malformed response fail closed", async () => {
+test("rejects a broker response for another repository or without a canonical identity", async () => {
+  const shared = {
+    repository: "Example/Alpha",
+    environment,
+    readFile: () => "workspace-credential-with-at-least-32-bytes",
+    now: () => NOW,
+  };
+  for (const body of [
+    validToken(202, "Example/Bravo"),
+    validToken(101, "Other/Alpha"),
+    validToken(101, "https://github.com/Example/Alpha"),
+    validToken(101, "Example/Alpha.git"),
+    { ...validToken(), repository: undefined },
+    validToken(0),
+    validToken(-1),
+    validToken("101"),
+    { ...validToken(), repository_id: undefined },
+    { ...validToken(), expires_at: "2026-08-18T14:30:00Z" },
+  ]) {
+    await assert.rejects(
+      () => requestGitHubAppToken({ ...shared, fetchImpl: async () => response(body) }),
+      /invalid scoped response/,
+      JSON.stringify(body),
+    );
+  }
+});
+
+test("broker refusal, timeout and malformed response fail closed", async () => {
   const shared = {
     repository: "Example/Alpha",
     environment,
@@ -249,10 +272,6 @@ test("broker refusal, timeout, malformed policy and malformed response fail clos
     () => requestGitHubAppToken({ ...shared, fetchImpl: async () => response({ token: TOKEN }) }),
     /invalid scoped response/,
   );
-  await assert.rejects(
-    () => requestGitHubAppToken({ ...shared, environment: { ...environment, GITHUB_REPOSITORY_POLICY_JSON: "{" } }),
-    /policy is invalid/,
-  );
 });
 
 test("auth status performs an uncached live proof and emits the official host schema", async () => {
@@ -262,6 +281,7 @@ test("auth status performs an uncached live proof and emits the official host sc
   const input = {
     args: ["auth", "status", "--json", "hosts"],
     environment,
+    readOrigin: () => "https://github.com/Example/Alpha.git",
     requestToken: async ({ repository }) => {
       proofs += 1;
       assert.equal(repository, "Example/Alpha");
@@ -290,9 +310,11 @@ test("the exact viewer probe reports the machine actor only after a live proof",
   assert.equal(
     await runBrokeredGh({
       args: ["api", "user", "--jq", ".login"],
-      environment,
-      requestToken: async () => {
+      environment: { ...environment, GH_REPO: "Example/Bravo" },
+      readOrigin: () => null,
+      requestToken: async ({ repository }) => {
         calls += 1;
+        assert.equal(repository, "Example/Bravo");
         return { token: TOKEN };
       },
       writeStdout: (value) => stdout.push(value),
@@ -301,6 +323,186 @@ test("the exact viewer probe reports the machine actor only after a live proof",
   );
   assert.equal(calls, 1);
   assert.deepEqual(stdout, [`${HOSTED_GITHUB_ACTOR}\n`]);
+});
+
+const WORKSPACE_PROOF = {
+  workspace_id: "example-management",
+  organization: "Example",
+  github_team_id: 4001,
+  github_team_slug: "management",
+};
+
+function brokerStub(status, body) {
+  const requests = [];
+  return {
+    requests,
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: status >= 200 && status < 300, status, json: async () => body };
+    },
+  };
+}
+
+test("requestWorkspaceProof posts to /v1/workspace with the pinned identity and returns the Team", async () => {
+  const stub = brokerStub(200, WORKSPACE_PROOF);
+  const proof = await requestWorkspaceProof({
+    environment,
+    readFile: () => "workspace-credential-with-at-least-32-bytes",
+    fetchImpl: stub.fetchImpl,
+  });
+  assert.deepEqual({ ...proof }, {
+    workspaceId: "example-management",
+    organization: "Example",
+    githubTeamId: 4001,
+    githubTeamSlug: "management",
+  });
+  assert.equal(stub.requests.length, 1);
+  assert.equal(stub.requests[0].url, "http://github-token-broker:8787/v1/workspace");
+  assert.equal(stub.requests[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(stub.requests[0].options.body), {});
+  assert.equal(stub.requests[0].options.headers["X-Lazurio-Workspace-ID"], "example-management");
+  assert.ok(stub.requests[0].options.signal);
+
+  // The same pinned remote-origin and credential-path validation as the token request.
+  await assert.rejects(
+    () => requestWorkspaceProof({
+      environment: { ...environment, GITHUB_TOKEN_BROKER_URL: "https://attacker.invalid" },
+      readFile: () => "workspace-credential-with-at-least-32-bytes",
+      fetchImpl: stub.fetchImpl,
+    }),
+    /endpoint is invalid/,
+  );
+  await assert.rejects(
+    () => requestWorkspaceProof({
+      environment: { ...environment, GITHUB_BROKER_CLIENT_CREDENTIAL_FILE: "/tmp/credential" },
+      readFile: () => "workspace-credential-with-at-least-32-bytes",
+      fetchImpl: stub.fetchImpl,
+    }),
+    /credential path is invalid/,
+  );
+  assert.equal(stub.requests.length, 1);
+});
+
+test("requestWorkspaceProof fails closed on refusals, outages and foreign or token-bearing answers", async () => {
+  const shared = { environment, readFile: () => "workspace-credential-with-at-least-32-bytes" };
+  for (const [status, body] of [
+    [401, { error: "workspace_unauthorized" }],
+    [403, { error: "team_grant_missing" }],
+    [502, { error: "token_unavailable" }],
+  ]) {
+    await assert.rejects(
+      () => requestWorkspaceProof({ ...shared, fetchImpl: brokerStub(status, body).fetchImpl }),
+      /refused/,
+      String(status),
+    );
+  }
+  await assert.rejects(
+    () => requestWorkspaceProof({ ...shared, fetchImpl: async () => { throw new Error(TOKEN); } }),
+    /unavailable/,
+  );
+  for (const body of [
+    { ...WORKSPACE_PROOF, workspace_id: "other-workspace" },
+    { ...WORKSPACE_PROOF, github_team_id: 0 },
+    { ...WORKSPACE_PROOF, github_team_slug: "" },
+    { ...WORKSPACE_PROOF, organization: "not an org" },
+    { ...WORKSPACE_PROOF, token: TOKEN },
+    null,
+  ]) {
+    await assert.rejects(
+      () => requestWorkspaceProof({ ...shared, fetchImpl: brokerStub(200, body).fetchImpl }),
+      /invalid Workspace proof/,
+      JSON.stringify(body),
+    );
+  }
+});
+
+test("from the Folder root the discovery proofs use /v1/workspace and mint no repository token", async () => {
+  const stdout = [];
+  let tokenRequests = 0;
+  let workspaceProofs = 0;
+  const shared = {
+    environment,
+    readOrigin: () => null,
+    requestToken: async () => {
+      tokenRequests += 1;
+      return { token: TOKEN };
+    },
+    requestWorkspace: async ({ environment: proofEnvironment }) => {
+      workspaceProofs += 1;
+      assert.equal(proofEnvironment, environment);
+      return WORKSPACE_PROOF;
+    },
+    writeStdout: (value) => stdout.push(value),
+    writeStderr: () => {},
+  };
+  assert.equal(await runBrokeredGh({ ...shared, args: ["auth", "status", "--json", "hosts"] }), 0);
+  const status = JSON.parse(stdout.at(-1));
+  assert.equal(status.hosts["github.com"][0].state, "success");
+  assert.equal(status.hosts["github.com"][0].login, HOSTED_GITHUB_ACTOR);
+  assert.equal(await runBrokeredGh({ ...shared, args: ["api", "user", "--jq", ".login"] }), 0);
+  assert.equal(stdout.at(-1), `${HOSTED_GITHUB_ACTOR}\n`);
+  assert.equal(workspaceProofs, 2);
+  assert.equal(tokenRequests, 0);
+});
+
+test("from the Folder root a refused or unavailable Workspace proof fails closed", async () => {
+  for (const [status, body] of [
+    [401, { error: "workspace_unauthorized" }],
+    [403, { error: "team_grant_missing" }],
+    [502, { error: "token_unavailable" }],
+  ]) {
+    const stub = brokerStub(status, body);
+    const stdout = [];
+    const stderr = [];
+    const shared = {
+      environment,
+      readOrigin: () => null,
+      requestToken: async () => {
+        throw new Error("must not mint a repository token from the Folder root");
+      },
+      requestWorkspace: (options) => requestWorkspaceProof({
+        ...options,
+        readFile: () => "workspace-credential-with-at-least-32-bytes",
+        exists: () => false,
+        fetchImpl: stub.fetchImpl,
+      }),
+      writeStdout: (value) => stdout.push(value),
+      writeStderr: (value) => stderr.push(value),
+    };
+    assert.equal(await runBrokeredGh({ ...shared, args: ["auth", "status", "--json", "hosts"] }), 1, String(status));
+    assert.deepEqual(JSON.parse(stdout.at(-1)), { hosts: {} });
+    assert.equal(stderr.at(-1), "Brokered gh authentication proof failed.\n");
+    await assert.rejects(
+      () => runBrokeredGh({ ...shared, args: ["api", "user", "--jq", ".login"] }),
+      /identity proof failed/,
+    );
+    assert.deepEqual(stub.requests.map(({ url }) => url), [
+      "http://github-token-broker:8787/v1/workspace",
+      "http://github-token-broker:8787/v1/workspace",
+    ]);
+  }
+});
+
+test("inside a checkout the discovery proof stays the repository mint and never falls back", async () => {
+  let workspaceProofs = 0;
+  const stdout = [];
+  const exitCode = await runBrokeredGh({
+    args: ["auth", "status", "--json", "hosts"],
+    environment,
+    readOrigin: () => "https://github.com/Example/Alpha.git",
+    requestToken: async () => {
+      throw new Error("team_grant_missing");
+    },
+    requestWorkspace: async () => {
+      workspaceProofs += 1;
+      return WORKSPACE_PROOF;
+    },
+    writeStdout: (value) => stdout.push(value),
+    writeStderr: () => {},
+  });
+  assert.equal(exitCode, 1);
+  assert.deepEqual(JSON.parse(stdout.at(-1)), { hosts: {} });
+  assert.equal(workspaceProofs, 0);
 });
 
 test("repository operations accept T3 lowercase identity and pass only an env-local token", async () => {
@@ -398,7 +600,7 @@ test("local help and version invoke real gh without any ambient credential", asy
   assert.equal(childEnvironment.GITHUB_TOKEN, undefined);
 });
 
-test("repo selection, policy and origin disagreements fail closed", () => {
+test("repo selection and origin disagreements fail closed; no target means no default", () => {
   assert.equal(
     resolveGhRepository({
       args: ["pr", "list", "--repo=Example/Alpha"],
@@ -423,6 +625,14 @@ test("repo selection, policy and origin disagreements fail closed", () => {
         readOrigin: () => "https://github.com/Example/Alpha.git",
       }),
     /does not match/,
+  );
+  assert.equal(
+    resolveGhRepository({ args: ["pr", "list", "-R", "Example/Bravo"], environment: {}, readOrigin: () => null }),
+    "Example/Bravo",
+  );
+  assert.throws(
+    () => resolveGhRepository({ args: ["pr", "list"], environment: {}, readOrigin: () => null }),
+    /run gh inside a Team repository checkout or pass --repo OWNER\/REPO/,
   );
 });
 

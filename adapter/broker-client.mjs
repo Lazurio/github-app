@@ -37,46 +37,6 @@ export function requireHttpsGitHubOrigin(value) {
   return normalizeRepository(candidate);
 }
 
-export function parseRepositoryPolicy(environment = process.env) {
-  let input;
-  try {
-    input = JSON.parse(environment.GITHUB_REPOSITORY_POLICY_JSON ?? "null");
-  } catch {
-    fail("Team repository policy is invalid");
-  }
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    fail("Team repository policy is invalid");
-  }
-
-  const entries = Object.entries(input).map(([repository, repositoryId]) => {
-    const coordinate = normalizeRepository(repository);
-    if (
-      coordinate !== repository ||
-      !Number.isSafeInteger(repositoryId) ||
-      repositoryId <= 0
-    ) {
-      fail("Team repository policy is invalid");
-    }
-    return Object.freeze({ repository: coordinate, repositoryId });
-  });
-  if (entries.length === 0) fail("Team repository policy is invalid");
-  if (
-    new Set(entries.map(({ repository }) => repositoryIdentityKey(repository))).size !==
-      entries.length ||
-    new Set(entries.map(({ repositoryId }) => repositoryId)).size !== entries.length
-  ) {
-    fail("Team repository policy is invalid");
-  }
-  entries.sort(({ repository: left }, { repository: right }) =>
-    left < right ? -1 : left > right ? 1 : 0,
-  );
-  return Object.freeze(entries);
-}
-
-export function firstPolicyRepository(environment = process.env) {
-  return parseRepositoryPolicy(environment)[0].repository;
-}
-
 export function parseBrokerClientConfig(raw) {
   let input;
   try {
@@ -142,22 +102,8 @@ function requireBrokerRuntime(environment, readFile, exists) {
   return Object.freeze({ workspaceId, brokerOrigin });
 }
 
-export async function requestGitHubAppToken({
-  repository,
-  environment = process.env,
-  readFile = fs.readFileSync,
-  exists = fs.existsSync,
-  fetchImpl = fetch,
-  now = () => Date.now(),
-  timeoutMs = 5_000,
-}) {
-  const coordinate = normalizeRepository(repository);
-  const policy = parseRepositoryPolicy(environment);
-  const coordinateKey = repositoryIdentityKey(coordinate);
-  const policyEntry = policy.find(
-    (entry) => repositoryIdentityKey(entry.repository) === coordinateKey,
-  );
-  if (!policyEntry) fail("repository is outside the Team Workspace policy");
+/** Authenticated POST to one broker route with the pinned origin, Workspace id and credential. */
+async function postToBroker(path, body, { environment, readFile, exists, fetchImpl, timeoutMs }) {
   const { workspaceId, brokerOrigin } = requireBrokerRuntime(environment, readFile, exists);
 
   const clientCredential = readFile(CREDENTIAL_FILE, "utf8").trim();
@@ -167,14 +113,14 @@ export async function requestGitHubAppToken({
 
   let response;
   try {
-    response = await fetchImpl(`${brokerOrigin}/v1/token`, {
+    response = await fetchImpl(`${brokerOrigin}${path}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${clientCredential}`,
         "Content-Type": "application/json",
         "X-Lazurio-Workspace-ID": workspaceId,
       },
-      body: JSON.stringify({ repository_id: policyEntry.repositoryId }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
@@ -182,17 +128,44 @@ export async function requestGitHubAppToken({
   }
   if (!response.ok) fail("GitHub token broker refused the request");
 
-  let result;
   try {
-    result = await response.json();
+    return { workspaceId, result: await response.json() };
   } catch {
-    fail("GitHub token broker returned an invalid scoped response");
+    return { workspaceId, result: undefined };
   }
+}
+
+export async function requestGitHubAppToken({
+  repository,
+  environment = process.env,
+  readFile = fs.readFileSync,
+  exists = fs.existsSync,
+  fetchImpl = fetch,
+  now = () => Date.now(),
+  timeoutMs = 5_000,
+}) {
+  // The broker decides the scope from the live GitHub Team grant; the client holds no allowlist.
+  const coordinate = normalizeRepository(repository);
+  const { result } = await postToBroker(
+    "/v1/token",
+    { repository: coordinate },
+    { environment, readFile, exists, fetchImpl, timeoutMs },
+  );
   const expiresAt = Date.parse(result?.expires_at ?? "");
+  let returnedRepository;
+  try {
+    returnedRepository = normalizeRepository(result?.repository);
+  } catch {
+    returnedRepository = undefined;
+  }
   if (
     typeof result?.token !== "string" ||
     result.token.length < 20 ||
-    result.repository_id !== policyEntry.repositoryId ||
+    returnedRepository === undefined ||
+    returnedRepository !== result.repository ||
+    repositoryIdentityKey(returnedRepository) !== repositoryIdentityKey(coordinate) ||
+    !Number.isSafeInteger(result?.repository_id) ||
+    result.repository_id <= 0 ||
     !Number.isFinite(expiresAt) ||
     expiresAt <= now() ||
     expiresAt > now() + MAX_TOKEN_LIFETIME_MS
@@ -201,8 +174,44 @@ export async function requestGitHubAppToken({
   }
   return Object.freeze({
     token: result.token,
-    repository: coordinate,
-    repositoryId: policyEntry.repositoryId,
+    repository: returnedRepository,
+    repositoryId: result.repository_id,
     expiresAt: result.expires_at,
+  });
+}
+
+/**
+ * Repository-independent connection proof: the broker verifies the live installation and the
+ * Workspace's GitHub Team and mints no repository token.
+ */
+export async function requestWorkspaceProof({
+  environment = process.env,
+  readFile = fs.readFileSync,
+  exists = fs.existsSync,
+  fetchImpl = fetch,
+  timeoutMs = 5_000,
+} = {}) {
+  const { workspaceId, result } = await postToBroker(
+    "/v1/workspace",
+    {},
+    { environment, readFile, exists, fetchImpl, timeoutMs },
+  );
+  if (
+    result?.workspace_id !== workspaceId ||
+    typeof result?.organization !== "string" ||
+    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(result.organization) ||
+    !Number.isSafeInteger(result?.github_team_id) ||
+    result.github_team_id <= 0 ||
+    typeof result?.github_team_slug !== "string" ||
+    result.github_team_slug.length === 0 ||
+    "token" in result
+  ) {
+    fail("GitHub token broker returned an invalid Workspace proof");
+  }
+  return Object.freeze({
+    workspaceId,
+    organization: result.organization,
+    githubTeamId: result.github_team_id,
+    githubTeamSlug: result.github_team_slug,
   });
 }

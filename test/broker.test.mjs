@@ -23,7 +23,7 @@ const secretByPath = new Map([
 
 function policyFixture() {
   return {
-    schema_version: "lazurio.github_app_broker.policy.v2",
+    schema_version: "lazurio.github_app_broker.policy.v3",
     github_app: { id: 42, slug: "example-app" },
     github_owner: { id: 1001, login: "example-org" },
     installation_id: 2001,
@@ -36,44 +36,57 @@ function policyFixture() {
       metadata: "read",
       pull_requests: "write",
     },
-    repositories: [
-      { id: 3001, full_name: "example-org/alpha" },
-      { id: 3002, full_name: "example-org/beta" },
-    ],
     workspaces: [
       {
         id: "alpha-team",
         github_team_id: 4001,
         github_team_slug: "alpha-team",
         credential_file: "/run/secrets/workspace-alpha",
-        repository_ids: [3001],
       },
       {
         id: "beta-team",
         github_team_id: 4002,
         credential_file: "/run/secrets/workspace-beta",
-        repository_ids: [3002],
       },
     ],
   };
 }
 
-const grantedTeam = async (_policy, workspace, repositoryId) => ({
-  workspace_id: workspace.id,
-  github_team_id: workspace.github_team_id,
-  github_team_slug: workspace.github_team_slug ?? workspace.id,
-  repository_id: repositoryId,
-  role: "write",
+const SYNTHETIC_REPOSITORIES = new Map([
+  ["example-org/alpha", 3001],
+  ["example-org/beta", 3002],
+]);
+
+/** Synthetic Workspace Team proof: the bound Team exists with its asserted identity. */
+const provenTeam = async (_policy, workspace) => ({
+  id: workspace.github_team_id,
+  slug: workspace.github_team_slug ?? workspace.id,
 });
+
+/** Synthetic Team gate: resolves both body forms to the canonical repository id and name. */
+const grantedTeam = async (_policy, workspace, target) => {
+  const entry = target.repository_id === undefined
+    ? [...SYNTHETIC_REPOSITORIES].find(([name]) => name === target.repository.toLowerCase())
+    : [...SYNTHETIC_REPOSITORIES].find(([, id]) => id === target.repository_id);
+  if (!entry) throw Object.assign(new Error("no grant"), { code: "team_grant_missing" });
+  return {
+    workspace_id: workspace.id,
+    github_team_id: workspace.github_team_id,
+    github_team_slug: workspace.github_team_slug ?? workspace.id,
+    repository_id: entry[1],
+    full_name: entry[0],
+    role: "write",
+  };
+};
 
 async function withServer(run, mintToken = async (_policy, repositoryId) => ({
   token: `ghs_synthetic_${repositoryId}`,
   expires_at: "2030-01-01T00:00:00Z",
   repository_id: repositoryId,
-}), verifyTeamGrant = grantedTeam) {
+}), verifyTeamGrant = grantedTeam, verifyWorkspaceTeam = provenTeam) {
   const server = createBrokerServer({
     policy: parsePolicy(policyFixture()),
-    github: { verifyTeamGrant, mintToken },
+    github: { verifyTeamGrant, verifyWorkspaceTeam, mintToken },
     readFile: (file) => secretByPath.get(file) ?? "",
     realpath: (file) => file,
   });
@@ -88,7 +101,12 @@ async function withServer(run, mintToken = async (_policy, repositoryId) => ({
   }
 }
 
-function request(origin, { workspace = "alpha-team", secret = secretByPath.get("/run/secrets/workspace-alpha"), repositoryId = 3001 } = {}) {
+function request(origin, {
+  workspace = "alpha-team",
+  secret = secretByPath.get("/run/secrets/workspace-alpha"),
+  body = { repository: "example-org/alpha" },
+  rawBody,
+} = {}) {
   return fetch(`${origin}/v1/token`, {
     method: "POST",
     headers: {
@@ -96,7 +114,7 @@ function request(origin, { workspace = "alpha-team", secret = secretByPath.get("
       "Content-Type": "application/json",
       "X-Lazurio-Workspace-ID": workspace,
     },
-    body: JSON.stringify({ repository_id: repositoryId }),
+    body: rawBody ?? JSON.stringify(body),
   });
 }
 
@@ -126,16 +144,19 @@ function requestHeadersWithoutBody(origin, { contentType, secret }) {
   });
 }
 
-test("mints a non-cacheable token only for the Workspace repository id", async () => {
+test("mints a non-cacheable token for the Team-granted repository in both body forms", async () => {
   await withServer(async (origin) => {
-    const response = await request(origin);
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get("cache-control"), "no-store");
-    assert.deepEqual(await response.json(), {
-      token: "ghs_synthetic_3001",
-      expires_at: "2030-01-01T00:00:00Z",
-      repository_id: 3001,
-    });
+    for (const body of [{ repository: "example-org/alpha" }, { repository: "Example-Org/Alpha" }, { repository_id: 3001 }]) {
+      const response = await request(origin, { body });
+      assert.equal(response.status, 200, JSON.stringify(body));
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.deepEqual(await response.json(), {
+        token: "ghs_synthetic_3001",
+        expires_at: "2030-01-01T00:00:00Z",
+        repository_id: 3001,
+        repository: "example-org/alpha",
+      });
+    }
   });
 });
 
@@ -171,19 +192,65 @@ test("rejects media type and credentials before reading a token body", async () 
   });
 });
 
-test("rejects cross-Workspace repository access before calling GitHub", async () => {
+test("rejects a repository of another owner by name before any GitHub traffic", async () => {
   let calls = 0;
+  const count = async () => {
+    calls += 1;
+    throw new Error("must not be called");
+  };
   await withServer(
     async (origin) => {
-      const response = await request(origin, { repositoryId: 3002 });
-      assert.equal(response.status, 403);
-      assert.deepEqual(await response.json(), { error: "repository_denied" });
+      for (const repository of ["other-org/alpha", "example-org-two/alpha", "Other-Org/beta"]) {
+        const response = await request(origin, { body: { repository } });
+        assert.equal(response.status, 403, repository);
+        assert.deepEqual(await response.json(), { error: "repository_denied" });
+      }
       assert.equal(calls, 0);
     },
-    async () => {
-      calls += 1;
-      throw new Error("must not be called");
+    count,
+    count,
+  );
+});
+
+test("rejects every body other than exactly one repository form with 400 and no GitHub traffic", async () => {
+  let calls = 0;
+  const count = async () => {
+    calls += 1;
+    throw new Error("must not be called");
+  };
+  await withServer(
+    async (origin) => {
+      for (const rawBody of [
+        "{",
+        "[]",
+        "null",
+        "\"example-org/alpha\"",
+        "{}",
+        JSON.stringify({ repository: "example-org/alpha", repository_id: 3001 }),
+        JSON.stringify({ repository_id: 3001, padding: "x" }),
+        JSON.stringify({ repository_id: "3001" }),
+        JSON.stringify({ repository_id: 0 }),
+        JSON.stringify({ repository_id: -1 }),
+        JSON.stringify({ repository_id: 1.5 }),
+        JSON.stringify({ repository_id: 2 ** 53 }),
+        JSON.stringify({ repository: "example-org" }),
+        JSON.stringify({ repository: "example-org/alpha/extra" }),
+        JSON.stringify({ repository: "example-org/.." }),
+        JSON.stringify({ repository: "example-org/." }),
+        JSON.stringify({ repository: "example-org/al%2Fpha" }),
+        JSON.stringify({ repository: "https://github.com/example-org/alpha" }),
+        JSON.stringify({ repository: " example-org/alpha" }),
+        JSON.stringify({ repository: 3001 }),
+        JSON.stringify({ full_name: "example-org/alpha" }),
+      ]) {
+        const response = await request(origin, { rawBody });
+        assert.equal(response.status, 400, rawBody);
+        assert.deepEqual(await response.json(), { error: "invalid_request" });
+      }
+      assert.equal(calls, 0);
     },
+    count,
+    count,
   );
 });
 
@@ -219,11 +286,7 @@ test("fails closed when GitHub stops issuing a repository token", async () => {
   );
 });
 
-test("policy rejects mutable-name drift and ambiguous Workspace credentials", () => {
-  const wrongOwner = policyFixture();
-  wrongOwner.repositories[0].full_name = "other-org/alpha";
-  assert.throws(() => parsePolicy(wrongOwner), /asserted owner/);
-
+test("policy rejects ambiguous Workspace credentials and incomplete permissions", () => {
   const duplicateSecret = policyFixture();
   duplicateSecret.workspaces[1].credential_file = duplicateSecret.workspaces[0].credential_file;
   assert.throws(() => parsePolicy(duplicateSecret), /credential files must be unique/);
@@ -272,179 +335,57 @@ function testPrivateKey() {
   });
 }
 
-test("verifies the exact live installation and immutable repository set", async () => {
-  const calls = [];
-  const policy = parsePolicy(policyFixture());
-  const fetchImpl = async (url, init) => {
-    const path = new URL(url).pathname + new URL(url).search;
-    calls.push({ path, method: init.method, body: init.body && JSON.parse(init.body) });
-    if (path === "/app/installations/2001" && init.method === "GET") {
-      return jsonResponse({
-        app_id: 42,
-        app_slug: "example-app",
-        account: { id: 1001, login: "example-org" },
-        target_type: "Organization",
-        repository_selection: "selected",
-        permissions: {
-          actions: "write",
-          checks: "read",
-          contents: "write",
-          members: "read",
-          metadata: "read",
-          pull_requests: "write",
-        },
-      });
-    }
-    if (path === "/app/installations/2001/access_tokens" && init.method === "POST") {
-      assert.deepEqual(JSON.parse(init.body), { permissions: { contents: "read" } });
-      return jsonResponse({ token: "ghs_repository_probe" });
-    }
-    if (path === "/installation/repositories?per_page=100&page=1" && init.method === "GET") {
-      assert.equal(init.headers.Authorization, "Bearer ghs_repository_probe");
-      return jsonResponse({
-        total_count: 2,
-        repositories: [
-          { id: 3001, full_name: "example-org/alpha" },
-          { id: 3002, full_name: "example-org/beta" },
-        ],
-      });
-    }
-    if (path === "/installation/token" && init.method === "DELETE") {
-      return jsonResponse(null, 204);
-    }
-    throw new Error(`unexpected request ${init.method} ${path}`);
-  };
-  const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
-  await github.verifyPolicy(policy);
-  assert.equal(calls.at(-1).path, "/installation/token");
-});
-
-test("accepts an all-repository installation without authorizing unlisted repositories", async () => {
-  const fixture = policyFixture();
-  fixture.installation_repository_selection = "all";
-  const policy = parsePolicy(fixture);
-  const fetchImpl = async (url, init) => {
-    const path = new URL(url).pathname + new URL(url).search;
-    if (path === "/app/installations/2001" && init.method === "GET") {
-      return jsonResponse({
-        app_id: 42,
-        app_slug: "example-app",
-        account: { id: 1001, login: "example-org" },
-        target_type: "Organization",
-        repository_selection: "all",
-        permissions: policy.installation_permissions,
-      });
-    }
-    if (path === "/app/installations/2001/access_tokens" && init.method === "POST") {
-      assert.deepEqual(JSON.parse(init.body), { permissions: { contents: "read" } });
-      return jsonResponse({ token: "ghs_repository_probe" });
-    }
-    if (path === "/installation/repositories?per_page=100&page=1" && init.method === "GET") {
-      return jsonResponse({
-        total_count: 3,
-        repositories: [
-          { id: 3001, full_name: "example-org/alpha" },
-          { id: 3002, full_name: "example-org/beta" },
-          { id: 3999, full_name: "example-org/not-broker-authorized" },
-        ],
-      });
-    }
-    if (path === "/installation/token" && init.method === "DELETE") {
-      return jsonResponse(null, 204);
-    }
-    throw new Error(`unexpected request ${init.method} ${path}`);
-  };
-  const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
-  await github.verifyPolicy(policy);
-
-  const server = createBrokerServer({
-    policy,
-    github: {
-      verifyTeamGrant: grantedTeam,
-      mintToken: async () => {
-        throw new Error("must not mint an unlisted repository token");
-      },
-    },
-    readFile: (file) => secretByPath.get(file) ?? "",
-    realpath: (file) => file,
-  });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  try {
-    const address = server.address();
-    const response = await request(`http://127.0.0.1:${address.port}`, {
-      repositoryId: 3999,
-    });
-    assert.equal(response.status, 403);
-    assert.deepEqual(await response.json(), { error: "repository_denied" });
-  } finally {
-    server.close();
-    await once(server, "close");
-  }
-});
-
-test("rejects selection drift and repository-set drift in either installation mode", async () => {
-  const privateKey = testPrivateKey();
-  const installation = (selection) => ({
+function liveInstallation(selection = "selected", overrides = {}) {
+  return {
     app_id: 42,
     app_slug: "example-app",
     account: { id: 1001, login: "example-org" },
     target_type: "Organization",
     repository_selection: selection,
-    permissions: parsePolicy(policyFixture()).installation_permissions,
-  });
+    permissions: {
+      actions: "write",
+      checks: "read",
+      contents: "write",
+      members: "read",
+      metadata: "read",
+      pull_requests: "write",
+    },
+    ...overrides,
+  };
+}
 
-  const allFixture = policyFixture();
-  allFixture.installation_repository_selection = "all";
-  const allPolicy = parsePolicy(allFixture);
-  const selectionDrift = createGithubClient({
-    appId: "42",
-    privateKey,
-    fetchImpl: async () => jsonResponse(installation("selected")),
-  });
-  await assert.rejects(
-    () => selectionDrift.verifyPolicy(allPolicy),
-    /identity, selection or permissions differ from policy/,
-  );
-
-  async function verifyRepositorySet(policy, repositories) {
+test("verifies the exact live installation with one read and no repository enumeration", async () => {
+  for (const selection of ["selected", "all"]) {
+    const fixture = policyFixture();
+    fixture.installation_repository_selection = selection;
+    const policy = parsePolicy(fixture);
+    const calls = [];
     const fetchImpl = async (url, init) => {
       const path = new URL(url).pathname + new URL(url).search;
-      if (path === "/app/installations/2001") {
-        return jsonResponse(installation(policy.installation_repository_selection));
-      }
-      if (path === "/app/installations/2001/access_tokens") {
-        return jsonResponse({ token: "ghs_repository_probe" });
-      }
-      if (path === "/installation/repositories?per_page=100&page=1") {
-        return jsonResponse({ total_count: repositories.length, repositories });
-      }
-      if (path === "/installation/token" && init.method === "DELETE") {
-        return jsonResponse(null, 204);
-      }
+      calls.push(`${init.method} ${path}`);
+      if (path === "/app/installations/2001" && init.method === "GET") return jsonResponse(liveInstallation(selection));
       throw new Error(`unexpected request ${init.method} ${path}`);
     };
-    const github = createGithubClient({ appId: "42", privateKey, fetchImpl });
-    return github.verifyPolicy(policy);
+    const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
+    await github.verifyPolicy(policy);
+    assert.deepEqual(calls, ["GET /app/installations/2001"], selection);
   }
+});
 
-  await assert.rejects(
-    () =>
-      verifyRepositorySet(parsePolicy(policyFixture()), [
-        { id: 3001, full_name: "example-org/alpha" },
-        { id: 3002, full_name: "example-org/beta" },
-        { id: 3999, full_name: "example-org/extra" },
-      ]),
-    /repository grants differ from policy/,
-  );
-  await assert.rejects(
-    () =>
-      verifyRepositorySet(allPolicy, [
-        { id: 3001, full_name: "example-org/alpha" },
-        { id: 3999, full_name: "example-org/extra" },
-      ]),
-    /repository grants differ from policy/,
-  );
+test("rejects selection, owner and target drift of the live installation", async () => {
+  const privateKey = testPrivateKey();
+  const allFixture = policyFixture();
+  allFixture.installation_repository_selection = "all";
+  for (const [policy, installation] of [
+    [parsePolicy(allFixture), liveInstallation("selected")],
+    [parsePolicy(policyFixture()), liveInstallation("all")],
+    [parsePolicy(policyFixture()), liveInstallation("selected", { account: { id: 1002, login: "example-org" } })],
+    [parsePolicy(policyFixture()), liveInstallation("selected", { account: { id: 1001, login: "other-org" } })],
+    [parsePolicy(policyFixture()), liveInstallation("selected", { target_type: "User" })],
+  ]) {
+    const github = createGithubClient({ appId: "42", privateKey, fetchImpl: async () => jsonResponse(installation) });
+    await assert.rejects(() => github.verifyPolicy(policy), /identity, selection or permissions differ from policy/);
+  }
 });
 
 test("rejects live permission expansion even when required contents access remains", async () => {
@@ -693,6 +634,7 @@ test("keeps one verified credential snapshot for the complete server lifetime", 
     policy: parsePolicy(policyFixture()),
     github: {
       verifyTeamGrant: grantedTeam,
+      verifyWorkspaceTeam: provenTeam,
       mintToken: async (_policy, repositoryId) => ({
         token: `ghs_synthetic_${repositoryId}`,
         expires_at: "2030-01-01T00:00:00Z",
@@ -730,6 +672,7 @@ test("verifies live policy exactly once before serving runtime requests", async 
         verifies += 1;
       },
       verifyTeamGrant: grantedTeam,
+      verifyWorkspaceTeam: provenTeam,
       mintToken: async (_policy, repositoryId) => ({
         token: `ghs_synthetic_${repositoryId}`,
         expires_at: "2030-01-01T00:00:00Z",
@@ -800,19 +743,59 @@ test("policy requires exactly one broker Workspace per immutable GitHub Team", (
   assert.equal("github_team_slug" in parsed.workspaces[1], false);
 });
 
-test("policy retires schema v1 with an explicit migration message", () => {
-  const legacy = policyFixture();
-  legacy.schema_version = "lazurio.github_app_broker.policy.v1";
-  assert.throws(() => parsePolicy(legacy), /policy\.v1 is retired; migrate to lazurio\.github_app_broker\.policy\.v2/);
+test("policy retires schemas v1 and v2 with an explicit v3 migration message", () => {
+  const v1 = policyFixture();
+  v1.schema_version = "lazurio.github_app_broker.policy.v1";
+  assert.throws(
+    () => parsePolicy(v1),
+    /policy\.v1 is retired; .*migrate to lazurio\.github_app_broker\.policy\.v3 by deleting `repositories` and every `workspaces\[\]\.repository_ids`; the live Team grant is the scope/,
+  );
+
+  const v2 = policyFixture();
+  v2.schema_version = "lazurio.github_app_broker.policy.v2";
+  v2.repositories = [{ id: 3001, full_name: "example-org/alpha" }];
+  v2.workspaces[0].repository_ids = [3001];
+  assert.throws(
+    () => parsePolicy(v2),
+    /policy\.v2 is retired; migrate to lazurio\.github_app_broker\.policy\.v3 by deleting `repositories` and every `workspaces\[\]\.repository_ids`; the live Team grant is the scope/,
+  );
 
   const unknown = policyFixture();
-  unknown.schema_version = "lazurio.github_app_broker.policy.v3";
+  unknown.schema_version = "lazurio.github_app_broker.policy.v4";
   assert.throws(() => parsePolicy(unknown), /unsupported policy schema/);
 });
 
+test("a half-migrated v3 policy with repositories or repository_ids fails closed", () => {
+  const withRepositories = policyFixture();
+  withRepositories.repositories = [{ id: 3001, full_name: "example-org/alpha" }];
+  assert.throws(() => parsePolicy(withRepositories), /v3 must not contain `repositories`; migrate/);
+
+  const emptyRepositories = policyFixture();
+  emptyRepositories.repositories = [];
+  assert.throws(() => parsePolicy(emptyRepositories), /v3 must not contain `repositories`/);
+
+  const withRepositoryIds = policyFixture();
+  withRepositoryIds.workspaces[1].repository_ids = [3002];
+  assert.throws(() => parsePolicy(withRepositoryIds), /v3 must not contain `workspaces\[1\]\.repository_ids`; migrate/);
+
+  const parsed = parsePolicy(policyFixture());
+  assert.equal("repositories" in parsed, false);
+  assert.equal("repository_ids" in parsed.workspaces[0], false);
+});
+
+const PROBE_PERMISSIONS = { members: "read", metadata: "read" };
+
 function teamGrantFetch({
   team = { id: 4001, slug: "alpha-team", organization: { id: 1001, login: "example-org" } },
-  grant = { id: 3001, full_name: "example-org/alpha", permissions: { admin: false, maintain: false, pull: true, push: true, triage: true } },
+  grant = {
+    id: 3001,
+    full_name: "example-org/alpha",
+    owner: { id: 1001, login: "example-org" },
+    permissions: { admin: false, maintain: false, pull: true, push: true, triage: true },
+  },
+  repositories = {
+    3001: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" } },
+  },
   calls = [],
 } = {}) {
   return async (url, init) => {
@@ -824,8 +807,23 @@ function teamGrantFetch({
     if (path === "/organizations/1001/team/4001" && init.method === "GET") {
       return team === null ? jsonResponse({ message: "Not Found" }, 404) : jsonResponse(team);
     }
+    // The second Team exists and holds no repository grant.
+    if (path === "/organizations/1001/team/4002" && init.method === "GET") {
+      return jsonResponse({ id: 4002, slug: "beta", organization: { id: 1001, login: "example-org" } });
+    }
+    if (path.startsWith("/organizations/1001/team/4002/repos/") && init.method === "GET") {
+      return jsonResponse({ message: "Not Found" }, 404);
+    }
+    const repositoryMatch = path.match(/^\/repositories\/(\d+)$/);
+    if (repositoryMatch && init.method === "GET") {
+      const repository = repositories[repositoryMatch[1]];
+      return repository ? jsonResponse(repository) : jsonResponse({ message: "Not Found" }, 404);
+    }
     if (path === "/organizations/1001/team/4001/repos/example-org/alpha" && init.method === "GET") {
       return grant === null ? jsonResponse({ message: "Not Found" }, 404) : jsonResponse(grant);
+    }
+    if (path.startsWith("/organizations/1001/team/4001/repos/") && init.method === "GET") {
+      return jsonResponse({ message: "Not Found" }, 404);
     }
     if (path === "/installation/token" && init.method === "DELETE") {
       return jsonResponse(null, 204);
@@ -834,7 +832,7 @@ function teamGrantFetch({
   };
 }
 
-test("verifies the live Team binding and write-capable grant with a revoked members-only probe", async () => {
+test("verifies the live Team binding and write-capable grant by name with a revoked probe", async () => {
   const policy = parsePolicy(policyFixture());
   const calls = [];
   const github = createGithubClient({
@@ -842,7 +840,7 @@ test("verifies the live Team binding and write-capable grant with a revoked memb
     privateKey: testPrivateKey(),
     fetchImpl: teamGrantFetch({ calls }),
   });
-  const grant = await github.verifyTeamGrant(policy, policy.workspaces[0], 3001);
+  const grant = await github.verifyTeamGrant(policy, policy.workspaces[0], { repository: "example-org/alpha" });
   assert.deepEqual(grant, {
     workspace_id: "alpha-team",
     github_team_id: 4001,
@@ -857,51 +855,130 @@ test("verifies the live Team binding and write-capable grant with a revoked memb
     "GET /organizations/1001/team/4001/repos/example-org/alpha",
     "DELETE /installation/token",
   ]);
-  assert.deepEqual(calls[0].body, { permissions: { members: "read", metadata: "read" } });
+  assert.deepEqual(calls[0].body, { permissions: PROBE_PERMISSIONS });
   assert.equal(calls[1].authorization, "Bearer ghs_team_probe");
   assert.equal(calls[2].accept, "application/vnd.github.v3.repository+json");
   assert.equal(calls[3].authorization, "Bearer ghs_team_probe");
 });
 
-test("refuses with team_grant_missing when the Team is absent, renamed under a new id, or lacks write", async () => {
+test("the id form resolves the live coordinate first and costs one extra read", async () => {
+  const policy = parsePolicy(policyFixture());
+  const calls = [];
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: teamGrantFetch({ calls }),
+  });
+  const grant = await github.verifyTeamGrant(policy, policy.workspaces[0], { repository_id: 3001 });
+  assert.equal(grant.repository_id, 3001);
+  assert.equal(grant.full_name, "example-org/alpha");
+  assert.deepEqual(calls.map(({ method, path }) => `${method} ${path}`), [
+    "POST /app/installations/2001/access_tokens",
+    "GET /organizations/1001/team/4001",
+    "GET /repositories/3001",
+    "GET /organizations/1001/team/4001/repos/example-org/alpha",
+    "DELETE /installation/token",
+  ]);
+  assert.equal(calls[2].authorization, "Bearer ghs_team_probe");
+});
+
+test("returns the canonical repository name and id GitHub reports for a differently cased name", async () => {
+  const policy = parsePolicy(policyFixture());
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname;
+    calls.push(path);
+    if (path === "/organizations/1001/team/4001/repos/Example-Org/ALPHA") {
+      return jsonResponse({
+        id: 3001,
+        full_name: "example-org/alpha",
+        owner: { id: 1001, login: "example-org" },
+        permissions: { admin: false, maintain: false, pull: true, push: true, triage: true },
+      });
+    }
+    return teamGrantFetch()(url, init);
+  };
+  const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
+  const grant = await github.verifyTeamGrant(policy, policy.workspaces[0], { repository: "Example-Org/ALPHA" });
+  assert.equal(grant.full_name, "example-org/alpha");
+  assert.equal(grant.repository_id, 3001);
+  assert.ok(calls.includes("/organizations/1001/team/4001/repos/Example-Org/ALPHA"));
+});
+
+test("refuses with team_grant_missing when the Team is absent, drifted, or lacks a write grant", async () => {
   const policy = parsePolicy(policyFixture());
   const workspace = policy.workspaces[0];
   const privateKey = testPrivateKey();
+  const writeGrant = (overrides) => ({
+    id: 3001,
+    full_name: "example-org/alpha",
+    owner: { id: 1001, login: "example-org" },
+    permissions: { admin: false, maintain: false, pull: true, push: true, triage: true },
+    ...overrides,
+  });
+  const byName = { repository: "example-org/alpha" };
+  const byId = { repository_id: 3001 };
   const cases = [
-    { name: "team absent", fetch: teamGrantFetch({ team: null }), message: /no longer exists/ },
+    { name: "team absent", fetch: teamGrantFetch({ team: null }), target: byName, message: /no longer exists/ },
     {
       name: "team id differs",
       fetch: teamGrantFetch({ team: { id: 4999, slug: "alpha-team", organization: { id: 1001, login: "example-org" } } }),
+      target: byName,
       message: /identity differs from policy/,
     },
     {
       name: "team belongs to another organization",
       fetch: teamGrantFetch({ team: { id: 4001, slug: "alpha-team", organization: { id: 1002, login: "other-org" } } }),
+      target: byName,
       message: /identity differs from policy/,
     },
     {
       name: "asserted slug drifted",
       fetch: teamGrantFetch({ team: { id: 4001, slug: "renamed-team", organization: { id: 1001, login: "example-org" } } }),
+      target: byName,
       message: /identity differs from policy/,
     },
-    { name: "no grant", fetch: teamGrantFetch({ grant: null }), message: /no live grant on repository example-org\/alpha/ },
+    { name: "no grant by name", fetch: teamGrantFetch({ grant: null }), target: byName, message: /no live grant on repository example-org\/alpha/ },
+    { name: "no grant by id", fetch: teamGrantFetch({ grant: null }), target: byId, message: /no live grant on repository example-org\/alpha/ },
     {
-      name: "read-only grant",
-      fetch: teamGrantFetch({ grant: { id: 3001, full_name: "example-org/alpha", permissions: { admin: false, maintain: false, pull: true, push: false, triage: true } } }),
+      name: "repository not in the Team (cross-repository)",
+      fetch: teamGrantFetch(),
+      target: { repository: "example-org/beta" },
+      message: /no live grant on repository example-org\/beta/,
+    },
+    { name: "id not visible", fetch: teamGrantFetch(), target: { repository_id: 3999 }, message: /cannot see repository 3999/ },
+    {
+      name: "pull-only grant",
+      fetch: teamGrantFetch({ grant: writeGrant({ permissions: { admin: false, maintain: false, pull: true, push: false, triage: false } }) }),
+      target: byName,
       message: /not write-capable/,
     },
     {
-      name: "grant on a different repository id",
-      fetch: teamGrantFetch({ grant: { id: 3999, full_name: "example-org/alpha", permissions: { admin: true, maintain: true, pull: true, push: true, triage: true } } }),
+      name: "triage-only grant",
+      fetch: teamGrantFetch({ grant: writeGrant({ permissions: { admin: false, maintain: false, pull: true, push: false, triage: true } }) }),
+      target: byId,
+      message: /not write-capable/,
+    },
+    {
+      name: "id form grant returns a different repository id",
+      fetch: teamGrantFetch({ grant: writeGrant({ id: 3999 }) }),
+      target: byId,
+      message: /not write-capable/,
+    },
+    {
+      name: "grant without a canonical full name",
+      fetch: teamGrantFetch({ grant: writeGrant({ full_name: undefined }) }),
+      target: byName,
       message: /not write-capable/,
     },
     {
       name: "204 without permissions payload",
-      fetch: teamGrantFetch({ grant: undefined }),
+      fetch: teamGrantFetch(),
+      target: byName,
       message: /not write-capable/,
     },
   ];
-  for (const { name, fetch: fetchImpl, message } of cases) {
+  for (const { name, fetch: fetchImpl, target, message } of cases) {
     const calls = [];
     const wrapped = async (url, init) => {
       calls.push(`${init.method} ${new URL(url).pathname}`);
@@ -912,7 +989,7 @@ test("refuses with team_grant_missing when the Team is absent, renamed under a n
     };
     const github = createGithubClient({ appId: "42", privateKey, fetchImpl: wrapped });
     await assert.rejects(
-      () => github.verifyTeamGrant(policy, workspace, 3001),
+      () => github.verifyTeamGrant(policy, workspace, target),
       (error) => {
         assert.equal(error.code, "team_grant_missing", name);
         assert.match(error.message, message, name);
@@ -921,6 +998,61 @@ test("refuses with team_grant_missing when the Team is absent, renamed under a n
     );
     assert.equal(calls.at(-1), "DELETE /installation/token", `${name} must revoke the probe`);
     assert.equal(calls.filter((call) => call.startsWith("POST /app/installations/2001/access_tokens")).length, 1, name);
+  }
+});
+
+test("refuses a repository of another owner with repository_denied in both forms", async () => {
+  const policy = parsePolicy(policyFixture());
+  const workspace = policy.workspaces[0];
+  const privateKey = testPrivateKey();
+  const foreign = { id: 9001, full_name: "other-org/alpha", owner: { id: 1002, login: "other-org" } };
+  const cases = [
+    {
+      name: "id form resolves to a public repository of another owner",
+      fetch: teamGrantFetch({ repositories: { 9001: foreign } }),
+      target: { repository_id: 9001 },
+      reads: ["GET /repositories/9001"],
+    },
+    {
+      name: "grant readback reports another owner",
+      fetch: teamGrantFetch({
+        grant: {
+          id: 3001,
+          full_name: "example-org/alpha",
+          owner: { id: 1002, login: "example-org" },
+          permissions: { admin: true, maintain: true, pull: true, push: true, triage: true },
+        },
+      }),
+      target: { repository: "example-org/alpha" },
+      reads: ["GET /organizations/1001/team/4001/repos/example-org/alpha"],
+    },
+    {
+      name: "direct client call with a name of another owner",
+      fetch: teamGrantFetch(),
+      target: { repository: "other-org/alpha" },
+      reads: [],
+    },
+  ];
+  for (const { name, fetch: fetchImpl, target, reads } of cases) {
+    const calls = [];
+    const github = createGithubClient({
+      appId: "42",
+      privateKey,
+      fetchImpl: async (url, init) => {
+        calls.push(`${init.method} ${new URL(url).pathname}`);
+        return fetchImpl(url, init);
+      },
+    });
+    await assert.rejects(
+      () => github.verifyTeamGrant(policy, workspace, target),
+      (error) => {
+        assert.equal(error.code, "repository_denied", name);
+        return true;
+      },
+    );
+    for (const read of reads) assert.ok(calls.includes(read), `${name} reads ${read}`);
+    assert.equal(calls.some((call) => call.includes("/repos/other-org/")), false, name);
+    assert.equal(calls.at(-1), "DELETE /installation/token", `${name} must revoke the probe`);
   }
 });
 
@@ -934,9 +1066,11 @@ test("accepts maintain and admin grants and distinguishes outages from refusals"
     const github = createGithubClient({
       appId: "42",
       privateKey,
-      fetchImpl: teamGrantFetch({ grant: { id: 3001, full_name: "example-org/alpha", permissions } }),
+      fetchImpl: teamGrantFetch({
+        grant: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions },
+      }),
     });
-    assert.equal((await github.verifyTeamGrant(policy, policy.workspaces[0], 3001)).role, role);
+    assert.equal((await github.verifyTeamGrant(policy, policy.workspaces[0], { repository_id: 3001 })).role, role);
   }
 
   const outage = createGithubClient({
@@ -948,14 +1082,8 @@ test("accepts maintain and admin grants and distinguishes outages from refusals"
     },
   });
   await assert.rejects(
-    () => outage.verifyTeamGrant(policy, policy.workspaces[0], 3001),
+    () => outage.verifyTeamGrant(policy, policy.workspaces[0], { repository: "example-org/alpha" }),
     (error) => error.code === undefined && /HTTP 503/.test(error.message),
-  );
-
-  const outsidePolicy = createGithubClient({ appId: "42", privateKey, fetchImpl: teamGrantFetch() });
-  await assert.rejects(
-    () => outsidePolicy.verifyTeamGrant(policy, policy.workspaces[0], 3002),
-    (error) => error.code === undefined && /outside the Workspace alpha-team policy/.test(error.message),
   );
 });
 
@@ -965,16 +1093,17 @@ test("mints only after a live Team grant and refuses with team_grant_missing oth
   const server = createBrokerServer({
     policy: parsePolicy(policyFixture()),
     github: {
-      verifyTeamGrant: async (_policy, workspace, repositoryId) => {
+      verifyWorkspaceTeam: provenTeam,
+      verifyTeamGrant: async (policy, workspace, target) => {
         checks += 1;
         assert.equal(workspace.github_team_id, 4001);
-        assert.equal(repositoryId, 3001);
-        if (workspace.id === "alpha-team" && checks > 1) {
+        assert.deepEqual(target, { repository: "example-org/alpha" });
+        if (checks > 1) {
           const error = new Error("grant revoked");
           error.code = "team_grant_missing";
           throw error;
         }
-        return { role: "write" };
+        return grantedTeam(policy, workspace, target);
       },
       mintToken: async (_policy, repositoryId) => {
         mints += 1;
@@ -1009,7 +1138,101 @@ test("mints only after a live Team grant and refuses with team_grant_missing oth
   }
 });
 
-test("Team grant outages fail closed as token_unavailable and cross-Workspace checks never run", async () => {
+/** Runs the real core client behind the Node server with a synthetic GitHub. */
+async function withLiveCoreServer(fetchImpl, run) {
+  const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
+  const server = createBrokerServer({
+    policy: parsePolicy(policyFixture()),
+    github,
+    readFile: (file) => secretByPath.get(file) ?? "",
+    realpath: (file) => file,
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    await run(`http://127.0.0.1:${server.address().port}`);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+}
+
+function mintingFetch(calls, teamFetch = teamGrantFetch()) {
+  return async (url, init) => {
+    const path = new URL(url).pathname;
+    calls.push(`${init.method} ${path}`);
+    if (path === "/app/installations/2001/access_tokens" && JSON.parse(init.body).repository_ids) {
+      const [repositoryId] = JSON.parse(init.body).repository_ids;
+      return jsonResponse({
+        token: `ghs_scoped_synthetic_${repositoryId}`,
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: repositoryId }],
+        permissions: { actions: "write", checks: "read", contents: "write", metadata: "read", pull_requests: "write" },
+      });
+    }
+    return teamFetch(url, init);
+  };
+}
+
+test("end to end: a Team-granted repository mints for its id; other Teams, repositories and owners mint nothing", async () => {
+  const calls = [];
+  await withLiveCoreServer(mintingFetch(calls), async (origin) => {
+    for (const body of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+      const response = await request(origin, { body });
+      assert.equal(response.status, 200);
+      const json = await response.json();
+      assert.equal(json.repository_id, 3001);
+      assert.equal(json.repository, "example-org/alpha");
+    }
+    const mints = () => calls.filter((call) => call === "POST /app/installations/2001/access_tokens").length;
+    const before = mints();
+
+    // Cross-repository: alpha's Team holds no grant on beta.
+    const crossRepository = await request(origin, { body: { repository: "example-org/beta" } });
+    assert.equal(crossRepository.status, 403);
+    assert.deepEqual(await crossRepository.json(), { error: "team_grant_missing" });
+
+    // Cross-Workspace: beta's Team (4002) holds no grant on alpha, whatever alpha's Team holds.
+    const crossWorkspace = await request(origin, {
+      workspace: "beta-team",
+      secret: secretByPath.get("/run/secrets/workspace-beta"),
+    });
+    assert.equal(crossWorkspace.status, 403);
+    assert.deepEqual(await crossWorkspace.json(), { error: "team_grant_missing" });
+    assert.ok(calls.includes("GET /organizations/1001/team/4002/repos/example-org/alpha"));
+
+    // Foreign owner by id: GitHub resolves a public repository of another owner.
+    const trafficBefore = calls.length;
+    const foreignName = await request(origin, { body: { repository: "other-org/alpha" } });
+    assert.equal(foreignName.status, 403);
+    assert.equal(calls.length, trafficBefore, "a foreign owner name never reaches GitHub");
+
+    // Every refusal minted only its revoked probe, never a scoped repository token.
+    assert.equal(
+      calls.filter((call) => call === "DELETE /installation/token").length,
+      mints() - 2,
+      "each probe is revoked; only the two accepted requests minted a scoped token",
+    );
+    assert.equal(before, 4);
+  });
+});
+
+test("end to end: an id of another owner is refused with repository_denied and mints nothing", async () => {
+  const calls = [];
+  const foreign = teamGrantFetch({
+    repositories: { 9001: { id: 9001, full_name: "other-org/public", owner: { id: 1002, login: "other-org" } } },
+  });
+  await withLiveCoreServer(mintingFetch(calls, foreign), async (origin) => {
+    const response = await request(origin, { body: { repository_id: 9001 } });
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "repository_denied" });
+    assert.equal(calls.filter((call) => call.startsWith("GET /organizations/1001/team/4001/repos/")).length, 0);
+    assert.equal(calls.filter((call) => call === "POST /app/installations/2001/access_tokens").length, 1);
+    assert.equal(calls.at(-1), "DELETE /installation/token");
+  });
+});
+
+test("Team grant outages fail closed as token_unavailable and foreign owners never reach the gate", async () => {
   let checks = 0;
   await withServer(
     async (origin) => {
@@ -1018,7 +1241,7 @@ test("Team grant outages fail closed as token_unavailable and cross-Workspace ch
       assert.deepEqual(await outage.json(), { error: "token_unavailable" });
       assert.equal(checks, 1);
 
-      const denied = await request(origin, { repositoryId: 3002 });
+      const denied = await request(origin, { body: { repository: "other-org/alpha" } });
       assert.equal(denied.status, 403);
       assert.deepEqual(await denied.json(), { error: "repository_denied" });
       assert.equal(checks, 1);
@@ -1033,34 +1256,45 @@ test("Team grant outages fail closed as token_unavailable and cross-Workspace ch
   );
 });
 
-test("policy check --live reads back every Team grant and prints a secret-free table", async () => {
+test("refuses a mint whose result names another repository than the Team gate verified", async () => {
+  await withServer(
+    async (origin) => {
+      const response = await request(origin);
+      assert.equal(response.status, 502);
+      assert.deepEqual(await response.json(), { error: "token_unavailable" });
+    },
+    async () => ({ token: "ghs_synthetic_other", expires_at: "2030-01-01T00:00:00Z", repository_id: 3002 }),
+  );
+});
+
+test("policy check --live lists live Team grants as information and fails only on Team drift", async () => {
   const policy = parsePolicy(policyFixture());
   assert.equal(
     formatPolicySummary(policy),
     [
-      "lazurio.github_app_broker.policy.v2 owner=example-org installation=2001",
-      "WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORIES",
-      "alpha-team  4001     alpha-team  1",
-      "beta-team   4002     -           1",
+      "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
+      "WORKSPACE   TEAM_ID  TEAM_SLUG",
+      "alpha-team  4001     alpha-team",
+      "beta-team   4002     -",
       "",
     ].join("\n"),
   );
 
   const probes = [];
+  const rowsFor = {
+    "alpha-team": [
+      { workspace_id: "alpha-team", github_team_id: 4001, github_team_slug: "alpha-team", repository_id: 3001, full_name: "example-org/alpha", role: "write", status: "ok", detail: "" },
+      { workspace_id: "alpha-team", github_team_id: 4001, github_team_slug: "alpha-team", repository_id: 3003, full_name: "example-org/gamma", role: "admin", status: "ok", detail: "" },
+    ],
+    "beta-team": [
+      { workspace_id: "beta-team", github_team_id: 4002, github_team_slug: "?", repository_id: "-", full_name: "-", role: "-", status: "refused", detail: "Workspace beta-team GitHub Team 4002 no longer exists in the Organization" },
+    ],
+  };
   const github = {
     verifyPolicy: async () => probes.push("verify"),
     readWorkspaceTeamGrants: async (_policy, workspace) => {
       probes.push(`grants:${workspace.id}`);
-      return workspace.repository_ids.map((repositoryId) => ({
-        workspace_id: workspace.id,
-        github_team_id: workspace.github_team_id,
-        github_team_slug: workspace.github_team_slug ?? "beta",
-        repository_id: repositoryId,
-        full_name: policy.repositories.find(({ id }) => id === repositoryId).full_name,
-        role: workspace.id === "alpha-team" ? "write" : "none",
-        status: workspace.id === "alpha-team" ? "ok" : "refused",
-        detail: workspace.id === "alpha-team" ? "" : "Workspace beta-team GitHub Team has no live grant on repository example-org/beta",
-      }));
+      return rowsFor[workspace.id];
     },
   };
   const result = await checkPolicyLive({ policy, github });
@@ -1072,51 +1306,199 @@ test("policy check --live reads back every Team grant and prints a secret-free t
     [
       "WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY         ROLE   STATUS   DETAIL",
       "alpha-team  4001     alpha-team  3001           example-org/alpha  write  ok",
-      "beta-team   4002     beta        3002           example-org/beta   none   refused  Workspace beta-team GitHub Team has no live grant on repository example-org/beta",
-      "2 grants checked, 1 ok, 1 refused",
+      "alpha-team  4001     alpha-team  3003           example-org/gamma  admin  ok",
+      "beta-team   4002     ?           -              -                  -      refused  Workspace beta-team GitHub Team 4002 no longer exists in the Organization",
+      "2 Workspaces checked, 1 Teams ok, 1 refused; 2 write-capable repository grants",
       "",
     ].join("\n"),
   );
   assert.doesNotMatch(table, /ghs_|secret/i);
 
+  rowsFor["beta-team"] = [
+    { workspace_id: "beta-team", github_team_id: 4002, github_team_slug: "beta", repository_id: "-", full_name: "-", role: "-", status: "ok", detail: "Team holds no write-capable repository grant" },
+  ];
+  const healthy = await checkPolicyLive({ policy, github });
+  assert.equal(healthy.ok, true, "a Team without grants is information, not drift");
+  assert.match(formatPolicyCheckTable(healthy.rows), /2 Workspaces checked, 2 Teams ok, 0 refused; 2 write-capable repository grants/);
+
   const failedInstallation = { ...github, verifyPolicy: async () => { throw new Error("live GitHub installation identity, selection or permissions differ from policy"); } };
   await assert.rejects(() => checkPolicyLive({ policy, github: failedInstallation }), /differ from policy/);
 });
 
-test("readWorkspaceTeamGrants uses one probe per Workspace and reports each repository", async () => {
-  const fixture = policyFixture();
-  fixture.workspaces[0].repository_ids = [3001, 3002];
-  const policy = parsePolicy(fixture);
+test("readWorkspaceTeamGrants paginates the Team's write-capable repositories with one probe", async () => {
+  const policy = parsePolicy(policyFixture());
   const calls = [];
+  const writable = { admin: false, maintain: false, pull: true, push: true, triage: true };
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({
+    id: 5000 + index,
+    full_name: `example-org/repo-${index}`,
+    owner: { id: 1001, login: "example-org" },
+    permissions: index === 0 ? { admin: false, maintain: false, pull: true, push: false, triage: true } : writable,
+  }));
+  const secondPage = [
+    { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions: { ...writable, maintain: true } },
+    { id: 9001, full_name: "other-org/foreign", owner: { id: 1002, login: "other-org" }, permissions: writable },
+    { id: 3002, full_name: "example-org/beta", owner: { id: 1001, login: "example-org" }, permissions: { pull: true } },
+  ];
   const fetchImpl = async (url, init) => {
-    const path = new URL(url).pathname;
+    const path = new URL(url).pathname + new URL(url).search;
     calls.push(`${init.method} ${path}`);
-    if (path === "/app/installations/2001/access_tokens") return jsonResponse({ token: "ghs_team_probe" });
+    if (path === "/app/installations/2001/access_tokens") {
+      assert.deepEqual(JSON.parse(init.body), { permissions: PROBE_PERMISSIONS });
+      return jsonResponse({ token: "ghs_team_probe" });
+    }
     if (path === "/organizations/1001/team/4001") {
       return jsonResponse({ id: 4001, slug: "alpha-team", organization: { id: 1001, login: "example-org" } });
     }
-    if (path === "/organizations/1001/team/4001/repos/example-org/alpha") {
-      return jsonResponse({ id: 3001, full_name: "example-org/alpha", permissions: { admin: false, maintain: true, pull: true, push: true, triage: true } });
-    }
-    if (path === "/organizations/1001/team/4001/repos/example-org/beta") return jsonResponse({ message: "Not Found" }, 404);
-    if (path === "/organizations/1001/team/4002") return jsonResponse({ message: "Not Found" }, 404);
+    if (path === "/organizations/1001/team/4001/repos?per_page=100&page=1") return jsonResponse(firstPage);
+    if (path === "/organizations/1001/team/4001/repos?per_page=100&page=2") return jsonResponse(secondPage);
+    if (path === "/organizations/1001/team/4002") return jsonResponse({ id: 4002, slug: "beta", organization: { id: 1001, login: "example-org" } });
+    if (path === "/organizations/1001/team/4002/repos?per_page=100&page=1") return jsonResponse([]);
     if (path === "/installation/token") return jsonResponse(null, 204);
     throw new Error(`unexpected request ${init.method} ${path}`);
   };
   const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
 
   const alpha = await github.readWorkspaceTeamGrants(policy, policy.workspaces[0]);
-  assert.deepEqual(alpha.map(({ repository_id, role, status }) => [repository_id, role, status]), [
-    [3001, "maintain", "ok"],
-    [3002, "none", "refused"],
-  ]);
-  assert.match(alpha[1].detail, /no live grant on repository example-org\/beta/);
+  assert.equal(alpha.length, 100, "99 write grants from page one plus alpha; triage, read-only and foreign rows are skipped");
+  assert.deepEqual(alpha.at(-1), {
+    workspace_id: "alpha-team",
+    github_team_id: 4001,
+    github_team_slug: "alpha-team",
+    repository_id: 3001,
+    full_name: "example-org/alpha",
+    role: "maintain",
+    status: "ok",
+    detail: "",
+  });
+  assert.equal(alpha.some(({ repository_id }) => repository_id === 9001 || repository_id === 3002 || repository_id === 5000), false);
   assert.equal(calls.filter((call) => call === "POST /app/installations/2001/access_tokens").length, 1);
   assert.equal(calls.at(-1), "DELETE /installation/token");
 
   const beta = await github.readWorkspaceTeamGrants(policy, policy.workspaces[1]);
-  assert.deepEqual(beta.map(({ repository_id, github_team_slug, status }) => [repository_id, github_team_slug, status]), [
-    [3002, "?", "refused"],
+  assert.deepEqual(beta.map(({ repository_id, status, detail }) => [repository_id, status, detail]), [
+    ["-", "ok", "Team holds no write-capable repository grant"],
   ]);
-  assert.match(beta[0].detail, /Team 4002 no longer exists/);
+});
+
+test("readWorkspaceTeamGrants reports a missing Team as one refused row without listing repositories", async () => {
+  const policy = parsePolicy(policyFixture());
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname + new URL(url).search;
+    calls.push(`${init.method} ${path}`);
+    if (path === "/app/installations/2001/access_tokens") return jsonResponse({ token: "ghs_team_probe" });
+    if (path === "/organizations/1001/team/4002") return jsonResponse({ message: "Not Found" }, 404);
+    if (path === "/installation/token") return jsonResponse(null, 204);
+    throw new Error(`unexpected request ${init.method} ${path}`);
+  };
+  const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
+  const rows = await github.readWorkspaceTeamGrants(policy, policy.workspaces[1]);
+  assert.deepEqual(rows.map(({ github_team_slug, status }) => [github_team_slug, status]), [["?", "refused"]]);
+  assert.match(rows[0].detail, /Team 4002 no longer exists/);
+  assert.deepEqual(calls, [
+    "POST /app/installations/2001/access_tokens",
+    "GET /organizations/1001/team/4002",
+    "DELETE /installation/token",
+  ]);
+});
+
+function workspaceRequest(origin, {
+  workspace = "alpha-team",
+  secret = secretByPath.get("/run/secrets/workspace-alpha"),
+} = {}) {
+  return fetch(`${origin}/v1/workspace`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${secret}`,
+      "Content-Type": "application/json",
+      "X-Lazurio-Workspace-ID": workspace,
+    },
+    body: "{}",
+  });
+}
+
+test("POST /v1/workspace proves the live Workspace Team through a revoked probe and mints no token", async () => {
+  const calls = [];
+  await withLiveCoreServer(mintingFetch(calls), async (origin) => {
+    const response = await workspaceRequest(origin);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await response.json(), {
+      workspace_id: "alpha-team",
+      organization: "example-org",
+      github_team_id: 4001,
+      github_team_slug: "alpha-team",
+    });
+    assert.deepEqual(calls, [
+      "POST /app/installations/2001/access_tokens",
+      "GET /organizations/1001/team/4001",
+      "DELETE /installation/token",
+    ]);
+  });
+});
+
+test("POST /v1/workspace refuses bad credentials without GitHub traffic and a drifted Team with 403", async () => {
+  const calls = [];
+  const drifted = teamGrantFetch({ team: { id: 4001, slug: "renamed-team", organization: { id: 1001, login: "example-org" } } });
+  await withLiveCoreServer(mintingFetch(calls, drifted), async (origin) => {
+    for (const options of [
+      { secret: "wrong-secret-value-with-at-least-32-bytes" },
+      { workspace: "unknown-team", secret: "unknown-secret-value-with-at-least-32-bytes" },
+      { workspace: "beta-team", secret: secretByPath.get("/run/secrets/workspace-alpha") },
+    ]) {
+      const response = await workspaceRequest(origin, options);
+      assert.equal(response.status, 401);
+      assert.deepEqual(await response.json(), { error: "workspace_unauthorized" });
+    }
+    assert.equal(calls.length, 0);
+
+    const refused = await workspaceRequest(origin);
+    assert.equal(refused.status, 403);
+    assert.deepEqual(await refused.json(), { error: "team_grant_missing" });
+    assert.deepEqual(calls, [
+      "POST /app/installations/2001/access_tokens",
+      "GET /organizations/1001/team/4001",
+      "DELETE /installation/token",
+    ]);
+  });
+
+  const missing = [];
+  await withLiveCoreServer(mintingFetch(missing, teamGrantFetch({ team: null })), async (origin) => {
+    const response = await workspaceRequest(origin);
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "team_grant_missing" });
+    assert.equal(missing.at(-1), "DELETE /installation/token");
+  });
+});
+
+test("POST /v1/workspace fails closed as token_unavailable on a GitHub outage and never reads repositories", async () => {
+  const calls = [];
+  const outage = async (url, init) => {
+    if (new URL(url).pathname === "/organizations/1001/team/4001") return jsonResponse({ message: "boom" }, 503);
+    return teamGrantFetch()(url, init);
+  };
+  await withLiveCoreServer(mintingFetch(calls, outage), async (origin) => {
+    const response = await workspaceRequest(origin);
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), { error: "token_unavailable" });
+    assert.equal(calls.some((call) => call.includes("/repos") || call.startsWith("GET /repositories")), false);
+    assert.equal(calls.filter((call) => call === "POST /app/installations/2001/access_tokens").length, 1);
+    assert.equal(calls.at(-1), "DELETE /installation/token");
+  });
+});
+
+test("POST /v1/workspace is not a token route: it rejects other methods, media types and paths", async () => {
+  await withServer(async (origin) => {
+    assert.equal((await fetch(`${origin}/v1/workspace`)).status, 404);
+    assert.equal((await fetch(`${origin}/v1/workspace/extra`, { method: "POST" })).status, 404);
+    const unsupported = await fetch(`${origin}/v1/workspace`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", "X-Lazurio-Workspace-ID": "alpha-team" },
+      body: "{}",
+    });
+    assert.equal(unsupported.status, 415);
+    const proof = await (await workspaceRequest(origin)).json();
+    assert.equal("token" in proof, false);
+  });
 });

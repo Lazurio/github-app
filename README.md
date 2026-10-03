@@ -26,34 +26,33 @@ with a fresh, one-repository installation token for each operation.
 The broker makes one machine authorization decision:
 
 ```text
-Workspace id + Workspace credential + repository id
-    -> exact deployment policy
-    -> immutable GitHub App id and slug
-    -> live GitHub App installation grant
-    -> live GitHub Team -> repository grant of the Workspace's immutable Team
-    -> one-repository installation token
+Workspace id + Workspace credential + repository (name or id)
+    -> exact deployment policy (Organization, App, installation, Workspace -> Team)
+    -> repository owner is the policy's Organization
+    -> live GitHub App installation identity and permissions
+    -> live write-capable grant of the Workspace's immutable GitHub Team on that repository
+    -> one-repository installation token for the repository id GitHub returned
 ```
 
 - It never asks which human last used the Workspace.
 - It never receives a browser session or OAuth token.
 - The GitHub App private key exists only in the broker workload.
-- A Workspace credential authorizes only that Workspace's configured
-  repository ids.
-- Every Workspace is bound to exactly one immutable GitHub Team id, and every
-  token requires that Team to hold a live write-capable grant on the exact
-  repository. GitHub Team membership and repository grants are the only
-  grant authority; the policy never grants anything GitHub has not granted
-  and never replaces GitHub's ACL. Its `repository_ids` allowlist is still
-  part of the admission decision as a separate deny-only gate: a repository
-  outside the allowlist is refused before the live Team grant is even read,
-  even if the GitHub Team holds a write grant on it.
+- Every Workspace is bound to exactly one immutable GitHub Team id. The live
+  GitHub Team grant is the scope: a Workspace can obtain a token for exactly
+  the repositories of the policy's Organization on which its Team holds a
+  `push`, `maintain` or `admin` grant at the moment of the request. The policy
+  holds no repository list, so it never grants anything GitHub has not granted
+  and never narrows what GitHub has granted. An Organization Admin who grants
+  a Team write access to a new repository makes it available to that Team's
+  Environment without a broker policy change or redeploy.
 - A minted token can read checks, rerun workflows, change repository contents
   and create or update pull requests only for that one repository. GitHub has
   no rerun-only installation permission, so `actions: write` also permits
   other Actions mutations in that repository; the token still receives no
   Checks write, administration, membership or cross-repository authority.
-- Repository names are assertions for human readback; immutable GitHub ids are
-  the authorization keys.
+- Immutable ids are the authorization keys: the Workspace id, the Team id, the
+  Organization id and the repository id GitHub returns from the live Team
+  grant. Repository names are resolved live on every request and never cached.
 - Installation tokens are neither logged nor written to disk by this service.
 - The client credential helper must also avoid disk persistence.
 
@@ -96,18 +95,17 @@ The policy schema is demonstrated in
 contain one high-entropy value and are referenced by path; their values never
 belong in the policy or Git.
 
-### Policy schema `lazurio.github_app_broker.policy.v2`
+### Policy schema `lazurio.github_app_broker.policy.v3`
 
-Schema v2 makes the Team binding part of the contract:
+Schema v3 binds each Workspace to its GitHub Team and names no repositories:
 
-- `workspaces[].github_team_id` is required: the immutable numeric id of the
-  GitHub Team this Workspace acts for. Ids must be unique across Workspaces,
-  so exactly one broker Workspace exists per Team.
-- `workspaces[].github_team_slug` is an optional human-readback assertion. When
-  present, the live Team slug must match; a renamed Team fails closed until
-  the policy is reviewed, and the slug never selects a different Team.
-- `installation_permissions.members` must be `read`: the App reads Teams and
-  Team repository grants through this Organization permission.
+- `github_app {id, slug}`, `github_owner {id, login}`, `installation_id` and
+  `installation_repository_selection` (`selected` or `all`; omitted means
+  `selected`) assert the exact App installation.
+- `installation_permissions` is the exact accepted permission set. It must
+  include `actions: write`, `checks: read`, `contents: write`,
+  `members: read` and `pull_requests: write`; the App reads Teams and Team
+  repository grants through `members: read`.
 - `installation_permissions.workflows: write` is optional. When the
   Organization accepted it and the policy declares it, every token also asks
   for `workflows: write`, so a Workspace can push commits that add or change
@@ -115,113 +113,185 @@ Schema v2 makes the Team binding part of the contract:
   with a write grant. Without it the token keeps the base set. Because the
   installation gate compares permissions exactly, accept the permission and
   deploy the policy that declares it in one short window.
-- `id`, `credential_file` and `repository_ids` keep their v1 meaning.
+- `workspaces[]` has `id`, `github_team_id`, optional `github_team_slug` and
+  `credential_file`. Workspace ids, Team ids and credential files must each be
+  unique, so exactly one broker Workspace exists per Team. The optional slug
+  is a human-readback assertion: when present, the live Team slug must match;
+  a renamed Team fails closed until the policy is reviewed, and the slug never
+  selects a different Team.
 
-Schema v1 is retired and rejected with a migration message. Existing v1
-policies migrate by setting the new `schema_version`, adding one
-`github_team_id` per Workspace and passing `policy check --live` before the
-deployment is switched.
+`repositories` and `workspaces[].repository_ids` no longer exist. A v3 policy
+that still contains either key is rejected, so a half-migrated policy fails
+closed instead of silently ignoring a list someone believes is enforced.
+
+#### Migration from v2
+
+Schema v2 (and the already retired v1) is rejected with a migration message.
+Migrate by setting `schema_version` to `lazurio.github_app_broker.policy.v3`
+and deleting `repositories` and every `workspaces[].repository_ids`; the live
+Team grant is the scope. Run `policy check --live` against the converted
+policy and compare the listed write-capable repositories of each Team with
+what that Team's Environment should reach. A Team that holds more write grants
+than its v2 allowlist gains those repositories; narrow such a Team on GitHub
+before switching. Only then deploy broker `0.10.0` with the v3 policy.
+
+Roll out the broker before the client adapter: broker `0.10.0` accepts both
+the new `{"repository": ...}` body and the `{"repository_id": ...}` body that
+already deployed `0.9.0` adapters send. The `0.10.0` adapter sends only the
+name form and therefore needs a `0.10.0` broker.
 
 ### API
 
-`POST /v1/token`
+`POST /v1/token` accepts exactly one of two bodies:
 
 ```http
 Authorization: Bearer <workspace credential>
 X-Lazurio-Workspace-ID: customer-team
 Content-Type: application/json
 
+{"repository": "example-organization/example-repository"}
+```
+
+```http
 {"repository_id": 2345}
 ```
 
-The response contains the installation token and GitHub expiry timestamp with
-`Cache-Control: no-store`. `GET /health` returns `204` only after startup
-policy verification has succeeded.
+The name form is what the adapter sends. The id form keeps already deployed
+`0.9.0` adapters working during rollout and costs one extra GitHub read. A
+body with both keys, neither, any other key, a non-positive or non-integer id,
+or a name that is not exactly `Owner/name` is refused with `400`.
+
+The response contains the installation token, GitHub's expiry timestamp, the
+immutable `repository_id` and the canonical `repository` full name GitHub
+returned, with `Cache-Control: no-store`:
+
+```json
+{"token": "<installation token>", "expires_at": "2030-01-01T00:00:00Z", "repository_id": 2345, "repository": "example-organization/example-repository"}
+```
+
+`POST /v1/workspace` is the repository-independent connection proof the
+adapter uses for host-level discovery outside a repository checkout. It takes
+the same headers (its body is not read), runs the same credential gate, then
+the installation gate and a read of the Workspace's Team through the same
+revoked `members: read` plus `metadata: read` probe. It mints no repository
+token and returns, with `Cache-Control: no-store`:
+
+```json
+{"workspace_id": "customer-team", "organization": "example-organization", "github_team_id": 4001, "github_team_slug": "customer-team"}
+```
+
+`GET /health` returns `204` only after startup policy verification has
+succeeded.
 
 Every `POST /v1/token` passes these gates in order; a failed gate never issues
 a scoped repository token. The Team gate itself first mints a short-lived
-`members: read` plus `metadata: read` probe token, performs the Team read and revokes the probe, so
-a Team or grant refusal has already cost that probe mint and revocation — it
-only guarantees that no final repository token exists:
+`members: read` plus `metadata: read` probe token, performs its reads and
+revokes the probe, so a Team or grant refusal has already cost that probe mint
+and revocation; it only guarantees that no final repository token exists:
+
+1. credential: unknown Workspace or wrong credential, no GitHub traffic;
+2. body shape and, for the name form, owner: the owner must equal
+   `github_owner.login` case-insensitively, no GitHub traffic;
+3. installation gate: exact App identity, Organization target, selection mode
+   and permissions (the Node adapter at startup, the Worker on every request);
+4. Team gate: the Workspace's Team exists with the asserted identity and holds
+   a write-capable grant on the repository; then the one-repository mint.
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
 | `401` | `workspace_unauthorized` | Unknown Workspace id or wrong credential. No GitHub traffic. |
-| `403` | `repository_denied` | Repository id is outside the Workspace allowlist. No GitHub traffic. |
-| `403` | `team_grant_missing` | Live GitHub readback shows the Workspace's Team is gone, has a different identity than the policy asserts, or lacks a push/maintain/admin grant on the exact repository. |
-| `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, or the mint left the requested scope. |
+| `400` | `invalid_request` | Body is not exactly one of the two forms. No GitHub traffic. |
+| `403` | `repository_denied` | The repository belongs to another owner than the policy's Organization. The name form is refused without GitHub traffic; the id form after the live readback. |
+| `403` | `team_grant_missing` | Live GitHub readback shows the Workspace's Team is gone, has a different identity than the policy asserts, or lacks a push/maintain/admin grant on the repository; or the repository id is not visible to the installation. |
+| `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, the mint left the requested scope, or the body exceeded the size limit. |
 | `415` | `unsupported_media_type` | Body is not JSON. |
 
+`POST /v1/workspace` uses the same codes: `401 workspace_unauthorized` with no
+GitHub traffic, `403 team_grant_missing` when the Workspace's Team is gone or
+its identity differs from the policy, `502 token_unavailable` on any GitHub
+failure and `415` for a non-JSON media type. It never returns `400` or
+`repository_denied` because it names no repository.
+
 The Team gate runs live on every mint with a short-lived `members: read` plus
-`metadata: read` probe token that is revoked immediately afterwards. Its two read requests are
-addressed by immutable ids:
+`metadata: read` probe token that is revoked immediately afterwards. Its read
+requests are:
 
 1. `GET /organizations/{org_id}/team/{team_id}` proves the Team still exists in
    the installation's Organization and matches the asserted identity
    (Organization `members: read`).
-2. `GET /organizations/{org_id}/team/{team_id}/repos/{owner}/{repo}` with
+2. Id form only: `GET /repositories/{id}` learns the repository's current
+   `full_name` and `owner.id`; an owner other than `github_owner.id` is
+   `repository_denied`, and a repository the installation cannot see is
+   `team_grant_missing`.
+3. `GET /organizations/{org_id}/team/{team_id}/repos/{owner}/{repo}` with
    `Accept: application/vnd.github.v3.repository+json` returns the repository
-   with the Team's `permissions`; the broker requires the returned immutable
-   repository id to match and `push`, `maintain` or `admin` to be `true`. A
-   `404` means no grant (Organization `members: read`; GitHub also lists this
-   endpoint under repository `administration: read`, which is not required).
-   The probe also needs repository `metadata: read`: without it GitHub
-   answers `404` for every private repository the probe cannot see, which
-   would look like a missing grant.
+   with the Team's `permissions`. The broker requires the returned
+   `owner.id` to equal `github_owner.id`, `push`, `maintain` or `admin` to be
+   `true` and, for the id form, the returned id to equal the requested id. A
+   `404` or a `pull`/`triage`-only grant is `team_grant_missing`
+   (Organization `members: read`; GitHub also lists this endpoint under
+   repository `administration: read`, which is not required). The probe also
+   needs repository `metadata: read`: without it GitHub answers `404` for
+   every private repository the probe cannot see, which would look like a
+   missing grant.
 
-The `{owner}/{repo}` path segment is the policy's asserted `full_name`, whose
-immutable id was already proven against the live installation. A repository
-renamed after that proof fails closed until the policy is reviewed. Nothing
-from these readbacks is cached: revoking a Team grant on GitHub refuses the
-next token without a restart, and a token already issued expires on GitHub's
-installation-token schedule.
+The token is minted for the repository id GitHub returned in step 3. Archived
+repositories are not special-cased: GitHub itself refuses writes to them.
+Nothing from these readbacks is cached: revoking a Team grant on GitHub
+refuses the next token without a restart, granting one makes the next request
+succeed, and a token already issued expires on GitHub's installation-token
+schedule.
+
+In `selected` installation mode a repository must also be added to the App
+installation on GitHub before a token can be minted for it; until then the
+probe cannot see it and the request is refused. In `all` mode every
+Organization repository is installed, so the Team grant alone decides. Both
+are GitHub-side actions an Organization Admin performs without the broker
+operator.
 
 #### GitHub request budget
 
-A successful Team gate costs four GitHub requests: the probe token mint, the
-two reads above and the probe revocation. A missing Team refuses early after
-three (probe mint, Team read, probe revocation) and never reads the repository
-grant. Including the final scoped mint, one accepted token request costs:
+The installation gate is one request. A successful Team gate costs four GitHub
+requests for the name form (probe mint, Team read, grant read, probe
+revocation) and five for the id form (plus the repository read). A missing
+Team refuses early after three (probe mint, Team read, probe revocation).
+Including the final scoped mint, one accepted token request costs:
 
 | Path | GitHub requests |
 | --- | --- |
-| Node adapter, accepted `POST /v1/token` | 5 (Team gate 4 + scoped mint 1) |
-| Worker adapter, accepted `POST /v1/token` | 9 (live installation gate 4 + Team gate 4 + scoped mint 1) |
-| `policy check --live`, fully successful (maximum) | 4 + 3 × Workspaces + allowlisted grants (installation gate, then one probe mint and revocation plus one Team read per Workspace, plus one grant read per `repository_ids` entry) |
-| `policy check --live`, Workspace with a missing Team | 4 + 3 × Workspaces and no `/repos/` grant reads for that Workspace: the Team read refuses every grant row early, so the per-repository GETs are skipped (a one-Workspace, one-repository missing-Team policy costs 7 requests) |
+| Node adapter, accepted name form | 5 (Team gate 4 + scoped mint 1) |
+| Node adapter, accepted id form | 6 (Team gate 5 + scoped mint 1) |
+| Worker adapter, accepted name form | 6 (installation gate 1 + Team gate 4 + scoped mint 1) |
+| Worker adapter, accepted id form | 7 (installation gate 1 + Team gate 5 + scoped mint 1) |
+| Node adapter, accepted `POST /v1/workspace` | 3 (probe mint, Team read, probe revocation) |
+| Worker adapter, accepted `POST /v1/workspace` | 4 (installation gate 1 + the same 3) |
+| `policy check --live` | 1 + per Workspace: probe mint, Team read, one Team repository list page per 100 repositories, probe revocation (a missing Team skips the list) |
 
-The installation gate counts one `/installation/repositories` page; an
-installation with more than 100 repositories adds one request per further
-page. Denied credentials and denied repositories cost zero GitHub requests.
+Denied credentials, invalid bodies and foreign owners in the name form cost
+zero GitHub requests.
 
 All of these requests draw on the installation's GitHub rate limit. A
 rate-limit or quota response, like any other GitHub failure, fails closed as
 `502 token_unavailable` (or a non-zero `policy check --live` exit) and issues
 no scoped repository token; the Team gate's probe token may already have been
-minted and revoked by then. There is no readback cache to fall back on. Operators sizing a
-deployment must budget the per-mint Worker cost and the readback cost of a
-large policy accordingly.
+minted and revoked by then. There is no readback cache to fall back on.
 
 Both runtime adapters reject an invalid route, media type or Workspace
 credential before consuming the request body. An authenticated token body is
 read with a hard `1024`-byte streaming limit before JSON parsing.
 
-The broker parses the policy and Workspace credentials once, verifies the exact
-live GitHub installation and only then starts listening. Runtime requests never
-trigger installation-wide GitHub verification. Policy or credential changes
-become active only through a verified service restart; deployment automation
-must recreate the workload whenever either mounted input changes.
+The Node broker parses the policy and Workspace credentials once, verifies the
+exact live GitHub installation and only then starts listening. Policy or
+credential changes become active only through a verified service restart;
+deployment automation must recreate the workload whenever either mounted input
+changes. A repository newly granted to a Team needs neither.
 
-`installation_repository_selection` is an explicit policy assertion with the
-values `selected` or `all`; an omitted value remains backward-compatible with
-`selected`. In `selected` mode, the live installation repository set must equal
-the policy exactly. In `all` mode, verification still requires every immutable
-repository id and asserted full name in the policy to exist, while additional
-installation repositories are expected and do not become broker-authorized.
-Every token request remains constrained to one policy repository id and one
-Workspace allowlist. An `all` installation nevertheless increases the private
-key's provider-side blast radius and should be a reviewed deployment decision,
-not an implicit fallback.
+`installation_repository_selection` is an explicit assertion with the values
+`selected` or `all`. The installation gate compares the mode, not a
+repository set. An `all` installation lets the Team grant alone decide and
+increases the private key's provider-side blast radius to every Organization
+repository; it should be a reviewed deployment decision, not an implicit
+fallback.
 
 Operators can revalidate the same live contract without starting another
 listener:
@@ -231,9 +301,9 @@ node src/broker.mjs --verify-only
 ```
 
 The command reads the same mounted policy, App key and Workspace credentials,
-performs the exact live GitHub readback, emits no secret or token, and exits
-non-zero on drift. Deployment automation should run it on every desired-state
-apply in addition to the startup gate.
+performs the exact live installation readback, emits no secret or token, and
+exits non-zero on drift. Deployment automation should run it on every
+desired-state apply in addition to the startup gate.
 
 ### Policy check and migration gate
 
@@ -254,24 +324,28 @@ node src/broker.mjs policy check --live
 
 Without `--live` the command only parses the policy and prints the Workspace
 to Team binding; it needs no key and makes no GitHub call. With `--live` it
-first performs the same installation verification as `--verify-only`, then
-reads back every `repository_ids` entry of every Workspace with one
-`members: read` plus `metadata: read` probe token per Workspace, and prints one
-row per grant:
+first performs the same installation verification as `--verify-only`, then,
+with one `members: read` plus `metadata: read` probe token per Workspace,
+verifies the Team identity and lists the Team's live write-capable
+repositories of the policy's Organization:
 
 ```text
 WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY         ROLE   STATUS   DETAIL
 alpha-team  4001     alpha-team  3001           example-org/alpha  write  ok
-beta-team   4002     beta        3002           example-org/beta   none   refused  Workspace beta-team GitHub Team has no live grant on repository example-org/beta
-2 grants checked, 1 ok, 1 refused
+alpha-team  4001     alpha-team  3003           example-org/gamma  admin  ok
+beta-team   4002     ?           -              -                  -      refused  Workspace beta-team GitHub Team 4002 no longer exists in the Organization
+2 Workspaces checked, 1 Teams ok, 1 refused; 2 write-capable repository grants
 ```
 
-The output contains no token or credential. The command exits non-zero when
-any grant is refused or the installation differs from the policy, which is the
-migration gate for existing v1 deployments: migrate the policy, run
-`policy check --live`, and only then switch the deployment to a broker release
-that requires schema v2. The check never edits GitHub; a refused row is fixed by
-changing the live Team grant or the reviewed policy, never by the broker.
+The repository rows are information: they show the Team's live write grants
+as the probe sees them. In `selected` installation mode a listed repository is
+mintable only while it is also installed for the App; the check does not
+prove that per repository. A Team with no write-capable grant prints one `ok` row
+saying so. The output contains no token or credential. The command exits
+non-zero only when a Team is missing or its identity differs from the policy,
+or when the installation differs from the policy. The check never edits
+GitHub; a refused row is fixed by restoring the Team on GitHub or reviewing
+the policy, never by the broker.
 
 ### Cloudflare Workers
 
@@ -301,10 +375,10 @@ failed.
 
 Unlike the always-on Node process, a Worker has no trustworthy startup phase.
 It therefore parses the policy and credential snapshot on each request and,
-after a valid Workspace credential and repository allowlist match, verifies
-the exact live GitHub installation and then the live Team grant immediately
-before every token mint. Bad credentials and denied repositories never trigger
-GitHub traffic. `GET
+after a valid Workspace credential, a valid body and (for the name form) the
+owner check, verifies the exact live GitHub installation and then the live
+Team grant immediately before every token mint. Bad credentials, invalid
+bodies and foreign-owner names never trigger GitHub traffic. `GET
 /health` proves only that the current Worker bindings form a valid local
 configuration, including an importable RSA PKCS#8 App key; a successful token
 request is the live installation proof.
@@ -355,9 +429,12 @@ The adapter has four command classes:
    `lazurio-for-github[bot]`;
 3. all other `auth`, `config`, `alias`, `extension`, host override and
    cross-repository `search` surfaces fail closed; and
-4. repository commands resolve one exact approved repository, mint a fresh
+4. repository commands resolve one exact repository from `--repo`/`-R`,
+   `GH_REPO` or the current checkout's brokered HTTPS origin, mint a fresh
    scoped token, and invoke real `gh` with the token only in the child process
-   environment.
+   environment. Without a target the command fails closed and asks to run
+   inside a Team repository or pass `--repo OWNER/REPO`; there is no default
+   repository.
 
 `gh run rerun <run-id> --repo OWNER/REPO` follows the fourth class. It uses the
 same one-repository token as other repository commands and does not require a
@@ -371,14 +448,22 @@ denied, and the argument is forwarded unchanged rather than interpreted as a
 second authority.
 
 The host-level authenticated indicator means only that the broker accepted a
-fresh proof for the first deterministic repository in the validated Team
-policy. It is not an Organization-wide capability claim. Every actual command
-resolves and authorizes its own repository again.
+fresh proof. Inside a repository checkout (or with `GH_REPO`) the proof mints
+and discards a token for that repository. Anywhere else, such as the Folder
+root from which Launchpad and T3 run discovery, it calls `POST /v1/workspace`,
+which proves the live installation and the Workspace's Team without minting a
+repository token. A failure of whichever proof applies reports the
+unauthenticated host shape; a failed repository proof does not fall back to the
+Workspace proof. The indicator is not an Organization-wide capability claim.
+Every actual command resolves and authorizes its own repository again.
+
+The adapter holds no repository list. It sends the repository name, and it
+accepts only a broker response whose `repository` names the same repository
+(case-insensitively) and whose `repository_id` is a positive integer. A
+leftover `GITHUB_REPOSITORY_POLICY_JSON` from a `0.9.0` Workspace is ignored.
 
 Required Workspace environment:
 
-- `GITHUB_REPOSITORY_POLICY_JSON`: exact `OWNER/REPO` to immutable repository
-  id mapping;
 - `GITHUB_TOKEN_BROKER_URL`: the exact deployment-owned broker origin;
 - `GITHUB_BROKER_WORKSPACE_ID`: immutable lowercase Workspace id; and
 - `GITHUB_BROKER_CLIENT_CREDENTIAL_FILE=/run/secrets/github_broker_client_token`.
@@ -415,7 +500,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.9.0` |
+| Adapter | `0.10.0` |
 | Cloudflare Wrangler | `4.127.1` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests

@@ -4,10 +4,10 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 
 import {
-  firstPolicyRepository,
   normalizeRepository,
   repositoryIdentityKey,
   requestGitHubAppToken,
+  requestWorkspaceProof,
   requireHttpsGitHubOrigin,
 } from "./broker-client.mjs";
 
@@ -113,16 +113,18 @@ function explicitRepository(args, environment) {
   return result;
 }
 
+function readCheckoutOrigin() {
+  const result = spawnSync("git", ["remote", "get-url", "origin"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
 export function resolveGhRepository({
   args,
   environment = process.env,
-  readOrigin = () => {
-    const result = spawnSync("git", ["remote", "get-url", "origin"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return result.status === 0 ? result.stdout.trim() : null;
-  },
+  readOrigin = readCheckoutOrigin,
 }) {
   const selected = explicitRepository(args, environment);
   const origin = readOrigin();
@@ -137,7 +139,7 @@ export function resolveGhRepository({
   // Prefer the checkout's canonical spelling when gh/T3 supplied the same GitHub identity in a
   // different case. The original gh arguments remain untouched and official gh still executes.
   const repository = originRepository ?? selected;
-  if (!repository) fail("run gh inside an approved Team repository or pass --repo OWNER/REPO");
+  if (!repository) fail("run gh inside a Team repository checkout or pass --repo OWNER/REPO");
   return repository;
 }
 
@@ -197,11 +199,27 @@ function authenticatedStatus() {
   };
 }
 
+/**
+ * Live connection proof for the exact T3 discovery envelopes. Inside a repository checkout (or with
+ * GH_REPO) it mints and discards a token for that repository; anywhere else, such as the Folder
+ * root, it asks the broker for the repository-independent Workspace proof. Throws on any failure.
+ */
+async function proveConnection({ environment, readOrigin, requestToken, requestWorkspace }) {
+  const origin = readOrigin();
+  if (origin || environment.GH_REPO) {
+    const repository = resolveGhRepository({ args: [], environment, readOrigin: () => origin });
+    await requestToken({ repository, environment });
+    return;
+  }
+  await requestWorkspace({ environment });
+}
+
 export async function runBrokeredGh({
   args,
   environment = process.env,
-  readOrigin,
+  readOrigin = readCheckoutOrigin,
   requestToken = requestGitHubAppToken,
+  requestWorkspace = requestWorkspaceProof,
   runRealGh = defaultRunRealGh,
   assertConfigDirectory = assertReadOnlyGhConfigDirectory,
   writeStdout = (value) => process.stdout.write(value),
@@ -217,8 +235,7 @@ export async function runBrokeredGh({
   }
   if (classification === "auth-status" || classification === "viewer-login") {
     try {
-      const repository = firstPolicyRepository(environment);
-      await requestToken({ repository, environment });
+      await proveConnection({ environment, readOrigin, requestToken, requestWorkspace });
     } catch {
       if (classification === "auth-status") {
         writeStdout(`${JSON.stringify({ hosts: {} })}\n`);

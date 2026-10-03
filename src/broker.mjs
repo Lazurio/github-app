@@ -151,12 +151,11 @@ export function parseCommand(arguments_) {
 
 /** Offline summary of the parsed Team binding; no GitHub traffic and no secret. */
 export function formatPolicySummary(policy) {
-  const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG", "REPOSITORIES"];
+  const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG"];
   const rows = policy.workspaces.map((workspace) => [
     workspace.id,
     String(workspace.github_team_id),
     workspace.github_team_slug ?? "-",
-    String(workspace.repository_ids.length),
   ]);
   const widths = header.map((title, column) => Math.max(title.length, ...rows.map((row) => row[column].length)));
   const line = (values) => values.map((value, column) => value.padEnd(widths[column])).join("  ").trimEnd();
