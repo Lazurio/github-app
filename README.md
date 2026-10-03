@@ -318,8 +318,10 @@ beta-team   4002     ?           -              -                  -      refuse
 2 Workspaces checked, 1 Teams ok, 1 refused; 2 write-capable repository grants
 ```
 
-The repository rows are information: they show what each Team's Environment
-can reach right now. A Team with no write-capable grant prints one `ok` row
+The repository rows are information: they show the Team's live write grants
+as the probe sees them. In `selected` installation mode a listed repository is
+mintable only while it is also installed for the App; the check does not
+prove that per repository. A Team with no write-capable grant prints one `ok` row
 saying so. The output contains no token or credential. The command exits
 non-zero only when a Team is missing or its identity differs from the policy,
 or when the installation differs from the policy. The check never edits
