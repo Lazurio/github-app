@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 
-import { TeamGrantError } from "../src/core.mjs";
+import { RepositoryDeniedError, TeamGrantError } from "../src/core.mjs";
 import {
   createWorkerEntrypoint,
   createWorkerJwtSigner,
@@ -15,7 +15,7 @@ const BETA_CREDENTIAL = "beta-secret-value-with-at-least-32-bytes";
 
 function policyFixture() {
   return {
-    schema_version: "lazurio.github_app_broker.policy.v2",
+    schema_version: "lazurio.github_app_broker.policy.v3",
     github_app: { id: 42, slug: "example-app" },
     github_owner: { id: 1001, login: "example-org" },
     installation_id: 2001,
@@ -28,22 +28,16 @@ function policyFixture() {
       metadata: "read",
       pull_requests: "write",
     },
-    repositories: [
-      { id: 3001, full_name: "example-org/alpha" },
-      { id: 3002, full_name: "example-org/beta" },
-    ],
     workspaces: [
       {
         id: "alpha-team",
         github_team_id: 4001,
         credential_file: "/run/secrets/workspace-alpha",
-        repository_ids: [3001],
       },
       {
         id: "beta-team",
         github_team_id: 4002,
         credential_file: "/run/secrets/workspace-beta",
-        repository_ids: [3002],
       },
     ],
   };
@@ -60,19 +54,32 @@ function environment(overrides = {}) {
   };
 }
 
-function workerFixture({ teamGrant = async () => ({ role: "write" }) } = {}) {
-  const calls = { verify: 0, teamGrant: 0, mint: 0 };
+const grantedAlpha = async (_policy, _workspace, target) => {
+  if (target.repository_id !== undefined && target.repository_id !== 3001) {
+    throw new TeamGrantError("no grant");
+  }
+  if (target.repository !== undefined && target.repository.toLowerCase() !== "example-org/alpha") {
+    throw new TeamGrantError("no grant");
+  }
+  return { repository_id: 3001, full_name: "example-org/alpha", role: "write" };
+};
+
+function workerFixture({ teamGrant = grantedAlpha } = {}) {
+  const calls = { verify: 0, teamGrant: 0, mint: 0, order: [] };
   const worker = createWorkerEntrypoint({
     createGithub: () => ({
       async verifyPolicy() {
         calls.verify += 1;
+        calls.order.push("installation");
       },
-      async verifyTeamGrant(policy, workspace, repositoryId) {
+      async verifyTeamGrant(policy, workspace, target) {
         calls.teamGrant += 1;
-        return teamGrant(policy, workspace, repositoryId);
+        calls.order.push("team");
+        return teamGrant(policy, workspace, target);
       },
       async mintToken(_policy, repositoryId) {
         calls.mint += 1;
+        calls.order.push("mint");
         return {
           token: `ghs_synthetic_${repositoryId}`,
           expires_at: "2030-01-01T00:00:00Z",
@@ -88,7 +95,7 @@ function tokenRequest({
   origin = "https://broker.example.test",
   workspace = "alpha-team",
   credential = ALPHA_CREDENTIAL,
-  repositoryId = 3001,
+  body = { repository: "example-org/alpha" },
 } = {}) {
   return new Request(`${origin}/v1/token`, {
     method: "POST",
@@ -97,8 +104,12 @@ function tokenRequest({
       "Content-Type": "application/json",
       "X-Lazurio-Workspace-ID": workspace,
     },
-    body: JSON.stringify({ repository_id: repositoryId }),
+    body: typeof body === "string" ? body : JSON.stringify(body),
   });
+}
+
+function countsOf(calls) {
+  return { verify: calls.verify, teamGrant: calls.teamGrant, mint: calls.mint };
 }
 
 test("maps immutable Workspace ids to independent Worker secret bindings", () => {
@@ -111,7 +122,7 @@ test("Worker health validates deployment bindings without calling GitHub", async
   const response = await worker.fetch(new Request("https://broker.example.test/health"), environment());
   assert.equal(response.status, 204);
   assert.equal(response.headers.get("cache-control"), "no-store");
-  assert.deepEqual(calls, { verify: 0, teamGrant: 0, mint: 0 });
+  assert.deepEqual(countsOf(calls), { verify: 0, teamGrant: 0, mint: 0 });
 });
 
 test("Worker fails closed when policy, key or unique Workspace secrets are unavailable", async () => {
@@ -125,7 +136,7 @@ test("Worker fails closed when policy, key or unique Workspace secrets are unava
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { error: "configuration_unavailable" });
   }
-  assert.deepEqual(calls, { verify: 0, teamGrant: 0, mint: 0 });
+  assert.deepEqual(countsOf(calls), { verify: 0, teamGrant: 0, mint: 0 });
 });
 
 test("default Worker runtime rejects a non-PKCS#8 App key before reporting healthy", async () => {
@@ -205,34 +216,67 @@ test("Worker rejects request metadata without consuming the body stream", async 
     assert.deepEqual(await response.json(), { error: expectedError });
     assert.equal(reads, 0);
   }
-  assert.deepEqual(calls, { verify: 0, teamGrant: 0, mint: 0 });
+  assert.deepEqual(countsOf(calls), { verify: 0, teamGrant: 0, mint: 0 });
 });
 
-test("Worker denies invalid credentials and repositories before live GitHub verification", async () => {
+test("Worker denies invalid credentials, invalid bodies and foreign owners before live GitHub verification", async () => {
   const { worker, calls } = workerFixture();
   const unauthorized = await worker.fetch(tokenRequest({ credential: "wrong-secret-with-at-least-thirty-two-bytes" }), environment());
   assert.equal(unauthorized.status, 401);
   assert.deepEqual(await unauthorized.json(), { error: "workspace_unauthorized" });
 
-  const denied = await worker.fetch(tokenRequest({ repositoryId: 3002 }), environment());
-  assert.equal(denied.status, 403);
-  assert.deepEqual(await denied.json(), { error: "repository_denied" });
-  assert.deepEqual(calls, { verify: 0, teamGrant: 0, mint: 0 });
+  for (const repository of ["other-org/alpha", "OTHER-ORG/beta"]) {
+    const denied = await worker.fetch(tokenRequest({ body: { repository } }), environment());
+    assert.equal(denied.status, 403);
+    assert.deepEqual(await denied.json(), { error: "repository_denied" });
+  }
+
+  for (const body of [
+    "{",
+    {},
+    { repository: "example-org/alpha", repository_id: 3001 },
+    { repository_id: "3001" },
+    { repository: "example-org/.." },
+  ]) {
+    const invalid = await worker.fetch(tokenRequest({ body }), environment());
+    assert.equal(invalid.status, 400, JSON.stringify(body));
+    assert.deepEqual(await invalid.json(), { error: "invalid_request" });
+  }
+  assert.deepEqual(countsOf(calls), { verify: 0, teamGrant: 0, mint: 0 });
 });
 
-test("Worker verifies live policy before every fresh one-repository token", async () => {
+test("Worker verifies the live installation, then the Team grant, before every fresh token in both forms", async () => {
   const { worker, calls } = workerFixture();
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const response = await worker.fetch(tokenRequest(), environment());
+  for (const body of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+    const response = await worker.fetch(tokenRequest({ body }), environment());
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("cache-control"), "no-store");
     assert.deepEqual(await response.json(), {
       token: "ghs_synthetic_3001",
       expires_at: "2030-01-01T00:00:00Z",
       repository_id: 3001,
+      repository: "example-org/alpha",
     });
   }
-  assert.deepEqual(calls, { verify: 2, teamGrant: 2, mint: 2 });
+  assert.deepEqual(countsOf(calls), { verify: 2, teamGrant: 2, mint: 2 });
+  assert.deepEqual(calls.order, ["installation", "team", "mint", "installation", "team", "mint"]);
+});
+
+test("Worker refuses cross-repository and foreign-owner ids from the Team gate and mints nothing", async () => {
+  const { worker, calls } = workerFixture({
+    teamGrant: async (policy, workspace, target) => {
+      if (target.repository_id === 9001) throw new RepositoryDeniedError("another owner");
+      return grantedAlpha(policy, workspace, target);
+    },
+  });
+  const crossRepository = await worker.fetch(tokenRequest({ body: { repository: "example-org/beta" } }), environment());
+  assert.equal(crossRepository.status, 403);
+  assert.deepEqual(await crossRepository.json(), { error: "team_grant_missing" });
+
+  const foreignId = await worker.fetch(tokenRequest({ body: { repository_id: 9001 } }), environment());
+  assert.equal(foreignId.status, 403);
+  assert.deepEqual(await foreignId.json(), { error: "repository_denied" });
+  assert.deepEqual(countsOf(calls), { verify: 2, teamGrant: 2, mint: 0 });
 });
 
 test("Worker rejects query substitution and oversized token bodies", async () => {
@@ -244,7 +288,7 @@ test("Worker rejects query substitution and oversized token bodies", async () =>
       "Content-Type": "application/json",
       "X-Lazurio-Workspace-ID": "alpha-team",
     },
-    body: JSON.stringify({ repository_id: 3001 }),
+    body: JSON.stringify({ repository: "example-org/alpha" }),
   }), environment());
   assert.equal(query.status, 404);
 
@@ -255,12 +299,12 @@ test("Worker rejects query substitution and oversized token bodies", async () =>
       "Content-Type": "application/json",
       "X-Lazurio-Workspace-ID": "alpha-team",
     },
-    body: JSON.stringify({ repository_id: 3001, padding: "x".repeat(1024) }),
+    body: JSON.stringify({ repository: "example-org/alpha", padding: "x".repeat(1024) }),
   });
   const response = await worker.fetch(oversized, environment());
   assert.equal(response.status, 502);
   assert.deepEqual(await response.json(), { error: "token_unavailable" });
-  assert.deepEqual(calls, { verify: 0, teamGrant: 0, mint: 0 });
+  assert.deepEqual(countsOf(calls), { verify: 0, teamGrant: 0, mint: 0 });
 });
 
 test("Worker PKCS#8 signer produces a valid RS256 signature", async () => {
@@ -278,10 +322,10 @@ test("Worker PKCS#8 signer produces a valid RS256 signature", async () => {
 test("Worker refuses with team_grant_missing after live verification and mints nothing", async () => {
   let attempts = 0;
   const { worker, calls } = workerFixture({
-    teamGrant: async () => {
+    teamGrant: async (policy, workspace, target) => {
       attempts += 1;
       if (attempts > 1) throw new TeamGrantError("grant revoked between mints");
-      return { role: "write" };
+      return grantedAlpha(policy, workspace, target);
     },
   });
   const granted = await worker.fetch(tokenRequest(), environment());
@@ -291,7 +335,7 @@ test("Worker refuses with team_grant_missing after live verification and mints n
   assert.equal(refused.status, 403);
   assert.equal(refused.headers.get("cache-control"), "no-store");
   assert.deepEqual(await refused.json(), { error: "team_grant_missing" });
-  assert.deepEqual(calls, { verify: 2, teamGrant: 2, mint: 1 });
+  assert.deepEqual(countsOf(calls), { verify: 2, teamGrant: 2, mint: 1 });
 });
 
 test("Worker treats a GitHub client without Team verification as unavailable configuration", async () => {

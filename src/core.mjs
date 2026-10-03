@@ -2,10 +2,15 @@
 
 export const MAX_BODY_BYTES = 1024;
 
-const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v2";
-const RETIRED_POLICY_SCHEMA = "lazurio.github_app_broker.policy.v1";
+const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v3";
+const RETIRED_POLICY_SCHEMA_V1 = "lazurio.github_app_broker.policy.v1";
+const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
+const V3_MIGRATION =
+  "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.9.0";
+const USER_AGENT = "lazurio-github-app-broker/0.10.0";
+/** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
+const MAX_TEAM_REPOSITORY_PAGES = 100;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
 const TOKEN_PERMISSIONS = Object.freeze({
   actions: "write",
@@ -33,6 +38,8 @@ const TEAM_PROBE_PERMISSIONS = Object.freeze({ members: "read", metadata: "read"
 const REPOSITORY_PERMISSIONS_MEDIA_TYPE = "application/vnd.github.v3.repository+json";
 
 export const TEAM_GRANT_MISSING = "team_grant_missing";
+export const REPOSITORY_DENIED = "repository_denied";
+export const INVALID_REQUEST = "invalid_request";
 
 /** A live GitHub Team binding or repository grant diverged from the policy; the broker mints nothing. */
 export class TeamGrantError extends Error {
@@ -43,12 +50,72 @@ export class TeamGrantError extends Error {
   }
 }
 
+/** The requested repository belongs to another owner than the policy's Organization. */
+export class RepositoryDeniedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RepositoryDeniedError";
+    this.code = REPOSITORY_DENIED;
+  }
+}
+
 function fail(message) {
   throw new Error(message);
 }
 
 function refuse(message) {
   throw new TeamGrantError(message);
+}
+
+function deny(message) {
+  throw new RepositoryDeniedError(message);
+}
+
+const OWNER_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const REPOSITORY_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
+
+/**
+ * Parses an exact `Owner/name` coordinate. `.` and `..` are refused because they would change the
+ * meaning of the GitHub API path the name is placed into.
+ */
+export function parseRepositoryCoordinate(value) {
+  if (typeof value !== "string") return undefined;
+  const parts = value.split("/");
+  if (
+    parts.length !== 2 ||
+    !OWNER_LOGIN_PATTERN.test(parts[0]) ||
+    !REPOSITORY_NAME_PATTERN.test(parts[1]) ||
+    parts[1] === "." ||
+    parts[1] === ".."
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ owner: parts[0], name: parts[1], full_name: `${parts[0]}/${parts[1]}` });
+}
+
+/**
+ * Parses the `POST /v1/token` body: exactly one of `{"repository": "Owner/name"}` or
+ * `{"repository_id": <positive integer>}`. Returns undefined for anything else.
+ */
+export function parseTokenRequest(bodyText) {
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return undefined;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const keys = Object.keys(body);
+  if (keys.length !== 1) return undefined;
+  if (keys[0] === "repository") {
+    const coordinate = parseRepositoryCoordinate(body.repository);
+    return coordinate ? Object.freeze({ repository: coordinate.full_name }) : undefined;
+  }
+  if (keys[0] === "repository_id") {
+    const id = body.repository_id;
+    return Number.isSafeInteger(id) && id > 0 ? Object.freeze({ repository_id: id }) : undefined;
+  }
+  return undefined;
 }
 
 function positiveInteger(value, label) {
@@ -65,12 +132,18 @@ function canonicalObject(value) {
 export function parsePolicy(raw) {
   const input = typeof raw === "string" ? JSON.parse(raw) : structuredClone(raw);
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("policy must be an object");
-  if (input.schema_version === RETIRED_POLICY_SCHEMA) {
+  if (input.schema_version === RETIRED_POLICY_SCHEMA_V1) {
     fail(
-      `policy schema ${RETIRED_POLICY_SCHEMA} is retired; migrate to ${POLICY_SCHEMA} with one immutable workspaces[].github_team_id per Workspace`,
+      `policy schema ${RETIRED_POLICY_SCHEMA_V1} is retired; add one immutable workspaces[].github_team_id per Workspace and ${V3_MIGRATION}`,
     );
   }
+  if (input.schema_version === RETIRED_POLICY_SCHEMA_V2) {
+    fail(`policy schema ${RETIRED_POLICY_SCHEMA_V2} is retired; ${V3_MIGRATION}`);
+  }
   if (input.schema_version !== POLICY_SCHEMA) fail("unsupported policy schema");
+  if (Object.hasOwn(input, "repositories")) {
+    fail(`policy v3 must not contain \`repositories\`; ${V3_MIGRATION}`);
+  }
 
   const appId = positiveInteger(input.github_app?.id, "github_app.id");
   const appSlug = input.github_app?.slug;
@@ -79,7 +152,7 @@ export function parsePolicy(raw) {
   }
   const ownerId = positiveInteger(input.github_owner?.id, "github_owner.id");
   const ownerLogin = input.github_owner?.login;
-  if (typeof ownerLogin !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(ownerLogin)) {
+  if (typeof ownerLogin !== "string" || !OWNER_LOGIN_PATTERN.test(ownerLogin)) {
     fail("github_owner.login is invalid");
   }
   const installationId = positiveInteger(input.installation_id, "installation_id");
@@ -107,33 +180,13 @@ export function parsePolicy(raw) {
     );
   }
 
-  if (!Array.isArray(input.repositories) || input.repositories.length === 0) {
-    fail("repositories must be a non-empty array");
-  }
-  const repositories = input.repositories.map((repository, index) => {
-    const id = positiveInteger(repository?.id, `repositories[${index}].id`);
-    const fullName = repository?.full_name;
-    if (
-      typeof fullName !== "string" ||
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(fullName) ||
-      fullName.split("/", 1)[0].toLowerCase() !== ownerLogin.toLowerCase()
-    ) {
-      fail(`repositories[${index}].full_name is invalid for the asserted owner`);
-    }
-    return Object.freeze({ id, full_name: fullName });
-  });
-  if (new Set(repositories.map(({ id }) => id)).size !== repositories.length) {
-    fail("repository ids must be unique");
-  }
-  if (new Set(repositories.map(({ full_name }) => full_name.toLowerCase())).size !== repositories.length) {
-    fail("repository full names must be unique");
-  }
-  const repositoryIds = new Set(repositories.map(({ id }) => id));
-
   if (!Array.isArray(input.workspaces) || input.workspaces.length === 0) {
     fail("workspaces must be a non-empty array");
   }
   const workspaces = input.workspaces.map((workspace, index) => {
+    if (workspace && typeof workspace === "object" && Object.hasOwn(workspace, "repository_ids")) {
+      fail(`policy v3 must not contain \`workspaces[${index}].repository_ids\`; ${V3_MIGRATION}`);
+    }
     const id = workspace?.id;
     if (typeof id !== "string" || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) {
       fail(`workspaces[${index}].id is invalid`);
@@ -150,24 +203,11 @@ export function parsePolicy(raw) {
     ) {
       fail(`workspaces[${index}].credential_file must be a canonical file below /run/secrets`);
     }
-    if (!Array.isArray(workspace.repository_ids) || workspace.repository_ids.length === 0) {
-      fail(`workspaces[${index}].repository_ids must be non-empty`);
-    }
-    const ids = workspace.repository_ids.map((repositoryId, repositoryIndex) => {
-      const result = positiveInteger(
-        repositoryId,
-        `workspaces[${index}].repository_ids[${repositoryIndex}]`,
-      );
-      if (!repositoryIds.has(result)) fail(`workspace ${id} references an unknown repository id`);
-      return result;
-    });
-    if (new Set(ids).size !== ids.length) fail(`workspace ${id} repeats a repository id`);
     return Object.freeze({
       id,
       github_team_id: teamId,
       ...(teamSlug === undefined ? {} : { github_team_slug: teamSlug }),
       credential_file: credentialFile,
-      repository_ids: Object.freeze(ids),
     });
   });
   if (new Set(workspaces.map(({ id }) => id)).size !== workspaces.length) {
@@ -187,7 +227,6 @@ export function parsePolicy(raw) {
     installation_id: installationId,
     installation_repository_selection: installationRepositorySelection,
     installation_permissions: Object.freeze({ ...installationPermissions }),
-    repositories: Object.freeze(repositories),
     workspaces: Object.freeze(workspaces),
   });
 }
@@ -266,6 +305,11 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     return result;
   }
 
+  /**
+   * Installation gate: exact App identity, Organization target, repository selection mode and
+   * permission set. The policy names no repositories, so the gate enumerates none; the live Team
+   * grant decides which repository a Workspace may use.
+   */
   async function verifyPolicy(policy) {
     if (String(policy.github_app.id) !== String(appId)) {
       fail("configured GitHub App id differs from policy");
@@ -282,32 +326,6 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     ) {
       fail("live GitHub installation identity, selection or permissions differ from policy");
     }
-
-    await withProbeToken(policy, { contents: "read" }, async (authorization) => {
-      const actual = new Map();
-      let page = 1;
-      let total = Number.POSITIVE_INFINITY;
-      while (actual.size < total && page <= 100) {
-        const response = await request(`/installation/repositories?per_page=100&page=${page}`, {
-          authorization,
-        });
-        total = response?.total_count;
-        if (!Number.isSafeInteger(total) || total < 0) fail("GitHub returned an invalid repository total");
-        for (const repository of response.repositories ?? []) {
-          actual.set(repository.id, repository.full_name);
-        }
-        page += 1;
-      }
-      const expected = new Map(policy.repositories.map(({ id, full_name }) => [id, full_name]));
-      const configuredRepositoryMissing = [...expected].some(
-        ([id, fullName]) => actual.get(id) !== fullName,
-      );
-      const selectedInstallationHasDrift =
-        policy.installation_repository_selection === "selected" && actual.size !== expected.size;
-      if (actual.size !== total || configuredRepositoryMissing || selectedInstallationHasDrift) {
-        fail("live GitHub installation repository grants differ from policy");
-      }
-    });
   }
 
   function grantRole(permissions) {
@@ -317,6 +335,10 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     if (permissions?.triage === true) return "triage";
     if (permissions?.pull === true) return "read";
     return "none";
+  }
+
+  function isWriteCapable(role) {
+    return role === "admin" || role === "maintain" || role === "write";
   }
 
   async function readTeam(policy, workspace, authorization) {
@@ -339,90 +361,150 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     return Object.freeze({ id: team.id, slug: team.slug });
   }
 
-  async function readTeamGrant(policy, workspace, repositoryId, authorization) {
-    const repository = policy.repositories.find(({ id }) => id === repositoryId);
-    if (!repository || !workspace.repository_ids.includes(repositoryId)) {
-      fail(`repository ${repositoryId} is outside the Workspace ${workspace.id} policy`);
+  /** Resolves an immutable repository id to its live coordinate inside the policy's Organization. */
+  async function resolveRepositoryId(policy, workspace, repositoryId, authorization) {
+    const repository = await request(`/repositories/${repositoryId}`, { authorization, tolerateNotFound: true });
+    if (repository === undefined) {
+      refuse(`Workspace ${workspace.id} cannot see repository ${repositoryId}`);
+    }
+    if (repository?.owner?.id !== policy.github_owner.id) {
+      deny(`repository ${repositoryId} belongs to another owner than the policy's Organization`);
+    }
+    const coordinate = parseRepositoryCoordinate(repository?.full_name);
+    if (repository?.id !== repositoryId || !coordinate) {
+      fail("GitHub returned an invalid repository identity");
+    }
+    return coordinate;
+  }
+
+  async function readTeamGrant(policy, workspace, target, authorization) {
+    let coordinate;
+    if (target?.repository_id !== undefined) {
+      coordinate = await resolveRepositoryId(policy, workspace, target.repository_id, authorization);
+    } else {
+      coordinate = parseRepositoryCoordinate(target?.repository);
+      if (!coordinate) fail("repository coordinate is invalid");
+      if (coordinate.owner.toLowerCase() !== policy.github_owner.login.toLowerCase()) {
+        deny(`repository ${coordinate.full_name} belongs to another owner than the policy's Organization`);
+      }
     }
     const grant = await request(
-      `/organizations/${policy.github_owner.id}/team/${workspace.github_team_id}/repos/${repository.full_name}`,
+      `/organizations/${policy.github_owner.id}/team/${workspace.github_team_id}/repos/${encodeURIComponent(coordinate.owner)}/${encodeURIComponent(coordinate.name)}`,
       { authorization, accept: REPOSITORY_PERMISSIONS_MEDIA_TYPE, tolerateNotFound: true },
     );
     if (grant === undefined) {
-      refuse(`Workspace ${workspace.id} GitHub Team has no live grant on repository ${repository.full_name}`);
+      refuse(`Workspace ${workspace.id} GitHub Team has no live grant on repository ${coordinate.full_name}`);
+    }
+    if (grant?.owner && grant.owner.id !== policy.github_owner.id) {
+      deny(`repository ${coordinate.full_name} belongs to another owner than the policy's Organization`);
     }
     const role = grantRole(grant?.permissions);
-    if (grant?.id !== repositoryId || !["admin", "maintain", "write"].includes(role)) {
-      refuse(
-        `Workspace ${workspace.id} GitHub Team grant on repository ${repository.full_name} is not write-capable`,
-      );
+    const returned = parseRepositoryCoordinate(grant?.full_name);
+    if (
+      grant?.owner?.id !== policy.github_owner.id ||
+      !Number.isSafeInteger(grant?.id) ||
+      grant.id <= 0 ||
+      !returned ||
+      (target?.repository_id !== undefined && grant.id !== target.repository_id) ||
+      !isWriteCapable(role)
+    ) {
+      refuse(`Workspace ${workspace.id} GitHub Team grant on repository ${coordinate.full_name} is not write-capable`);
     }
     return Object.freeze({
       workspace_id: workspace.id,
       github_team_id: workspace.github_team_id,
-      repository_id: repositoryId,
-      full_name: repository.full_name,
+      repository_id: grant.id,
+      full_name: returned.full_name,
       role,
     });
   }
 
   /**
-   * Live per-mint Team binding check. Throws TeamGrantError when the Workspace's immutable
-   * GitHub Team is gone, has a different identity than the policy asserts, or lacks a
-   * write-capable grant on the exact repository. Nothing is cached across calls.
+   * Live per-mint Team gate. `target` is `{ repository: "Owner/name" }` or `{ repository_id }`.
+   * Throws RepositoryDeniedError when the repository belongs to another owner, and TeamGrantError
+   * when the Workspace's immutable GitHub Team is gone, has a different identity than the policy
+   * asserts, or lacks a write-capable grant on the repository. Nothing is cached across calls.
    */
-  async function verifyTeamGrant(policy, workspace, repositoryId) {
+  async function verifyTeamGrant(policy, workspace, target) {
     return withProbeToken(policy, TEAM_PROBE_PERMISSIONS, async (authorization) => {
       const team = await readTeam(policy, workspace, authorization);
-      const grant = await readTeamGrant(policy, workspace, repositoryId, authorization);
+      const grant = await readTeamGrant(policy, workspace, target, authorization);
       return Object.freeze({ ...grant, github_team_slug: team.slug });
     });
   }
 
-  /** Readback of every repository grant of one Workspace with a single probe token; never throws per row. */
+  /**
+   * Readback of one Workspace: its Team identity and the Team's live write-capable repositories,
+   * with a single probe token. A missing or drifted Team becomes one refused row; it never throws
+   * for that case.
+   */
   async function readWorkspaceTeamGrants(policy, workspace) {
     return withProbeToken(policy, TEAM_PROBE_PERMISSIONS, async (authorization) => {
-      const rows = [];
       let team;
       try {
         team = await readTeam(policy, workspace, authorization);
       } catch (error) {
         if (error?.code !== TEAM_GRANT_MISSING) throw error;
-        return policy.repositories
-          .filter(({ id }) => workspace.repository_ids.includes(id))
-          .map(({ id, full_name }) =>
-            Object.freeze({
-              workspace_id: workspace.id,
-              github_team_id: workspace.github_team_id,
-              github_team_slug: workspace.github_team_slug ?? "?",
-              repository_id: id,
-              full_name,
-              role: "none",
-              status: "refused",
-              detail: error.message,
-            }),
-          );
+        return Object.freeze([
+          Object.freeze({
+            workspace_id: workspace.id,
+            github_team_id: workspace.github_team_id,
+            github_team_slug: workspace.github_team_slug ?? "?",
+            repository_id: "-",
+            full_name: "-",
+            role: "-",
+            status: "refused",
+            detail: error.message,
+          }),
+        ]);
       }
-      for (const repositoryId of workspace.repository_ids) {
-        try {
-          const grant = await readTeamGrant(policy, workspace, repositoryId, authorization);
-          rows.push(Object.freeze({ ...grant, github_team_slug: team.slug, status: "ok", detail: "" }));
-        } catch (error) {
-          if (error?.code !== TEAM_GRANT_MISSING) throw error;
-          const repository = policy.repositories.find(({ id }) => id === repositoryId);
+      const rows = [];
+      for (let page = 1; ; page += 1) {
+        if (page > MAX_TEAM_REPOSITORY_PAGES) fail("GitHub Team repository list exceeds the readback bound");
+        const repositories = await request(
+          `/organizations/${policy.github_owner.id}/team/${workspace.github_team_id}/repos?per_page=100&page=${page}`,
+          { authorization },
+        );
+        if (!Array.isArray(repositories)) fail("GitHub returned an invalid Team repository list");
+        for (const repository of repositories) {
+          const role = grantRole(repository?.permissions);
+          const coordinate = parseRepositoryCoordinate(repository?.full_name);
+          if (
+            repository?.owner?.id !== policy.github_owner.id ||
+            !Number.isSafeInteger(repository?.id) ||
+            !coordinate ||
+            !isWriteCapable(role)
+          ) {
+            continue;
+          }
           rows.push(
             Object.freeze({
               workspace_id: workspace.id,
               github_team_id: workspace.github_team_id,
               github_team_slug: team.slug,
-              repository_id: repositoryId,
-              full_name: repository.full_name,
-              role: "none",
-              status: "refused",
-              detail: error.message,
+              repository_id: repository.id,
+              full_name: coordinate.full_name,
+              role,
+              status: "ok",
+              detail: "",
             }),
           );
         }
+        if (repositories.length < 100) break;
+      }
+      if (rows.length === 0) {
+        rows.push(
+          Object.freeze({
+            workspace_id: workspace.id,
+            github_team_id: workspace.github_team_id,
+            github_team_slug: team.slug,
+            repository_id: "-",
+            full_name: "-",
+            role: "-",
+            status: "ok",
+            detail: "Team holds no write-capable repository grant",
+          }),
+        );
       }
       return Object.freeze(rows);
     });
@@ -464,7 +546,8 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
 
 /**
  * Migration and readback gate: verifies the live installation, then every Workspace's Team
- * binding and every `repository_ids` grant. Returns rows for a human table; emits no secret.
+ * binding, and lists each Team's live write-capable repositories as information. Only a missing
+ * or drifted Team (or installation drift, which throws) makes the result not ok. Emits no secret.
  */
 export async function checkPolicyLive({ policy, github }) {
   if (typeof github?.verifyPolicy !== "function" || typeof github?.readWorkspaceTeamGrants !== "function") {
@@ -495,12 +578,22 @@ export function formatPolicyCheckTable(rows) {
     Math.max(header.length, ...cells.map((line) => line[column].length)),
   );
   const line = (values) => values.map((value, column) => value.padEnd(widths[column])).join("  ").trimEnd();
-  const refused = rows.filter(({ status }) => status !== "ok").length;
+  const workspaces = new Map();
+  for (const row of rows) {
+    const refused = workspaces.get(row.workspace_id) === "refused" || row.status !== "ok";
+    workspaces.set(row.workspace_id, refused ? "refused" : "ok");
+  }
+  const refusedTeams = [...workspaces.values()].filter((status) => status === "refused").length;
+  const repositories = rows.filter(({ status, repository_id }) => status === "ok" && repository_id !== "-").length;
   return [
     line(POLICY_CHECK_COLUMNS.map(([, header]) => header)),
     ...cells.map(line),
-    `${rows.length} grants checked, ${rows.length - refused} ok, ${refused} refused`,
+    `${workspaces.size} Workspaces checked, ${workspaces.size - refusedTeams} Teams ok, ${refusedTeams} refused; ${repositories} write-capable repository grants`,
   ].join("\n") + "\n";
+}
+
+function result(status, body) {
+  return Object.freeze({ status, body });
 }
 
 export function createBrokerHandler({ policy, github, credentials, secretMatches }) {
@@ -510,6 +603,7 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     fail("GitHub client must verify the Team grant and mint tokens");
   }
   const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
+  const ownerKey = policy.github_owner.login.toLowerCase();
 
   return async ({
     method,
@@ -520,13 +614,13 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     readBody = async () => "",
   }) => {
     if (method === "GET" && path === "/health") {
-      return Object.freeze({ status: 204, body: null });
+      return result(204, null);
     }
     if (method !== "POST" || path !== "/v1/token") {
-      return Object.freeze({ status: 404, body: { error: "not_found" } });
+      return result(404, { error: "not_found" });
     }
     if (!contentType.toLowerCase().startsWith("application/json")) {
-      return Object.freeze({ status: 415, body: { error: "unsupported_media_type" } });
+      return result(415, { error: "unsupported_media_type" });
     }
 
     const presentedCredential = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
@@ -538,7 +632,7 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
           DUMMY_WORKSPACE_CREDENTIAL,
       );
       if (!workspace || !presentedCredential || !credentialMatches) {
-        return Object.freeze({ status: 401, body: { error: "workspace_unauthorized" } });
+        return result(401, { error: "workspace_unauthorized" });
       }
 
       if (typeof readBody !== "function") fail("request body reader is missing");
@@ -547,22 +641,37 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       if (new TextEncoder().encode(bodyText).byteLength > MAX_BODY_BYTES) {
         fail("request body is too large");
       }
-      const body = JSON.parse(bodyText);
-      const repositoryId = body?.repository_id;
-      if (!Number.isSafeInteger(repositoryId) || !workspace.repository_ids.includes(repositoryId)) {
-        return Object.freeze({ status: 403, body: { error: "repository_denied" } });
+      const target = parseTokenRequest(bodyText);
+      if (!target) return result(400, { error: INVALID_REQUEST });
+      // A name outside the policy's Organization is refused before any GitHub traffic.
+      if (target.repository !== undefined && target.repository.split("/", 1)[0].toLowerCase() !== ownerKey) {
+        return result(403, { error: REPOSITORY_DENIED });
       }
+
+      let grant;
       try {
-        await github.verifyTeamGrant(policy, workspace, repositoryId);
+        grant = await github.verifyTeamGrant(policy, workspace, target);
       } catch (error) {
-        if (error?.code === TEAM_GRANT_MISSING) {
-          return Object.freeze({ status: 403, body: { error: TEAM_GRANT_MISSING } });
+        if (error?.code === TEAM_GRANT_MISSING || error?.code === REPOSITORY_DENIED) {
+          return result(403, { error: error.code });
         }
         throw error;
       }
-      return Object.freeze({ status: 200, body: await github.mintToken(policy, repositoryId) });
+      const repositoryId = grant?.repository_id;
+      const repository = parseRepositoryCoordinate(grant?.full_name);
+      if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0 || !repository) {
+        fail("Team gate returned an invalid repository");
+      }
+      const minted = await github.mintToken(policy, repositoryId);
+      if (minted?.repository_id !== repositoryId) fail("minted token is outside the verified repository");
+      return result(200, {
+        token: minted.token,
+        expires_at: minted.expires_at,
+        repository_id: repositoryId,
+        repository: repository.full_name,
+      });
     } catch {
-      return Object.freeze({ status: 502, body: { error: "token_unavailable" } });
+      return result(502, { error: "token_unavailable" });
     }
   };
 }

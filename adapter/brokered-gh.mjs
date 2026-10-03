@@ -4,7 +4,6 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 
 import {
-  firstPolicyRepository,
   normalizeRepository,
   repositoryIdentityKey,
   requestGitHubAppToken,
@@ -137,7 +136,7 @@ export function resolveGhRepository({
   // Prefer the checkout's canonical spelling when gh/T3 supplied the same GitHub identity in a
   // different case. The original gh arguments remain untouched and official gh still executes.
   const repository = originRepository ?? selected;
-  if (!repository) fail("run gh inside an approved Team repository or pass --repo OWNER/REPO");
+  if (!repository) fail("run gh inside a Team repository checkout or pass --repo OWNER/REPO");
   return repository;
 }
 
@@ -217,7 +216,9 @@ export async function runBrokeredGh({
   }
   if (classification === "auth-status" || classification === "viewer-login") {
     try {
-      const repository = firstPolicyRepository(environment);
+      // The proof targets the current checkout (or GH_REPO); there is no policy default to fall
+      // back to, so outside a Team repository the proof fails closed.
+      const repository = resolveGhRepository({ args: [], environment, readOrigin });
       await requestToken({ repository, environment });
     } catch {
       if (classification === "auth-status") {
