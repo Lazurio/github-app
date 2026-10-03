@@ -169,6 +169,17 @@ returned, with `Cache-Control: no-store`:
 {"token": "<installation token>", "expires_at": "2030-01-01T00:00:00Z", "repository_id": 2345, "repository": "example-organization/example-repository"}
 ```
 
+`POST /v1/workspace` is the repository-independent connection proof the
+adapter uses for host-level discovery outside a repository checkout. It takes
+the same headers (its body is not read), runs the same credential gate, then
+the installation gate and a read of the Workspace's Team through the same
+revoked `members: read` plus `metadata: read` probe. It mints no repository
+token and returns, with `Cache-Control: no-store`:
+
+```json
+{"workspace_id": "customer-team", "organization": "example-organization", "github_team_id": 4001, "github_team_slug": "customer-team"}
+```
+
 `GET /health` returns `204` only after startup policy verification has
 succeeded.
 
@@ -194,6 +205,12 @@ and revocation; it only guarantees that no final repository token exists:
 | `403` | `team_grant_missing` | Live GitHub readback shows the Workspace's Team is gone, has a different identity than the policy asserts, or lacks a push/maintain/admin grant on the repository; or the repository id is not visible to the installation. |
 | `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, the mint left the requested scope, or the body exceeded the size limit. |
 | `415` | `unsupported_media_type` | Body is not JSON. |
+
+`POST /v1/workspace` uses the same codes: `401 workspace_unauthorized` with no
+GitHub traffic, `403 team_grant_missing` when the Workspace's Team is gone or
+its identity differs from the policy, `502 token_unavailable` on any GitHub
+failure and `415` for a non-JSON media type. It never returns `400` or
+`repository_denied` because it names no repository.
 
 The Team gate runs live on every mint with a short-lived `members: read` plus
 `metadata: read` probe token that is revoked immediately afterwards. Its read
@@ -246,6 +263,8 @@ Including the final scoped mint, one accepted token request costs:
 | Node adapter, accepted id form | 6 (Team gate 5 + scoped mint 1) |
 | Worker adapter, accepted name form | 6 (installation gate 1 + Team gate 4 + scoped mint 1) |
 | Worker adapter, accepted id form | 7 (installation gate 1 + Team gate 5 + scoped mint 1) |
+| Node adapter, accepted `POST /v1/workspace` | 3 (probe mint, Team read, probe revocation) |
+| Worker adapter, accepted `POST /v1/workspace` | 4 (installation gate 1 + the same 3) |
 | `policy check --live` | 1 + per Workspace: probe mint, Team read, one Team repository list page per 100 repositories, probe revocation (a missing Team skips the list) |
 
 Denied credentials, invalid bodies and foreign owners in the name form cost
@@ -429,10 +448,14 @@ denied, and the argument is forwarded unchanged rather than interpreted as a
 second authority.
 
 The host-level authenticated indicator means only that the broker accepted a
-fresh proof for the repository of the current checkout (or `GH_REPO`). It is
-not an Organization-wide capability claim. Outside a Team repository the proof
-fails closed and reports the unauthenticated host shape. Every actual command
-resolves and authorizes its own repository again.
+fresh proof. Inside a repository checkout (or with `GH_REPO`) the proof mints
+and discards a token for that repository. Anywhere else, such as the Folder
+root from which Launchpad and T3 run discovery, it calls `POST /v1/workspace`,
+which proves the live installation and the Workspace's Team without minting a
+repository token. A failure of whichever proof applies reports the
+unauthenticated host shape; a failed repository proof does not fall back to the
+Workspace proof. The indicator is not an Organization-wide capability claim.
+Every actual command resolves and authorizes its own repository again.
 
 The adapter holds no repository list. It sends the repository name, and it
 accepts only a broker response whose `repository` names the same repository

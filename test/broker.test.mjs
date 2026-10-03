@@ -57,6 +57,12 @@ const SYNTHETIC_REPOSITORIES = new Map([
   ["example-org/beta", 3002],
 ]);
 
+/** Synthetic Workspace Team proof: the bound Team exists with its asserted identity. */
+const provenTeam = async (_policy, workspace) => ({
+  id: workspace.github_team_id,
+  slug: workspace.github_team_slug ?? workspace.id,
+});
+
 /** Synthetic Team gate: resolves both body forms to the canonical repository id and name. */
 const grantedTeam = async (_policy, workspace, target) => {
   const entry = target.repository_id === undefined
@@ -77,10 +83,10 @@ async function withServer(run, mintToken = async (_policy, repositoryId) => ({
   token: `ghs_synthetic_${repositoryId}`,
   expires_at: "2030-01-01T00:00:00Z",
   repository_id: repositoryId,
-}), verifyTeamGrant = grantedTeam) {
+}), verifyTeamGrant = grantedTeam, verifyWorkspaceTeam = provenTeam) {
   const server = createBrokerServer({
     policy: parsePolicy(policyFixture()),
-    github: { verifyTeamGrant, mintToken },
+    github: { verifyTeamGrant, verifyWorkspaceTeam, mintToken },
     readFile: (file) => secretByPath.get(file) ?? "",
     realpath: (file) => file,
   });
@@ -628,6 +634,7 @@ test("keeps one verified credential snapshot for the complete server lifetime", 
     policy: parsePolicy(policyFixture()),
     github: {
       verifyTeamGrant: grantedTeam,
+      verifyWorkspaceTeam: provenTeam,
       mintToken: async (_policy, repositoryId) => ({
         token: `ghs_synthetic_${repositoryId}`,
         expires_at: "2030-01-01T00:00:00Z",
@@ -665,6 +672,7 @@ test("verifies live policy exactly once before serving runtime requests", async 
         verifies += 1;
       },
       verifyTeamGrant: grantedTeam,
+      verifyWorkspaceTeam: provenTeam,
       mintToken: async (_policy, repositoryId) => ({
         token: `ghs_synthetic_${repositoryId}`,
         expires_at: "2030-01-01T00:00:00Z",
@@ -1085,6 +1093,7 @@ test("mints only after a live Team grant and refuses with team_grant_missing oth
   const server = createBrokerServer({
     policy: parsePolicy(policyFixture()),
     github: {
+      verifyWorkspaceTeam: provenTeam,
       verifyTeamGrant: async (policy, workspace, target) => {
         checks += 1;
         assert.equal(workspace.github_team_id, 4001);
@@ -1392,4 +1401,104 @@ test("readWorkspaceTeamGrants reports a missing Team as one refused row without 
     "GET /organizations/1001/team/4002",
     "DELETE /installation/token",
   ]);
+});
+
+function workspaceRequest(origin, {
+  workspace = "alpha-team",
+  secret = secretByPath.get("/run/secrets/workspace-alpha"),
+} = {}) {
+  return fetch(`${origin}/v1/workspace`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${secret}`,
+      "Content-Type": "application/json",
+      "X-Lazurio-Workspace-ID": workspace,
+    },
+    body: "{}",
+  });
+}
+
+test("POST /v1/workspace proves the live Workspace Team through a revoked probe and mints no token", async () => {
+  const calls = [];
+  await withLiveCoreServer(mintingFetch(calls), async (origin) => {
+    const response = await workspaceRequest(origin);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await response.json(), {
+      workspace_id: "alpha-team",
+      organization: "example-org",
+      github_team_id: 4001,
+      github_team_slug: "alpha-team",
+    });
+    assert.deepEqual(calls, [
+      "POST /app/installations/2001/access_tokens",
+      "GET /organizations/1001/team/4001",
+      "DELETE /installation/token",
+    ]);
+  });
+});
+
+test("POST /v1/workspace refuses bad credentials without GitHub traffic and a drifted Team with 403", async () => {
+  const calls = [];
+  const drifted = teamGrantFetch({ team: { id: 4001, slug: "renamed-team", organization: { id: 1001, login: "example-org" } } });
+  await withLiveCoreServer(mintingFetch(calls, drifted), async (origin) => {
+    for (const options of [
+      { secret: "wrong-secret-value-with-at-least-32-bytes" },
+      { workspace: "unknown-team", secret: "unknown-secret-value-with-at-least-32-bytes" },
+      { workspace: "beta-team", secret: secretByPath.get("/run/secrets/workspace-alpha") },
+    ]) {
+      const response = await workspaceRequest(origin, options);
+      assert.equal(response.status, 401);
+      assert.deepEqual(await response.json(), { error: "workspace_unauthorized" });
+    }
+    assert.equal(calls.length, 0);
+
+    const refused = await workspaceRequest(origin);
+    assert.equal(refused.status, 403);
+    assert.deepEqual(await refused.json(), { error: "team_grant_missing" });
+    assert.deepEqual(calls, [
+      "POST /app/installations/2001/access_tokens",
+      "GET /organizations/1001/team/4001",
+      "DELETE /installation/token",
+    ]);
+  });
+
+  const missing = [];
+  await withLiveCoreServer(mintingFetch(missing, teamGrantFetch({ team: null })), async (origin) => {
+    const response = await workspaceRequest(origin);
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "team_grant_missing" });
+    assert.equal(missing.at(-1), "DELETE /installation/token");
+  });
+});
+
+test("POST /v1/workspace fails closed as token_unavailable on a GitHub outage and never reads repositories", async () => {
+  const calls = [];
+  const outage = async (url, init) => {
+    if (new URL(url).pathname === "/organizations/1001/team/4001") return jsonResponse({ message: "boom" }, 503);
+    return teamGrantFetch()(url, init);
+  };
+  await withLiveCoreServer(mintingFetch(calls, outage), async (origin) => {
+    const response = await workspaceRequest(origin);
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), { error: "token_unavailable" });
+    assert.equal(calls.some((call) => call.includes("/repos") || call.startsWith("GET /repositories")), false);
+    assert.equal(calls.filter((call) => call === "POST /app/installations/2001/access_tokens").length, 1);
+    assert.equal(calls.at(-1), "DELETE /installation/token");
+  });
+});
+
+test("POST /v1/workspace is not a token route: it rejects other methods, media types and paths", async () => {
+  await withServer(async (origin) => {
+    assert.equal((await fetch(`${origin}/v1/workspace`)).status, 404);
+    assert.equal((await fetch(`${origin}/v1/workspace/extra`, { method: "POST" })).status, 404);
+    const unsupported = await fetch(`${origin}/v1/workspace`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", "X-Lazurio-Workspace-ID": "alpha-team" },
+      body: "{}",
+    });
+    assert.equal(unsupported.status, 415);
+    const proof = await (await workspaceRequest(origin)).json();
+    assert.equal("token" in proof, false);
+  });
 });

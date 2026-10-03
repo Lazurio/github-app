@@ -210,14 +210,18 @@ The official CLI remains responsible for pull requests, REST and GraphQL.
 T3 Code performs two host-level discovery calls that are not repository API
 operations. The adapter recognizes only their exact argument envelopes:
 
-- `gh auth status --json hosts` performs a live token proof for the
-  repository of the current checkout (or `GH_REPO`), discards the token, and
-  emits the official JSON host shape for `lazurio-for-github[bot]`;
+- `gh auth status --json hosts` performs a live proof and emits the official
+  JSON host shape for `lazurio-for-github[bot]`. Inside a repository checkout
+  (or with `GH_REPO`) the proof mints and discards a token for that
+  repository; anywhere else, such as the Folder root, it calls
+  `POST /v1/workspace`, which runs the credential gate, the installation gate
+  and the Team identity read through the revoked probe and mints no
+  repository token;
 - `gh api user --jq .login` performs the same proof and emits that machine
   actor without calling GitHub's user endpoint.
 
-A failed proof, including one run outside any Team repository, returns the
-official unauthenticated host shape and a non-zero exit. The result is deliberately not cached, so repository or installation
+A failed proof returns the official unauthenticated host shape and a non-zero
+exit; a failed repository proof never falls back to the Workspace proof. The result is deliberately not cached, so repository or installation
 revocation affects the next discovery and operation without restarting the
 Workspace. This host signal never substitutes for per-repository
 authorization.

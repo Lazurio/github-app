@@ -7,6 +7,7 @@ import {
   normalizeRepository,
   repositoryIdentityKey,
   requestGitHubAppToken,
+  requestWorkspaceProof,
   requireHttpsGitHubOrigin,
 } from "./broker-client.mjs";
 
@@ -112,16 +113,18 @@ function explicitRepository(args, environment) {
   return result;
 }
 
+function readCheckoutOrigin() {
+  const result = spawnSync("git", ["remote", "get-url", "origin"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
 export function resolveGhRepository({
   args,
   environment = process.env,
-  readOrigin = () => {
-    const result = spawnSync("git", ["remote", "get-url", "origin"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return result.status === 0 ? result.stdout.trim() : null;
-  },
+  readOrigin = readCheckoutOrigin,
 }) {
   const selected = explicitRepository(args, environment);
   const origin = readOrigin();
@@ -196,11 +199,27 @@ function authenticatedStatus() {
   };
 }
 
+/**
+ * Live connection proof for the exact T3 discovery envelopes. Inside a repository checkout (or with
+ * GH_REPO) it mints and discards a token for that repository; anywhere else, such as the Folder
+ * root, it asks the broker for the repository-independent Workspace proof. Throws on any failure.
+ */
+async function proveConnection({ environment, readOrigin, requestToken, requestWorkspace }) {
+  const origin = readOrigin();
+  if (origin || environment.GH_REPO) {
+    const repository = resolveGhRepository({ args: [], environment, readOrigin: () => origin });
+    await requestToken({ repository, environment });
+    return;
+  }
+  await requestWorkspace({ environment });
+}
+
 export async function runBrokeredGh({
   args,
   environment = process.env,
-  readOrigin,
+  readOrigin = readCheckoutOrigin,
   requestToken = requestGitHubAppToken,
+  requestWorkspace = requestWorkspaceProof,
   runRealGh = defaultRunRealGh,
   assertConfigDirectory = assertReadOnlyGhConfigDirectory,
   writeStdout = (value) => process.stdout.write(value),
@@ -216,10 +235,7 @@ export async function runBrokeredGh({
   }
   if (classification === "auth-status" || classification === "viewer-login") {
     try {
-      // The proof targets the current checkout (or GH_REPO); there is no policy default to fall
-      // back to, so outside a Team repository the proof fails closed.
-      const repository = resolveGhRepository({ args: [], environment, readOrigin });
-      await requestToken({ repository, environment });
+      await proveConnection({ environment, readOrigin, requestToken, requestWorkspace });
     } catch {
       if (classification === "auth-status") {
         writeStdout(`${JSON.stringify({ hosts: {} })}\n`);

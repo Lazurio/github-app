@@ -8,6 +8,7 @@ import {
   parseBrokerClientConfig,
   repositoryIdentityKey,
   requestGitHubAppToken,
+  requestWorkspaceProof,
   requireHttpsGitHubOrigin,
 } from "../adapter/broker-client.mjs";
 import {
@@ -324,28 +325,184 @@ test("the exact viewer probe reports the machine actor only after a live proof",
   assert.deepEqual(stdout, [`${HOSTED_GITHUB_ACTOR}\n`]);
 });
 
-test("outside a Team repository the discovery proofs fail closed without a broker call", async () => {
+const WORKSPACE_PROOF = {
+  workspace_id: "example-management",
+  organization: "Example",
+  github_team_id: 4001,
+  github_team_slug: "management",
+};
+
+function brokerStub(status, body) {
+  const requests = [];
+  return {
+    requests,
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: status >= 200 && status < 300, status, json: async () => body };
+    },
+  };
+}
+
+test("requestWorkspaceProof posts to /v1/workspace with the pinned identity and returns the Team", async () => {
+  const stub = brokerStub(200, WORKSPACE_PROOF);
+  const proof = await requestWorkspaceProof({
+    environment,
+    readFile: () => "workspace-credential-with-at-least-32-bytes",
+    fetchImpl: stub.fetchImpl,
+  });
+  assert.deepEqual({ ...proof }, {
+    workspaceId: "example-management",
+    organization: "Example",
+    githubTeamId: 4001,
+    githubTeamSlug: "management",
+  });
+  assert.equal(stub.requests.length, 1);
+  assert.equal(stub.requests[0].url, "http://github-token-broker:8787/v1/workspace");
+  assert.equal(stub.requests[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(stub.requests[0].options.body), {});
+  assert.equal(stub.requests[0].options.headers["X-Lazurio-Workspace-ID"], "example-management");
+  assert.ok(stub.requests[0].options.signal);
+
+  // The same pinned remote-origin and credential-path validation as the token request.
+  await assert.rejects(
+    () => requestWorkspaceProof({
+      environment: { ...environment, GITHUB_TOKEN_BROKER_URL: "https://attacker.invalid" },
+      readFile: () => "workspace-credential-with-at-least-32-bytes",
+      fetchImpl: stub.fetchImpl,
+    }),
+    /endpoint is invalid/,
+  );
+  await assert.rejects(
+    () => requestWorkspaceProof({
+      environment: { ...environment, GITHUB_BROKER_CLIENT_CREDENTIAL_FILE: "/tmp/credential" },
+      readFile: () => "workspace-credential-with-at-least-32-bytes",
+      fetchImpl: stub.fetchImpl,
+    }),
+    /credential path is invalid/,
+  );
+  assert.equal(stub.requests.length, 1);
+});
+
+test("requestWorkspaceProof fails closed on refusals, outages and foreign or token-bearing answers", async () => {
+  const shared = { environment, readFile: () => "workspace-credential-with-at-least-32-bytes" };
+  for (const [status, body] of [
+    [401, { error: "workspace_unauthorized" }],
+    [403, { error: "team_grant_missing" }],
+    [502, { error: "token_unavailable" }],
+  ]) {
+    await assert.rejects(
+      () => requestWorkspaceProof({ ...shared, fetchImpl: brokerStub(status, body).fetchImpl }),
+      /refused/,
+      String(status),
+    );
+  }
+  await assert.rejects(
+    () => requestWorkspaceProof({ ...shared, fetchImpl: async () => { throw new Error(TOKEN); } }),
+    /unavailable/,
+  );
+  for (const body of [
+    { ...WORKSPACE_PROOF, workspace_id: "other-workspace" },
+    { ...WORKSPACE_PROOF, github_team_id: 0 },
+    { ...WORKSPACE_PROOF, github_team_slug: "" },
+    { ...WORKSPACE_PROOF, organization: "not an org" },
+    { ...WORKSPACE_PROOF, token: TOKEN },
+    null,
+  ]) {
+    await assert.rejects(
+      () => requestWorkspaceProof({ ...shared, fetchImpl: brokerStub(200, body).fetchImpl }),
+      /invalid Workspace proof/,
+      JSON.stringify(body),
+    );
+  }
+});
+
+test("from the Folder root the discovery proofs use /v1/workspace and mint no repository token", async () => {
   const stdout = [];
-  const stderr = [];
-  let calls = 0;
+  let tokenRequests = 0;
+  let workspaceProofs = 0;
   const shared = {
     environment,
     readOrigin: () => null,
     requestToken: async () => {
-      calls += 1;
+      tokenRequests += 1;
       return { token: TOKEN };
     },
+    requestWorkspace: async ({ environment: proofEnvironment }) => {
+      workspaceProofs += 1;
+      assert.equal(proofEnvironment, environment);
+      return WORKSPACE_PROOF;
+    },
     writeStdout: (value) => stdout.push(value),
-    writeStderr: (value) => stderr.push(value),
+    writeStderr: () => {},
   };
-  assert.equal(await runBrokeredGh({ ...shared, args: ["auth", "status", "--json", "hosts"] }), 1);
+  assert.equal(await runBrokeredGh({ ...shared, args: ["auth", "status", "--json", "hosts"] }), 0);
+  const status = JSON.parse(stdout.at(-1));
+  assert.equal(status.hosts["github.com"][0].state, "success");
+  assert.equal(status.hosts["github.com"][0].login, HOSTED_GITHUB_ACTOR);
+  assert.equal(await runBrokeredGh({ ...shared, args: ["api", "user", "--jq", ".login"] }), 0);
+  assert.equal(stdout.at(-1), `${HOSTED_GITHUB_ACTOR}\n`);
+  assert.equal(workspaceProofs, 2);
+  assert.equal(tokenRequests, 0);
+});
+
+test("from the Folder root a refused or unavailable Workspace proof fails closed", async () => {
+  for (const [status, body] of [
+    [401, { error: "workspace_unauthorized" }],
+    [403, { error: "team_grant_missing" }],
+    [502, { error: "token_unavailable" }],
+  ]) {
+    const stub = brokerStub(status, body);
+    const stdout = [];
+    const stderr = [];
+    const shared = {
+      environment,
+      readOrigin: () => null,
+      requestToken: async () => {
+        throw new Error("must not mint a repository token from the Folder root");
+      },
+      requestWorkspace: (options) => requestWorkspaceProof({
+        ...options,
+        readFile: () => "workspace-credential-with-at-least-32-bytes",
+        exists: () => false,
+        fetchImpl: stub.fetchImpl,
+      }),
+      writeStdout: (value) => stdout.push(value),
+      writeStderr: (value) => stderr.push(value),
+    };
+    assert.equal(await runBrokeredGh({ ...shared, args: ["auth", "status", "--json", "hosts"] }), 1, String(status));
+    assert.deepEqual(JSON.parse(stdout.at(-1)), { hosts: {} });
+    assert.equal(stderr.at(-1), "Brokered gh authentication proof failed.\n");
+    await assert.rejects(
+      () => runBrokeredGh({ ...shared, args: ["api", "user", "--jq", ".login"] }),
+      /identity proof failed/,
+    );
+    assert.deepEqual(stub.requests.map(({ url }) => url), [
+      "http://github-token-broker:8787/v1/workspace",
+      "http://github-token-broker:8787/v1/workspace",
+    ]);
+  }
+});
+
+test("inside a checkout the discovery proof stays the repository mint and never falls back", async () => {
+  let workspaceProofs = 0;
+  const stdout = [];
+  const exitCode = await runBrokeredGh({
+    args: ["auth", "status", "--json", "hosts"],
+    environment,
+    readOrigin: () => "https://github.com/Example/Alpha.git",
+    requestToken: async () => {
+      throw new Error("team_grant_missing");
+    },
+    requestWorkspace: async () => {
+      workspaceProofs += 1;
+      return WORKSPACE_PROOF;
+    },
+    writeStdout: (value) => stdout.push(value),
+    writeStderr: () => {},
+  });
+  assert.equal(exitCode, 1);
   assert.deepEqual(JSON.parse(stdout.at(-1)), { hosts: {} });
-  assert.equal(stderr.at(-1), "Brokered gh authentication proof failed.\n");
-  await assert.rejects(
-    () => runBrokeredGh({ ...shared, args: ["api", "user", "--jq", ".login"] }),
-    /identity proof failed/,
-  );
-  assert.equal(calls, 0);
+  assert.equal(workspaceProofs, 0);
 });
 
 test("repository operations accept T3 lowercase identity and pass only an env-local token", async () => {

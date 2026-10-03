@@ -102,6 +102,39 @@ function requireBrokerRuntime(environment, readFile, exists) {
   return Object.freeze({ workspaceId, brokerOrigin });
 }
 
+/** Authenticated POST to one broker route with the pinned origin, Workspace id and credential. */
+async function postToBroker(path, body, { environment, readFile, exists, fetchImpl, timeoutMs }) {
+  const { workspaceId, brokerOrigin } = requireBrokerRuntime(environment, readFile, exists);
+
+  const clientCredential = readFile(CREDENTIAL_FILE, "utf8").trim();
+  if (clientCredential.length < 32 || /\s/.test(clientCredential)) {
+    fail("Workspace broker credential is invalid");
+  }
+
+  let response;
+  try {
+    response = await fetchImpl(`${brokerOrigin}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${clientCredential}`,
+        "Content-Type": "application/json",
+        "X-Lazurio-Workspace-ID": workspaceId,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    fail("GitHub token broker is unavailable");
+  }
+  if (!response.ok) fail("GitHub token broker refused the request");
+
+  try {
+    return { workspaceId, result: await response.json() };
+  } catch {
+    return { workspaceId, result: undefined };
+  }
+}
+
 export async function requestGitHubAppToken({
   repository,
   environment = process.env,
@@ -113,36 +146,11 @@ export async function requestGitHubAppToken({
 }) {
   // The broker decides the scope from the live GitHub Team grant; the client holds no allowlist.
   const coordinate = normalizeRepository(repository);
-  const { workspaceId, brokerOrigin } = requireBrokerRuntime(environment, readFile, exists);
-
-  const clientCredential = readFile(CREDENTIAL_FILE, "utf8").trim();
-  if (clientCredential.length < 32 || /\s/.test(clientCredential)) {
-    fail("Workspace broker credential is invalid");
-  }
-
-  let response;
-  try {
-    response = await fetchImpl(`${brokerOrigin}/v1/token`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${clientCredential}`,
-        "Content-Type": "application/json",
-        "X-Lazurio-Workspace-ID": workspaceId,
-      },
-      body: JSON.stringify({ repository: coordinate }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch {
-    fail("GitHub token broker is unavailable");
-  }
-  if (!response.ok) fail("GitHub token broker refused the request");
-
-  let result;
-  try {
-    result = await response.json();
-  } catch {
-    fail("GitHub token broker returned an invalid scoped response");
-  }
+  const { result } = await postToBroker(
+    "/v1/token",
+    { repository: coordinate },
+    { environment, readFile, exists, fetchImpl, timeoutMs },
+  );
   const expiresAt = Date.parse(result?.expires_at ?? "");
   let returnedRepository;
   try {
@@ -169,5 +177,41 @@ export async function requestGitHubAppToken({
     repository: returnedRepository,
     repositoryId: result.repository_id,
     expiresAt: result.expires_at,
+  });
+}
+
+/**
+ * Repository-independent connection proof: the broker verifies the live installation and the
+ * Workspace's GitHub Team and mints no repository token.
+ */
+export async function requestWorkspaceProof({
+  environment = process.env,
+  readFile = fs.readFileSync,
+  exists = fs.existsSync,
+  fetchImpl = fetch,
+  timeoutMs = 5_000,
+} = {}) {
+  const { workspaceId, result } = await postToBroker(
+    "/v1/workspace",
+    {},
+    { environment, readFile, exists, fetchImpl, timeoutMs },
+  );
+  if (
+    result?.workspace_id !== workspaceId ||
+    typeof result?.organization !== "string" ||
+    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(result.organization) ||
+    !Number.isSafeInteger(result?.github_team_id) ||
+    result.github_team_id <= 0 ||
+    typeof result?.github_team_slug !== "string" ||
+    result.github_team_slug.length === 0 ||
+    "token" in result
+  ) {
+    fail("GitHub token broker returned an invalid Workspace proof");
+  }
+  return Object.freeze({
+    workspaceId,
+    organization: result.organization,
+    githubTeamId: result.github_team_id,
+    githubTeamSlug: result.github_team_slug,
   });
 }

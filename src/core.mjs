@@ -434,6 +434,14 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
   }
 
   /**
+   * Live Workspace identity proof: the Workspace's immutable Team exists in the Organization with
+   * the asserted identity. Reads through the revoked probe and mints no repository token.
+   */
+  async function verifyWorkspaceTeam(policy, workspace) {
+    return withProbeToken(policy, TEAM_PROBE_PERMISSIONS, (authorization) => readTeam(policy, workspace, authorization));
+  }
+
+  /**
    * Readback of one Workspace: its Team identity and the Team's live write-capable repositories,
    * with a single probe token. A missing or drifted Team becomes one refused row; it never throws
    * for that case.
@@ -541,7 +549,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     return { token: result.token, expires_at: result.expires_at, repository_id: repositoryId };
   }
 
-  return Object.freeze({ verifyPolicy, verifyTeamGrant, readWorkspaceTeamGrants, mintToken });
+  return Object.freeze({ verifyPolicy, verifyTeamGrant, verifyWorkspaceTeam, readWorkspaceTeamGrants, mintToken });
 }
 
 /**
@@ -599,11 +607,88 @@ function result(status, body) {
 export function createBrokerHandler({ policy, github, credentials, secretMatches }) {
   if (!(credentials instanceof Map)) fail("Workspace credentials must be a Map");
   if (typeof secretMatches !== "function") fail("secret matcher is missing");
-  if (typeof github?.verifyTeamGrant !== "function" || typeof github?.mintToken !== "function") {
-    fail("GitHub client must verify the Team grant and mint tokens");
+  if (
+    typeof github?.verifyTeamGrant !== "function" ||
+    typeof github?.verifyWorkspaceTeam !== "function" ||
+    typeof github?.mintToken !== "function"
+  ) {
+    fail("GitHub client must verify the Team grant and Workspace Team and mint tokens");
   }
   const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
   const ownerKey = policy.github_owner.login.toLowerCase();
+
+  async function authenticate(workspaceId, authorization) {
+    const presentedCredential = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+    const workspace = typeof workspaceId === "string" ? workspaces.get(workspaceId) : undefined;
+    const credentialMatches = await secretMatches(
+      presentedCredential,
+      (typeof workspaceId === "string" ? credentials.get(workspaceId) : undefined) ??
+        DUMMY_WORKSPACE_CREDENTIAL,
+    );
+    return workspace && presentedCredential && credentialMatches ? workspace : undefined;
+  }
+
+  /** Maps a live-gate refusal to its 403; any other failure stays a 502. */
+  function refusal(error) {
+    if (error?.code === TEAM_GRANT_MISSING || error?.code === REPOSITORY_DENIED) {
+      return result(403, { error: error.code });
+    }
+    throw error;
+  }
+
+  async function token(workspace, readBody) {
+    if (typeof readBody !== "function") fail("request body reader is missing");
+    const bodyText = await readBody();
+    if (typeof bodyText !== "string") fail("request body reader returned an invalid value");
+    if (new TextEncoder().encode(bodyText).byteLength > MAX_BODY_BYTES) {
+      fail("request body is too large");
+    }
+    const target = parseTokenRequest(bodyText);
+    if (!target) return result(400, { error: INVALID_REQUEST });
+    // A name outside the policy's Organization is refused before any GitHub traffic.
+    if (target.repository !== undefined && target.repository.split("/", 1)[0].toLowerCase() !== ownerKey) {
+      return result(403, { error: REPOSITORY_DENIED });
+    }
+
+    let grant;
+    try {
+      grant = await github.verifyTeamGrant(policy, workspace, target);
+    } catch (error) {
+      return refusal(error);
+    }
+    const repositoryId = grant?.repository_id;
+    const repository = parseRepositoryCoordinate(grant?.full_name);
+    if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0 || !repository) {
+      fail("Team gate returned an invalid repository");
+    }
+    const minted = await github.mintToken(policy, repositoryId);
+    if (minted?.repository_id !== repositoryId) fail("minted token is outside the verified repository");
+    return result(200, {
+      token: minted.token,
+      expires_at: minted.expires_at,
+      repository_id: repositoryId,
+      repository: repository.full_name,
+    });
+  }
+
+  /** Repository-independent connection proof; the body is never read and no token is minted. */
+  async function workspaceProof(workspace) {
+    let team;
+    try {
+      team = await github.verifyWorkspaceTeam(policy, workspace);
+    } catch (error) {
+      return refusal(error);
+    }
+    if (team?.id !== workspace.github_team_id || typeof team?.slug !== "string") {
+      fail("Workspace Team proof returned an invalid Team");
+    }
+    return result(200, {
+      workspace_id: workspace.id,
+      organization: policy.github_owner.login,
+      github_team_id: team.id,
+      github_team_slug: team.slug,
+    });
+  }
 
   return async ({
     method,
@@ -616,60 +701,17 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     if (method === "GET" && path === "/health") {
       return result(204, null);
     }
-    if (method !== "POST" || path !== "/v1/token") {
+    if (method !== "POST" || (path !== "/v1/token" && path !== "/v1/workspace")) {
       return result(404, { error: "not_found" });
     }
     if (!contentType.toLowerCase().startsWith("application/json")) {
       return result(415, { error: "unsupported_media_type" });
     }
 
-    const presentedCredential = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     try {
-      const workspace = typeof workspaceId === "string" ? workspaces.get(workspaceId) : undefined;
-      const credentialMatches = await secretMatches(
-        presentedCredential,
-        (typeof workspaceId === "string" ? credentials.get(workspaceId) : undefined) ??
-          DUMMY_WORKSPACE_CREDENTIAL,
-      );
-      if (!workspace || !presentedCredential || !credentialMatches) {
-        return result(401, { error: "workspace_unauthorized" });
-      }
-
-      if (typeof readBody !== "function") fail("request body reader is missing");
-      const bodyText = await readBody();
-      if (typeof bodyText !== "string") fail("request body reader returned an invalid value");
-      if (new TextEncoder().encode(bodyText).byteLength > MAX_BODY_BYTES) {
-        fail("request body is too large");
-      }
-      const target = parseTokenRequest(bodyText);
-      if (!target) return result(400, { error: INVALID_REQUEST });
-      // A name outside the policy's Organization is refused before any GitHub traffic.
-      if (target.repository !== undefined && target.repository.split("/", 1)[0].toLowerCase() !== ownerKey) {
-        return result(403, { error: REPOSITORY_DENIED });
-      }
-
-      let grant;
-      try {
-        grant = await github.verifyTeamGrant(policy, workspace, target);
-      } catch (error) {
-        if (error?.code === TEAM_GRANT_MISSING || error?.code === REPOSITORY_DENIED) {
-          return result(403, { error: error.code });
-        }
-        throw error;
-      }
-      const repositoryId = grant?.repository_id;
-      const repository = parseRepositoryCoordinate(grant?.full_name);
-      if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0 || !repository) {
-        fail("Team gate returned an invalid repository");
-      }
-      const minted = await github.mintToken(policy, repositoryId);
-      if (minted?.repository_id !== repositoryId) fail("minted token is outside the verified repository");
-      return result(200, {
-        token: minted.token,
-        expires_at: minted.expires_at,
-        repository_id: repositoryId,
-        repository: repository.full_name,
-      });
+      const workspace = await authenticate(workspaceId, authorization);
+      if (!workspace) return result(401, { error: "workspace_unauthorized" });
+      return path === "/v1/token" ? await token(workspace, readBody) : await workspaceProof(workspace);
     } catch {
       return result(502, { error: "token_unavailable" });
     }

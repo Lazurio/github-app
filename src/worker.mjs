@@ -159,6 +159,7 @@ export function createWorkerEntrypoint({ createGithub = defaultGithub, fetchImpl
           !github ||
           typeof github.verifyPolicy !== "function" ||
           typeof github.verifyTeamGrant !== "function" ||
+          typeof github.verifyWorkspaceTeam !== "function" ||
           typeof github.mintToken !== "function"
         ) {
           fail("GitHub client is invalid");
@@ -168,11 +169,16 @@ export function createWorkerEntrypoint({ createGithub = defaultGithub, fetchImpl
       }
 
       // No trustworthy startup phase: the exact live installation is verified before the
-      // Team gate on every authorized request, and both precede the one-repository mint.
+      // Team gate (or the Workspace Team proof) on every authorized request, and both precede
+      // the one-repository mint.
       const verifiedGithub = Object.freeze({
         async verifyTeamGrant(activePolicy, workspace, target) {
           await github.verifyPolicy(activePolicy);
           return github.verifyTeamGrant(activePolicy, workspace, target);
+        },
+        async verifyWorkspaceTeam(activePolicy, workspace) {
+          await github.verifyPolicy(activePolicy);
+          return github.verifyWorkspaceTeam(activePolicy, workspace);
         },
         mintToken(activePolicy, repositoryId) {
           return github.mintToken(activePolicy, repositoryId);

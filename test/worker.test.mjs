@@ -64,8 +64,10 @@ const grantedAlpha = async (_policy, _workspace, target) => {
   return { repository_id: 3001, full_name: "example-org/alpha", role: "write" };
 };
 
-function workerFixture({ teamGrant = grantedAlpha } = {}) {
-  const calls = { verify: 0, teamGrant: 0, mint: 0, order: [] };
+const provenTeam = async (_policy, workspace) => ({ id: workspace.github_team_id, slug: workspace.id });
+
+function workerFixture({ teamGrant = grantedAlpha, workspaceTeam = provenTeam } = {}) {
+  const calls = { verify: 0, teamGrant: 0, workspaceTeam: 0, mint: 0, order: [] };
   const worker = createWorkerEntrypoint({
     createGithub: () => ({
       async verifyPolicy() {
@@ -76,6 +78,11 @@ function workerFixture({ teamGrant = grantedAlpha } = {}) {
         calls.teamGrant += 1;
         calls.order.push("team");
         return teamGrant(policy, workspace, target);
+      },
+      async verifyWorkspaceTeam(policy, workspace) {
+        calls.workspaceTeam += 1;
+        calls.order.push("workspace-team");
+        return workspaceTeam(policy, workspace);
       },
       async mintToken(_policy, repositoryId) {
         calls.mint += 1;
@@ -338,11 +345,81 @@ test("Worker refuses with team_grant_missing after live verification and mints n
   assert.deepEqual(countsOf(calls), { verify: 2, teamGrant: 2, mint: 1 });
 });
 
-test("Worker treats a GitHub client without Team verification as unavailable configuration", async () => {
+test("Worker treats a GitHub client without Team or Workspace verification as unavailable configuration", async () => {
   const worker = createWorkerEntrypoint({
     createGithub: () => ({ verifyPolicy: async () => {}, mintToken: async () => ({}) }),
   });
   const response = await worker.fetch(tokenRequest(), environment());
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), { error: "configuration_unavailable" });
+
+  const withoutWorkspaceProof = createWorkerEntrypoint({
+    createGithub: () => ({ verifyPolicy: async () => {}, verifyTeamGrant: async () => ({}), mintToken: async () => ({}) }),
+  });
+  const missingProof = await withoutWorkspaceProof.fetch(workspaceRequest(), environment());
+  assert.equal(missingProof.status, 503);
+  assert.deepEqual(await missingProof.json(), { error: "configuration_unavailable" });
+});
+
+function workspaceRequest({ workspace = "alpha-team", credential = ALPHA_CREDENTIAL } = {}) {
+  return new Request("https://broker.example.test/v1/workspace", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${credential}`,
+      "Content-Type": "application/json",
+      "X-Lazurio-Workspace-ID": workspace,
+    },
+    body: "{}",
+  });
+}
+
+test("Worker /v1/workspace verifies the installation, then the Team, and mints nothing", async () => {
+  const { worker, calls } = workerFixture();
+  const response = await worker.fetch(workspaceRequest(), environment());
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), {
+    workspace_id: "alpha-team",
+    organization: "example-org",
+    github_team_id: 4001,
+    github_team_slug: "alpha-team",
+  });
+  assert.deepEqual(calls.order, ["installation", "workspace-team"]);
+  assert.equal(calls.mint, 0);
+  assert.equal(calls.teamGrant, 0);
+});
+
+test("Worker /v1/workspace refuses bad credentials without GitHub, drift with 403 and outages with 502", async () => {
+  const unauthorized = workerFixture();
+  const denied = await unauthorized.worker.fetch(
+    workspaceRequest({ credential: "wrong-secret-with-at-least-thirty-two-bytes" }),
+    environment(),
+  );
+  assert.equal(denied.status, 401);
+  assert.deepEqual(await denied.json(), { error: "workspace_unauthorized" });
+  assert.deepEqual(unauthorized.calls.order, []);
+
+  const drifted = workerFixture({
+    workspaceTeam: async () => {
+      throw new TeamGrantError("Team gone");
+    },
+  });
+  const refused = await drifted.worker.fetch(workspaceRequest(), environment());
+  assert.equal(refused.status, 403);
+  assert.deepEqual(await refused.json(), { error: "team_grant_missing" });
+  assert.equal(drifted.calls.mint, 0);
+
+  const outage = workerFixture({
+    workspaceTeam: async () => {
+      throw new Error("GitHub request failed with HTTP 503");
+    },
+  });
+  const unavailable = await outage.worker.fetch(workspaceRequest(), environment());
+  assert.equal(unavailable.status, 502);
+  assert.deepEqual(await unavailable.json(), { error: "token_unavailable" });
+  assert.equal(outage.calls.mint, 0);
+
+  const wrongTeam = workerFixture({ workspaceTeam: async () => ({ id: 4999, slug: "other" }) });
+  const mismatch = await wrongTeam.worker.fetch(workspaceRequest(), environment());
+  assert.equal(mismatch.status, 502);
 });
