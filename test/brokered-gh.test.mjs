@@ -659,10 +659,21 @@ test("a read-tier token runs official gh; reads succeed silently and a refused w
   assert.match(stderr[0], /gh issue create/);
   assert.equal(stderr.join("").includes(TOKEN), false);
 
+  // An unrelated failed read (missing resource, bad argument, outage) runs official gh too, keeps
+  // its exit code and gets the same notice, which only explains a refusal conditionally and says
+  // that proposing through an issue needs the Organization's accepted Issues permission.
+  assert.equal(await run(["api", "repos/Example/Alpha/contents/missing"], 1), 1);
+  assert.deepEqual(children.at(-1).args, ["api", "repos/Example/Alpha/contents/missing"]);
+  assert.equal(stderr.length, 2);
+  assert.match(stderr[1], /If GitHub refused a change above/);
+  assert.match(stderr[1], /any other error above is GitHub's own/);
+  assert.match(stderr[1], /accepted the app's Issues permission/);
+  assert.doesNotMatch(stderr[1], /GitHub refuses pushes/);
+
   // A write-tier failure, or one from a broker that reports no tier, stays official gh's own output.
   assert.equal(await run(["pr", "create"], 1, { ...validToken(), access: "write" }), 1);
   assert.equal(await run(["pr", "create"], 1, validToken()), 1);
-  assert.equal(stderr.length, 1);
+  assert.equal(stderr.length, 2);
 });
 
 test("discovery inside a checkout succeeds with a read-tier repository proof", async () => {

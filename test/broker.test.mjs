@@ -525,6 +525,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     actions: "write",
     checks: "read",
     contents: "write",
+    members: "read",
     metadata: "read",
     pull_requests: "write",
   };
@@ -535,6 +536,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
         actions: "write",
         checks: "read",
         contents: "write",
+        members: "read",
         pull_requests: "write",
       },
     });
@@ -561,6 +563,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
   responsePermissions = {
     checks: "read",
     contents: "write",
+    members: "read",
     metadata: "read",
     pull_requests: "write",
   };
@@ -572,6 +575,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
   responsePermissions = {
     actions: "write",
     contents: "write",
+    members: "read",
     metadata: "read",
     pull_requests: "write",
   };
@@ -584,7 +588,20 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     actions: "write",
     checks: "read",
     contents: "write",
+    members: "read",
     metadata: "read",
+  };
+  await assert.rejects(
+    () => github.mintToken(policy, 3001, "write"),
+    /outside the requested repository or permission scope/,
+  );
+
+  responsePermissions = {
+    actions: "write",
+    checks: "read",
+    contents: "write",
+    metadata: "read",
+    pull_requests: "write",
   };
   await assert.rejects(
     () => github.mintToken(policy, 3001, "write"),
@@ -596,6 +613,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     actions: "write",
     checks: "read",
     contents: "write",
+    members: "read",
     metadata: "read",
     pull_requests: "write",
   };
@@ -607,7 +625,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
 
 test("asks for workflows: write only when the policy declares the accepted permission", async () => {
   const now = 1_700_000_000_000;
-  const base = { actions: "write", checks: "read", contents: "write", pull_requests: "write" };
+  const base = { actions: "write", checks: "read", contents: "write", members: "read", pull_requests: "write" };
   let requested;
   let responsePermissions;
   const github = createGithubClient({
@@ -655,7 +673,7 @@ test("asks for workflows: write only when the policy declares the accepted permi
 
 test("the write tier adds issues: write only when the policy declares the accepted permission", async () => {
   const now = 1_700_000_000_000;
-  const base = { actions: "write", checks: "read", contents: "write", pull_requests: "write" };
+  const base = { actions: "write", checks: "read", contents: "write", members: "read", pull_requests: "write" };
   let requested;
   let responsePermissions;
   const github = createGithubClient({
@@ -730,7 +748,7 @@ test("the read tier asks for contents, pull request, check and Actions reads, ad
     now: () => now,
   });
 
-  const readBase = { actions: "read", checks: "read", contents: "read", pull_requests: "read" };
+  const readBase = { actions: "read", checks: "read", contents: "read", members: "read", pull_requests: "read" };
 
   // Base policy: no issues accepted. A workflows acceptance never leaks into the read tier.
   const fixture = policyFixture();
@@ -765,9 +783,11 @@ test("the read tier asks for contents, pull request, check and Actions reads, ad
     { ...readBase, actions: "write", metadata: "read" },
     { ...readBase, workflows: "write", metadata: "read" },
     { ...readBase, issues: "write", metadata: "read" },
-    { actions: "read", contents: "read", pull_requests: "read", metadata: "read" },
-    { actions: "read", checks: "read", contents: "read", metadata: "read" },
-    { checks: "read", contents: "read", pull_requests: "read", metadata: "read" },
+    { ...readBase, members: "write", metadata: "read" },
+    { actions: "read", contents: "read", members: "read", pull_requests: "read", metadata: "read" },
+    { actions: "read", checks: "read", contents: "read", members: "read", metadata: "read" },
+    { checks: "read", contents: "read", members: "read", pull_requests: "read", metadata: "read" },
+    { actions: "read", checks: "read", contents: "read", pull_requests: "read", metadata: "read" },
   ]) {
     responsePermissions = permissions;
     await assert.rejects(
@@ -1466,7 +1486,7 @@ test("end to end: a pull or triage grant mints a read-tier token; push mints wri
         assert.equal(json.repository, "example-org/alpha");
       }
       // The installation has not accepted issues: write, so the read tier asks for reads only.
-      const readSet = { actions: "read", checks: "read", contents: "read", pull_requests: "read" };
+      const readSet = { actions: "read", checks: "read", contents: "read", members: "read", pull_requests: "read" };
       assert.deepEqual(scopedMints, [readSet, readSet]);
 
       // Cross-Workspace: beta's Team holds nothing on alpha, whatever alpha's Team holds.
@@ -1484,7 +1504,7 @@ test("end to end: a pull or triage grant mints a read-tier token; push mints wri
   await withLiveCoreServer(mintingFetch([], teamGrantFetch(), writeMints), async (origin) => {
     const response = await request(origin);
     assert.equal((await response.json()).access, "write");
-    assert.deepEqual(writeMints, [{ actions: "write", checks: "read", contents: "write", pull_requests: "write" }]);
+    assert.deepEqual(writeMints, [{ actions: "write", checks: "read", contents: "write", members: "read", pull_requests: "write" }]);
   });
 
   const noneMints = [];
@@ -1552,8 +1572,8 @@ test("policy check --live lists live Team grants as information and fails only o
     formatPolicySummary(policy),
     [
       "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
-      "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write pull_requests=write",
-      "read tier (pull/triage grant) asks for: actions=read checks=read contents=read pull_requests=read",
+      "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write members=read pull_requests=write",
+      "read tier (pull/triage grant) asks for: actions=read checks=read contents=read members=read pull_requests=read",
       "WORKSPACE   TEAM_ID  TEAM_SLUG",
       "alpha-team  4001     alpha-team",
       "beta-team   4002     -",

@@ -256,18 +256,21 @@ export async function runBrokeredGh({
   const repository = resolveGhRepository({ args, environment, readOrigin });
   const credential = await requestToken({ repository, environment });
   // The adapter refuses nothing up front by access tier: official gh runs and GitHub decides.
-  // After GitHub refuses a read-tier command, say why, so it does not read like an outage.
+  // A failed read-tier command adds one conditional notice after official gh's own error: the
+  // adapter cannot tell a refused change from a bad argument or an outage, so it never claims which.
   const exitCode = runRealGh(args, brokeredGhEnvironment(environment, credential.token, repository));
   if (exitCode !== 0 && credential.access === "read") writeStderr(readAccessNotice(repository));
   return exitCode;
 }
 
-/** Explains a failed command under a read-tier token; contains no token or credential. */
+/** Context for a failed command under a read-tier token; contains no token or credential. */
 export function readAccessNotice(repository) {
   return (
     `Lazurio for GitHub: this Team Environment has read access to ${repository}. ` +
-    "GitHub refuses pushes, pull requests and other changes to it from here. " +
-    "Propose the change in an issue (gh issue create) or ask someone with write access.\n"
+    "If GitHub refused a change above (a push, pull request or other write), that is the reason; " +
+    "any other error above is GitHub's own. " +
+    "A change can be proposed in an issue (gh issue create) once the Organization has accepted " +
+    "the app's Issues permission, or by someone with write access.\n"
   );
 }
 

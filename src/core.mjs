@@ -20,10 +20,16 @@ const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
 export const WRITE_ACCESS = "write";
 export const READ_ACCESS = "read";
 
+/**
+ * Both tiers read Organization membership (`members: read`, which the installation already
+ * requires for the Team gate), so an Environment can find the Organization Owners to mention in an
+ * issue: without it GitHub answers the Owner and collaborator lists with an empty list, not an error.
+ */
 const WRITE_TOKEN_PERMISSIONS = Object.freeze({
   actions: "write",
   checks: "read",
   contents: "write",
+  members: "read",
   pull_requests: "write",
 });
 /**
@@ -37,6 +43,7 @@ const READ_TOKEN_PERMISSIONS = Object.freeze({
   actions: "read",
   checks: "read",
   contents: "read",
+  members: "read",
   pull_requests: "read",
 });
 

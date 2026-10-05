@@ -16,9 +16,9 @@ dependency-light and customer-neutral.
 4. A token is limited to one repository and to exactly one of two permission
    sets (plus GitHub's automatic `metadata: read`), and expires on GitHub's
    installation-token schedule. The write tier is `actions: write`,
-   `checks: read`, `contents: write` and `pull_requests: write`. The read tier
-   is `actions: read`, `checks: read`, `contents: read` and
-   `pull_requests: read`. Each tier
+   `checks: read`, `contents: write`, `members: read` and
+   `pull_requests: write`. The read tier is `actions: read`, `checks: read`,
+   `contents: read`, `members: read` and `pull_requests: read`. Each tier
    adds `issues: write`, and the write tier `workflows: write`, only when the
    reviewed policy declares that the installation accepted that permission. A
    mint without an explicit tier fails.

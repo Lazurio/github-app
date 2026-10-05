@@ -7,14 +7,19 @@ immutable repository id. The Workspace's live GitHub Team grant on that
 repository selects one of two exact permission sets:
 
 - write tier (`push`, `maintain` or `admin` grant): `actions: write`,
-  `checks: read`, `contents: write` plus `pull_requests: write`, and
+  `checks: read`, `contents: write`, `members: read` plus
+  `pull_requests: write`, and
   `workflows: write` and `issues: write` where the Organization's policy
   declares them;
 - read tier (`pull` or `triage` grant): `actions: read`, `checks: read`,
-  `contents: read` plus `pull_requests: read`, and `issues: write` where the
-  Organization's policy declares it.
+  `contents: read`, `members: read` plus `pull_requests: read`, and
+  `issues: write` where the Organization's policy declares it.
 
-GitHub adds `metadata: read` to every token.
+GitHub adds `metadata: read` to every token. Both tiers read Organization
+membership (`members: read`, which the installation already holds for the Team
+gate) so an Environment can find the Organization Owners to mention in an
+issue; without it GitHub answers the Owner and collaborator lists with an empty
+list instead of an error.
 
 Lazurio for GitHub is an independent project. It is not affiliated with,
 sponsored by, or endorsed by GitHub, Inc. GitHub and GitHub CLI are trademarks
@@ -63,7 +68,9 @@ Workspace id + Workspace credential + repository (name or id)
   and, with `issues: write` declared, open and manage issues there. GitHub has
   no rerun-only installation permission, so `actions: write` also permits
   other Actions mutations in that repository; the token still receives no
-  Checks write, administration, membership or cross-repository authority.
+  Checks write, administration, membership change or cross-repository
+  authority. Its `members: read` reads the Organization's members and Teams,
+  as any member of the Organization can.
 - A read-tier token can clone, fetch and read the contents of that one
   repository and list and view its pull requests, check runs and GitHub
   Actions workflow runs. `actions: read` also lets it read that repository's

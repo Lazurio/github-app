@@ -40,14 +40,16 @@ authorization on every valid token request. Every token request then asks
 GitHub to mint a new one-repository token with exactly the permission set of
 its tier, and refuses a response with any other scope or any other repository:
 
-- write tier: `actions: write`, `checks: read`, `contents: write` and
-  `pull_requests: write`, plus `workflows: write` and `issues: write` each
+- write tier: `actions: write`, `checks: read`, `contents: write`,
+  `members: read` and `pull_requests: write`, plus `workflows: write` and `issues: write` each
   when the policy declares that the installation accepted it;
-- read tier: `actions: read`, `checks: read`, `contents: read` and
-  `pull_requests: read`, plus `issues: write` when the policy declares that
-  the installation accepted it.
+- read tier: `actions: read`, `checks: read`, `contents: read`,
+  `members: read` and `pull_requests: read`, plus `issues: write` when the
+  policy declares that the installation accepted it.
 
-GitHub adds `metadata: read` to both. There is no default tier: a mint without
+GitHub adds `metadata: read` to both. `members: read` lets an Environment
+list the Organization Owners it mentions in an issue; GitHub answers that list
+with an empty list, not an error, to a token without it. There is no default tier: a mint without
 an explicit tier fails before reaching GitHub, so a lost tier can never become
 the write set. Between the installation gate and the mint, the runtime
 performs the Team gate described below; it is the step that turns a live
@@ -246,9 +248,12 @@ and then run the real CLI. The adapter holds no repository list: it sends the
 repository name and accepts only a response for that same repository; the
 broker's live Team gate decides. It also refuses nothing by tier: with a
 read-tier token official `gh` runs and GitHub refuses what the token cannot
-do, with GitHub's own error and exit code. After such a refusal the adapter
-adds one stderr line naming the read access, so a permission refusal is not
-mistaken for a broker outage. Installation tokens exist only in the child
+do, with GitHub's own error and exit code. After any failed read-tier command
+the adapter adds one conditional stderr line: it names the read access as the
+reason if GitHub refused a change, leaves every other error as GitHub's own and
+says that proposing through an issue needs the accepted Issues permission. The
+adapter cannot tell a refusal from a bad argument or an outage, so it never
+claims which one happened. Installation tokens exist only in the child
 environment and are never cached, rendered or written to GitHub CLI config.
 The official CLI remains responsible for pull requests, REST and GraphQL.
 
