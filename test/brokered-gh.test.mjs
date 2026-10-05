@@ -639,6 +639,7 @@ test("a read-tier token runs official gh; reads succeed silently and a refused w
   assert.equal(await run(["api", "repos/Example/Alpha", "--jq", ".full_name"], 0), 0);
   assert.equal(await run(["pr", "view", "1", "--json", "state"], 0), 0);
   assert.equal(await run(["pr", "checks", "1"], 0), 0);
+  assert.equal(await run(["run", "view", "1"], 0), 0);
   assert.deepEqual(stderr, []);
 
   // A pull request is not refused up front: official gh runs, GitHub refuses, the exit code
@@ -649,6 +650,7 @@ test("a read-tier token runs official gh; reads succeed silently and a refused w
     "api repos/Example/Alpha",
     "pr view",
     "pr checks",
+    "run view",
     "pr create",
   ]);
   assert.ok(children.every(({ token }) => token === TOKEN));

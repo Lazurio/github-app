@@ -17,7 +17,8 @@ dependency-light and customer-neutral.
    sets (plus GitHub's automatic `metadata: read`), and expires on GitHub's
    installation-token schedule. The write tier is `actions: write`,
    `checks: read`, `contents: write` and `pull_requests: write`. The read tier
-   is `checks: read`, `contents: read` and `pull_requests: read`. Each tier
+   is `actions: read`, `checks: read`, `contents: read` and
+   `pull_requests: read`. Each tier
    adds `issues: write`, and the write tier `workflows: write`, only when the
    reviewed policy declares that the installation accepted that permission. A
    mint without an explicit tier fails.
@@ -46,8 +47,8 @@ operator documentation; never describe the token as rerun-only.
 that can open an issue. It also authorizes editing, labelling, closing,
 reopening and commenting on existing issues of the same repository. Never
 describe a read-tier token with `issues: write` as read-only or as able only
-to create issues, and never describe a read-tier token as able to read
-GitHub Actions data: it asks for no `actions` access.
+to create issues. The read tier's `actions: read` likewise reads more than
+check status: it also reads the repository's workflow run logs and artifacts.
 
 Use an isolated worktree and pull request for every change. Code, comments,
 commits and pull-request descriptions are English. Run `npm test` and

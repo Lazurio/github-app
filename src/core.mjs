@@ -27,11 +27,14 @@ const WRITE_TOKEN_PERMISSIONS = Object.freeze({
   pull_requests: "write",
 });
 /**
- * A read-tier token can clone, fetch and read the repository and see its pull requests and check
- * runs (plus GitHub's automatic `metadata: read`). It never asks for any contents, pull request,
- * Actions or workflow write, nor for Actions read.
+ * A read-tier token can clone, fetch and read the repository and see its pull requests, check runs
+ * and the workflow runs behind them (plus GitHub's automatic `metadata: read`). GitHub CLI check
+ * views and `statusCheckRollup` read the workflow run of each Actions check, which needs
+ * `actions: read`. The read tier never asks for any contents, pull request, Checks, Actions or
+ * workflow write.
  */
 const READ_TOKEN_PERMISSIONS = Object.freeze({
+  actions: "read",
   checks: "read",
   contents: "read",
   pull_requests: "read",

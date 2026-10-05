@@ -10,9 +10,9 @@ repository selects one of two exact permission sets:
   `checks: read`, `contents: write` plus `pull_requests: write`, and
   `workflows: write` and `issues: write` where the Organization's policy
   declares them;
-- read tier (`pull` or `triage` grant): `checks: read`, `contents: read` plus
-  `pull_requests: read`, and `issues: write` where the Organization's policy
-  declares it.
+- read tier (`pull` or `triage` grant): `actions: read`, `checks: read`,
+  `contents: read` plus `pull_requests: read`, and `issues: write` where the
+  Organization's policy declares it.
 
 GitHub adds `metadata: read` to every token.
 
@@ -65,10 +65,12 @@ Workspace id + Workspace credential + repository (name or id)
   other Actions mutations in that repository; the token still receives no
   Checks write, administration, membership or cross-repository authority.
 - A read-tier token can clone, fetch and read the contents of that one
-  repository and list and view its pull requests and check runs. It receives
-  no contents, pull request, Checks, Actions or workflow write and no Actions
-  read. With `issues: write` declared it can also open issues, which is how an
-  Agent without write access proposes a change. GitHub has no create-only
+  repository and list and view its pull requests, check runs and GitHub
+  Actions workflow runs. `actions: read` also lets it read that repository's
+  workflow run logs and artifacts, as a person with read access can. It
+  receives no contents, pull request, Checks, Actions or workflow write. With
+  `issues: write` declared it can also open issues, which is how an Agent
+  without write access proposes a change. GitHub has no create-only
   issue permission: `issues: write` also lets the token edit, label, close,
   reopen and comment on existing issues in that repository, which is closer to
   the `triage` role for issues than to a person with read access.
@@ -181,9 +183,9 @@ people who hold write access change them from their own Environments under
 their own GitHub accounts. Before `0.11.0` lowering such a grant to read cut
 the Team's Environment off the repository completely.
 
-The read tier reads contents, pull requests and check runs, so people in a
-read-only Environment see pull requests and CI results, but it writes nothing
-except, where declared, issues.
+The read tier reads contents, pull requests, check runs and GitHub Actions
+workflow runs, so people in a read-only Environment see pull requests and CI
+results, but it writes nothing except, where declared, issues.
 
 `triage` maps to the same read tier as `pull`. The installation permission
 that would add pull request triage is `pull_requests: write`, which also lets a
@@ -439,7 +441,7 @@ Team binding; it needs no key and makes no GitHub call:
 ```text
 lazurio.github_app_broker.policy.v3 owner=example-org installation=2001
 write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write issues=write pull_requests=write
-read tier (pull/triage grant) asks for: checks=read contents=read issues=write pull_requests=read
+read tier (pull/triage grant) asks for: actions=read checks=read contents=read issues=write pull_requests=read
 WORKSPACE   TEAM_ID  TEAM_SLUG
 alpha-team  4001     alpha-team
 ```
@@ -567,21 +569,19 @@ The adapter refuses no repository command by access tier. It sends the
 repository, receives whichever tier the broker minted and runs official `gh`
 with that token; GitHub decides. With a read-tier token, a Git credential
 helper built on `requestGitHubAppToken` serves `git clone`, `fetch` and `pull`,
-and `gh repo view`, `gh api` reads, `gh pr list` and `gh pr view` and, where
-the policy declares `issues: write`, `gh issue create` work. A `git push` fails
+and `gh repo view`, `gh api` reads, `gh pr list`, `gh pr view`, `gh pr checks`
+and `gh run view` and, where the policy declares `issues: write`,
+`gh issue create` work. A `git push` fails
 with GitHub's own `403` permission error. A `gh` command GitHub refuses, such
 as `gh pr create`, keeps official `gh`'s error and exit code, and the adapter
 adds one stderr line saying that the Environment has read access to that
 repository and suggesting an issue, so a refusal does not look like a broker
 outage.
 
-Check results need one caveat. `gh pr checks` and `--json statusCheckRollup`
-(which T3's pull request list uses) also ask GitHub for the workflow run
-behind each GitHub Actions check. That field is Actions data, and the read
-tier asks for no `actions` access, so on a repository whose checks come from
-GitHub Actions those views can fail under the read tier. `gh run view` fails
-for the same reason. The write tier is not affected because `actions: write`
-includes read.
+`gh pr checks` and `--json statusCheckRollup`, which T3's pull request list
+uses, also ask GitHub for the workflow run behind each GitHub Actions check.
+That is Actions data, which is why the read tier asks for `actions: read`; the
+write tier's `actions: write` already includes it.
 
 `requestGitHubAppToken` returns the minted `access`. It accepts `read` or
 `write`, treats a missing value as `write` (brokers before `0.11.0` mint only

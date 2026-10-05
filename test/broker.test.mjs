@@ -707,7 +707,7 @@ test("the write tier adds issues: write only when the policy declares the accept
   assert.deepEqual(requested, { ...base, workflows: "write" });
 });
 
-test("the read tier asks for contents, pull request and check reads, adds issues: write only when declared, and nothing else", async () => {
+test("the read tier asks for contents, pull request, check and Actions reads, adds issues: write only when declared, and nothing else", async () => {
   const now = 1_700_000_000_000;
   let requests = 0;
   let requested;
@@ -730,7 +730,7 @@ test("the read tier asks for contents, pull request and check reads, adds issues
     now: () => now,
   });
 
-  const readBase = { checks: "read", contents: "read", pull_requests: "read" };
+  const readBase = { actions: "read", checks: "read", contents: "read", pull_requests: "read" };
 
   // Base policy: no issues accepted. A workflows acceptance never leaks into the read tier.
   const fixture = policyFixture();
@@ -762,12 +762,12 @@ test("the read tier asks for contents, pull request and check reads, adds issues
     { ...readBase, contents: "write", metadata: "read" },
     { ...readBase, pull_requests: "write", metadata: "read" },
     { ...readBase, checks: "write", metadata: "read" },
-    { ...readBase, actions: "read", metadata: "read" },
     { ...readBase, actions: "write", metadata: "read" },
     { ...readBase, workflows: "write", metadata: "read" },
     { ...readBase, issues: "write", metadata: "read" },
-    { contents: "read", pull_requests: "read", metadata: "read" },
-    { checks: "read", contents: "read", metadata: "read" },
+    { actions: "read", contents: "read", pull_requests: "read", metadata: "read" },
+    { actions: "read", checks: "read", contents: "read", metadata: "read" },
+    { checks: "read", contents: "read", pull_requests: "read", metadata: "read" },
   ]) {
     responsePermissions = permissions;
     await assert.rejects(
@@ -1466,7 +1466,7 @@ test("end to end: a pull or triage grant mints a read-tier token; push mints wri
         assert.equal(json.repository, "example-org/alpha");
       }
       // The installation has not accepted issues: write, so the read tier asks for reads only.
-      const readSet = { checks: "read", contents: "read", pull_requests: "read" };
+      const readSet = { actions: "read", checks: "read", contents: "read", pull_requests: "read" };
       assert.deepEqual(scopedMints, [readSet, readSet]);
 
       // Cross-Workspace: beta's Team holds nothing on alpha, whatever alpha's Team holds.
@@ -1553,7 +1553,7 @@ test("policy check --live lists live Team grants as information and fails only o
     [
       "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
       "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write pull_requests=write",
-      "read tier (pull/triage grant) asks for: checks=read contents=read pull_requests=read",
+      "read tier (pull/triage grant) asks for: actions=read checks=read contents=read pull_requests=read",
       "WORKSPACE   TEAM_ID  TEAM_SLUG",
       "alpha-team  4001     alpha-team",
       "beta-team   4002     -",

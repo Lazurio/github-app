@@ -43,8 +43,9 @@ its tier, and refuses a response with any other scope or any other repository:
 - write tier: `actions: write`, `checks: read`, `contents: write` and
   `pull_requests: write`, plus `workflows: write` and `issues: write` each
   when the policy declares that the installation accepted it;
-- read tier: `checks: read`, `contents: read` and `pull_requests: read`, plus
-  `issues: write` when the policy declares that the installation accepted it.
+- read tier: `actions: read`, `checks: read`, `contents: read` and
+  `pull_requests: read`, plus `issues: write` when the policy declares that
+  the installation accepted it.
 
 GitHub adds `metadata: read` to both. There is no default tier: a mint without
 an explicit tier fails before reaching GitHub, so a lost tier can never become
@@ -61,11 +62,14 @@ grant on exactly that repository and no Checks write access.
 
 The read tier exists so an Organization can keep some repositories read-only
 for a Team without cutting that Team's Environment off them. A read-tier token
-clones, fetches and reads one repository and lists and views its pull requests
-and check runs, so people in a read-only Environment see pull requests and CI.
-It receives no contents, pull request, Checks, Actions or workflow write and
-no Actions read; GitHub CLI views that also ask for the workflow run behind an
-Actions check therefore can fail under the read tier. `issues: write` is the
+clones, fetches and reads one repository and lists and views its pull requests,
+check runs and GitHub Actions workflow runs, so people in a read-only
+Environment see pull requests and CI. `actions: read` is there because GitHub
+CLI check views and the `statusCheckRollup` behind T3's pull request list read
+the workflow run of each Actions check; it also lets the token read that
+repository's workflow run logs and artifacts, as a person with read access
+can. The token receives no contents, pull request, Checks, Actions or workflow
+write. `issues: write` is the
 only write it can carry, so that an Agent without write access can propose a
 change as an issue the way a person with read access does. GitHub has no
 create-only issue permission: the same permission lets the token edit, label,
