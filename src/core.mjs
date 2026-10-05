@@ -8,25 +8,69 @@ const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
 const V3_MIGRATION =
   "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.10.0";
+const USER_AGENT = "lazurio-github-app-broker/0.11.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
-const TOKEN_PERMISSIONS = Object.freeze({
+
+/**
+ * Access tiers. The live Team grant selects the tier at mint time: a `push`, `maintain` or `admin`
+ * grant mints the write tier, a `pull` or `triage` grant the read tier. The policy holds no tier.
+ */
+export const WRITE_ACCESS = "write";
+export const READ_ACCESS = "read";
+
+/**
+ * Both tiers read Organization membership (`members: read`, which the installation already
+ * requires for the Team gate), so an Environment can find the Organization Owners to mention in an
+ * issue: without it GitHub answers the Owner and collaborator lists with an empty list, not an error.
+ */
+const WRITE_TOKEN_PERMISSIONS = Object.freeze({
   actions: "write",
   checks: "read",
   contents: "write",
+  members: "read",
   pull_requests: "write",
 });
 /**
- * Pushing a commit that touches `.github/workflows/` needs `workflows: write`. The token asks for it
- * only when the Organization accepted it and the reviewed policy declares it, so a deployment whose
- * installation has not accepted the permission keeps minting the base set.
+ * A read-tier token can clone, fetch and read the repository and see its pull requests, check runs
+ * and the workflow runs behind them (plus GitHub's automatic `metadata: read`). GitHub CLI check
+ * views and `statusCheckRollup` read the workflow run of each Actions check, which needs
+ * `actions: read`. The read tier never asks for any contents, pull request, Checks, Actions or
+ * workflow write.
  */
-const WORKFLOW_TOKEN_PERMISSIONS = Object.freeze({ ...TOKEN_PERMISSIONS, workflows: "write" });
+const READ_TOKEN_PERMISSIONS = Object.freeze({
+  actions: "read",
+  checks: "read",
+  contents: "read",
+  members: "read",
+  pull_requests: "read",
+});
 
-function tokenPermissions(policy) {
-  return policy.installation_permissions.workflows === "write" ? WORKFLOW_TOKEN_PERMISSIONS : TOKEN_PERMISSIONS;
+/**
+ * The exact permission set a token of `access` asks GitHub for under `policy`. Two opt-ins follow
+ * the permissions the Organization accepted and the reviewed policy declares, so a deployment
+ * whose installation has not accepted them keeps minting the base sets:
+ * - `workflows: write` (write tier only) lets a push touch `.github/workflows/`;
+ * - `issues: write` (both tiers) is GitHub's smallest installation permission that can open an
+ *   issue, so an Environment can propose a change or escalate through an issue.
+ */
+export function tokenPermissions(policy, access) {
+  const accepted = policy.installation_permissions;
+  const issues = accepted.issues === "write" ? { issues: "write" } : {};
+  if (access === WRITE_ACCESS) {
+    const workflows = accepted.workflows === "write" ? { workflows: "write" } : {};
+    return Object.freeze({ ...WRITE_TOKEN_PERMISSIONS, ...workflows, ...issues });
+  }
+  if (access === READ_ACCESS) return Object.freeze({ ...READ_TOKEN_PERMISSIONS, ...issues });
+  fail("token access tier must be read or write");
+}
+
+/** Maps a live Team grant role to its access tier; undefined means no usable grant. */
+function grantAccess(role) {
+  if (role === "admin" || role === "maintain" || role === "write") return WRITE_ACCESS;
+  if (role === "triage" || role === "read") return READ_ACCESS;
+  return undefined;
 }
 /**
  * Organization `members: read` reads Teams and Team repository grants. GitHub answers the Team
@@ -337,10 +381,6 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     return "none";
   }
 
-  function isWriteCapable(role) {
-    return role === "admin" || role === "maintain" || role === "write";
-  }
-
   async function readTeam(policy, workspace, authorization) {
     const team = await request(`/organizations/${policy.github_owner.id}/team/${workspace.github_team_id}`, {
       authorization,
@@ -399,6 +439,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       deny(`repository ${coordinate.full_name} belongs to another owner than the policy's Organization`);
     }
     const role = grantRole(grant?.permissions);
+    const access = grantAccess(role);
     const returned = parseRepositoryCoordinate(grant?.full_name);
     if (
       grant?.owner?.id !== policy.github_owner.id ||
@@ -406,9 +447,9 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       grant.id <= 0 ||
       !returned ||
       (target?.repository_id !== undefined && grant.id !== target.repository_id) ||
-      !isWriteCapable(role)
+      access === undefined
     ) {
-      refuse(`Workspace ${workspace.id} GitHub Team grant on repository ${coordinate.full_name} is not write-capable`);
+      refuse(`Workspace ${workspace.id} GitHub Team holds no verifiable grant on repository ${coordinate.full_name}`);
     }
     return Object.freeze({
       workspace_id: workspace.id,
@@ -416,6 +457,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       repository_id: grant.id,
       full_name: returned.full_name,
       role,
+      access,
     });
   }
 
@@ -423,7 +465,8 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
    * Live per-mint Team gate. `target` is `{ repository: "Owner/name" }` or `{ repository_id }`.
    * Throws RepositoryDeniedError when the repository belongs to another owner, and TeamGrantError
    * when the Workspace's immutable GitHub Team is gone, has a different identity than the policy
-   * asserts, or lacks a write-capable grant on the repository. Nothing is cached across calls.
+   * asserts, or holds no grant on the repository. A `pull`/`triage` grant resolves to the read
+   * tier, a `push`/`maintain`/`admin` grant to the write tier. Nothing is cached across calls.
    */
   async function verifyTeamGrant(policy, workspace, target) {
     return withProbeToken(policy, TEAM_PROBE_PERMISSIONS, async (authorization) => {
@@ -442,9 +485,9 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
   }
 
   /**
-   * Readback of one Workspace: its Team identity and the Team's live write-capable repositories,
-   * with a single probe token. A missing or drifted Team becomes one refused row; it never throws
-   * for that case.
+   * Readback of one Workspace: its Team identity and the Team's live repository grants with the
+   * access tier each one mints, with a single probe token. A missing or drifted Team becomes one
+   * refused row; it never throws for that case.
    */
   async function readWorkspaceTeamGrants(policy, workspace) {
     return withProbeToken(policy, TEAM_PROBE_PERMISSIONS, async (authorization) => {
@@ -461,6 +504,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
             repository_id: "-",
             full_name: "-",
             role: "-",
+            access: "-",
             status: "refused",
             detail: error.message,
           }),
@@ -476,12 +520,13 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
         if (!Array.isArray(repositories)) fail("GitHub returned an invalid Team repository list");
         for (const repository of repositories) {
           const role = grantRole(repository?.permissions);
+          const access = grantAccess(role);
           const coordinate = parseRepositoryCoordinate(repository?.full_name);
           if (
             repository?.owner?.id !== policy.github_owner.id ||
             !Number.isSafeInteger(repository?.id) ||
             !coordinate ||
-            !isWriteCapable(role)
+            access === undefined
           ) {
             continue;
           }
@@ -493,6 +538,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
               repository_id: repository.id,
               full_name: coordinate.full_name,
               role,
+              access,
               status: "ok",
               detail: "",
             }),
@@ -509,8 +555,9 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
             repository_id: "-",
             full_name: "-",
             role: "-",
+            access: "-",
             status: "ok",
-            detail: "Team holds no write-capable repository grant",
+            detail: "Team holds no repository grant",
           }),
         );
       }
@@ -518,8 +565,12 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     });
   }
 
-  async function mintToken(policy, repositoryId) {
-    const requested = tokenPermissions(policy);
+  /**
+   * Mints the one-repository token of the `access` tier the live Team gate resolved. The tier is
+   * required: there is no default, so a caller that lost the tier can never mint the write set.
+   */
+  async function mintToken(policy, repositoryId, access) {
+    const requested = tokenPermissions(policy, access);
     const result = await request(`/app/installations/${policy.installation_id}/access_tokens`, {
       method: "POST",
       body: {
@@ -546,7 +597,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     ) {
       fail("GitHub returned a token outside the requested repository or permission scope");
     }
-    return { token: result.token, expires_at: result.expires_at, repository_id: repositoryId };
+    return { token: result.token, expires_at: result.expires_at, repository_id: repositoryId, access };
   }
 
   return Object.freeze({ verifyPolicy, verifyTeamGrant, verifyWorkspaceTeam, readWorkspaceTeamGrants, mintToken });
@@ -554,8 +605,9 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
 
 /**
  * Migration and readback gate: verifies the live installation, then every Workspace's Team
- * binding, and lists each Team's live write-capable repositories as information. Only a missing
- * or drifted Team (or installation drift, which throws) makes the result not ok. Emits no secret.
+ * binding, and lists each Team's live repository grants with the access tier each one mints as
+ * information. Only a missing or drifted Team (or installation drift, which throws) makes the
+ * result not ok. Emits no secret.
  */
 export async function checkPolicyLive({ policy, github }) {
   if (typeof github?.verifyPolicy !== "function" || typeof github?.readWorkspaceTeamGrants !== "function") {
@@ -576,6 +628,7 @@ const POLICY_CHECK_COLUMNS = Object.freeze([
   ["repository_id", "REPOSITORY_ID"],
   ["full_name", "REPOSITORY"],
   ["role", "ROLE"],
+  ["access", "ACCESS"],
   ["status", "STATUS"],
   ["detail", "DETAIL"],
 ]);
@@ -592,11 +645,13 @@ export function formatPolicyCheckTable(rows) {
     workspaces.set(row.workspace_id, refused ? "refused" : "ok");
   }
   const refusedTeams = [...workspaces.values()].filter((status) => status === "refused").length;
-  const repositories = rows.filter(({ status, repository_id }) => status === "ok" && repository_id !== "-").length;
+  const grants = rows.filter(({ status, repository_id }) => status === "ok" && repository_id !== "-");
+  const writeGrants = grants.filter(({ access }) => access === WRITE_ACCESS).length;
+  const readGrants = grants.filter(({ access }) => access === READ_ACCESS).length;
   return [
     line(POLICY_CHECK_COLUMNS.map(([, header]) => header)),
     ...cells.map(line),
-    `${workspaces.size} Workspaces checked, ${workspaces.size - refusedTeams} Teams ok, ${refusedTeams} refused; ${repositories} write-capable repository grants`,
+    `${workspaces.size} Workspaces checked, ${workspaces.size - refusedTeams} Teams ok, ${refusedTeams} refused; ${grants.length} repository grants (${writeGrants} write, ${readGrants} read)`,
   ].join("\n") + "\n";
 }
 
@@ -658,16 +713,20 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     }
     const repositoryId = grant?.repository_id;
     const repository = parseRepositoryCoordinate(grant?.full_name);
+    const access = grant?.access;
     if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0 || !repository) {
       fail("Team gate returned an invalid repository");
     }
-    const minted = await github.mintToken(policy, repositoryId);
+    if (access !== WRITE_ACCESS && access !== READ_ACCESS) fail("Team gate returned an invalid access tier");
+    const minted = await github.mintToken(policy, repositoryId, access);
     if (minted?.repository_id !== repositoryId) fail("minted token is outside the verified repository");
+    if (minted?.access !== access) fail("minted token is outside the verified access tier");
     return result(200, {
       token: minted.token,
       expires_at: minted.expires_at,
       repository_id: repositoryId,
       repository: repository.full_name,
+      access,
     });
   }
 

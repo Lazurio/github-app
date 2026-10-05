@@ -61,13 +61,13 @@ const grantedAlpha = async (_policy, _workspace, target) => {
   if (target.repository !== undefined && target.repository.toLowerCase() !== "example-org/alpha") {
     throw new TeamGrantError("no grant");
   }
-  return { repository_id: 3001, full_name: "example-org/alpha", role: "write" };
+  return { repository_id: 3001, full_name: "example-org/alpha", role: "write", access: "write" };
 };
 
 const provenTeam = async (_policy, workspace) => ({ id: workspace.github_team_id, slug: workspace.id });
 
 function workerFixture({ teamGrant = grantedAlpha, workspaceTeam = provenTeam } = {}) {
-  const calls = { verify: 0, teamGrant: 0, workspaceTeam: 0, mint: 0, order: [] };
+  const calls = { verify: 0, teamGrant: 0, workspaceTeam: 0, mint: 0, order: [], tiers: [] };
   const worker = createWorkerEntrypoint({
     createGithub: () => ({
       async verifyPolicy() {
@@ -84,13 +84,15 @@ function workerFixture({ teamGrant = grantedAlpha, workspaceTeam = provenTeam } 
         calls.order.push("workspace-team");
         return workspaceTeam(policy, workspace);
       },
-      async mintToken(_policy, repositoryId) {
+      async mintToken(_policy, repositoryId, access) {
         calls.mint += 1;
         calls.order.push("mint");
+        calls.tiers.push(access);
         return {
           token: `ghs_synthetic_${repositoryId}`,
           expires_at: "2030-01-01T00:00:00Z",
           repository_id: repositoryId,
+          access,
         };
       },
     }),
@@ -263,10 +265,33 @@ test("Worker verifies the live installation, then the Team grant, before every f
       expires_at: "2030-01-01T00:00:00Z",
       repository_id: 3001,
       repository: "example-org/alpha",
+      access: "write",
     });
   }
   assert.deepEqual(countsOf(calls), { verify: 2, teamGrant: 2, mint: 2 });
   assert.deepEqual(calls.order, ["installation", "team", "mint", "installation", "team", "mint"]);
+  assert.deepEqual(calls.tiers, ["write", "write"]);
+});
+
+test("Worker passes the read tier of a pull or triage grant to the mint and reports it", async () => {
+  const { worker, calls } = workerFixture({
+    teamGrant: async (policy, workspace, target) => ({
+      ...(await grantedAlpha(policy, workspace, target)),
+      role: "triage",
+      access: "read",
+    }),
+  });
+  const response = await worker.fetch(tokenRequest(), environment());
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    token: "ghs_synthetic_3001",
+    expires_at: "2030-01-01T00:00:00Z",
+    repository_id: 3001,
+    repository: "example-org/alpha",
+    access: "read",
+  });
+  assert.deepEqual(calls.order, ["installation", "team", "mint"]);
+  assert.deepEqual(calls.tiers, ["read"]);
 });
 
 test("Worker refuses cross-repository and foreign-owner ids from the Team gate and mints nothing", async () => {

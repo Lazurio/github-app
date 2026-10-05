@@ -180,8 +180,8 @@ export function createWorkerEntrypoint({ createGithub = defaultGithub, fetchImpl
           await github.verifyPolicy(activePolicy);
           return github.verifyWorkspaceTeam(activePolicy, workspace);
         },
-        mintToken(activePolicy, repositoryId) {
-          return github.mintToken(activePolicy, repositoryId);
+        mintToken(activePolicy, repositoryId, access) {
+          return github.mintToken(activePolicy, repositoryId, access);
         },
       });
       const handle = createBrokerHandler({

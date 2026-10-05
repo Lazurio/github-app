@@ -6,11 +6,14 @@ import http from "node:http";
 
 import {
   MAX_BODY_BYTES,
+  READ_ACCESS,
+  WRITE_ACCESS,
   checkPolicyLive,
   createBrokerHandler,
   createGithubClient as createSharedGithubClient,
   formatPolicyCheckTable,
   parsePolicy,
+  tokenPermissions,
 } from "./core.mjs";
 
 export { checkPolicyLive, formatPolicyCheckTable, parsePolicy } from "./core.mjs";
@@ -149,7 +152,17 @@ export function parseCommand(arguments_) {
   fail(USAGE);
 }
 
-/** Offline summary of the parsed Team binding; no GitHub traffic and no secret. */
+function formatPermissions(permissions) {
+  return Object.entries(permissions)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([permission, level]) => `${permission}=${level}`)
+    .join(" ");
+}
+
+/**
+ * Offline summary of the parsed Team binding and of the exact permission set each access tier
+ * mints under this policy; no GitHub traffic and no secret.
+ */
 export function formatPolicySummary(policy) {
   const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG"];
   const rows = policy.workspaces.map((workspace) => [
@@ -161,6 +174,8 @@ export function formatPolicySummary(policy) {
   const line = (values) => values.map((value, column) => value.padEnd(widths[column])).join("  ").trimEnd();
   return [
     `${policy.schema_version} owner=${policy.github_owner.login} installation=${policy.installation_id}`,
+    `write tier (push/maintain/admin grant) asks for: ${formatPermissions(tokenPermissions(policy, WRITE_ACCESS))}`,
+    `read tier (pull/triage grant) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS))}`,
     line(header),
     ...rows.map(line),
   ].join("\n") + "\n";
