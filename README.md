@@ -580,10 +580,12 @@ and `gh repo view`, `gh api` reads, `gh pr list`, `gh pr view`, `gh pr checks`
 and `gh run view` and, where the policy declares `issues: write`,
 `gh issue create` work. A `git push` fails
 with GitHub's own `403` permission error. A `gh` command GitHub refuses, such
-as `gh pr create`, keeps official `gh`'s error and exit code, and the adapter
-adds one stderr line saying that the Environment has read access to that
-repository and suggesting an issue, so a refusal does not look like a broker
-outage.
+as `gh pr create`, keeps official `gh`'s error and exit code. After any failed
+command under the read tier the adapter adds one conditional stderr line: if
+GitHub refused a change, the read access is the reason; any other error is
+GitHub's own; an issue can propose the change once the Organization accepted
+the Issues permission. A refusal therefore does not look like a broker outage,
+and an unrelated failure is not misdiagnosed as one.
 
 `gh pr checks` and `--json statusCheckRollup`, which T3's pull request list
 uses, also ask GitHub for the workflow run behind each GitHub Actions check.
