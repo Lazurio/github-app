@@ -3,9 +3,16 @@
 Open-source, publicly auditable source for the small credential boundary used
 by Lazurio Team Workspaces. The broker exchanges an authenticated Workspace
 request for a short-lived GitHub App installation token restricted to one
-immutable repository id and exactly `actions: write`, `checks: read`,
-`contents: write` plus `pull_requests: write`, and `workflows: write` where the
-Organization's policy declares it.
+immutable repository id. The Workspace's live GitHub Team grant on that
+repository selects one of two exact permission sets:
+
+- write tier (`push`, `maintain` or `admin` grant): `actions: write`,
+  `checks: read`, `contents: write` plus `pull_requests: write`, and
+  `workflows: write` where the Organization's policy declares it;
+- read tier (`pull` or `triage` grant): `contents: read`, and `issues: write`
+  where the Organization's policy declares it.
+
+GitHub adds `metadata: read` to every token.
 
 Lazurio for GitHub is an independent project. It is not affiliated with,
 sponsored by, or endorsed by GitHub, Inc. GitHub and GitHub CLI are trademarks
@@ -30,8 +37,9 @@ Workspace id + Workspace credential + repository (name or id)
     -> exact deployment policy (Organization, App, installation, Workspace -> Team)
     -> repository owner is the policy's Organization
     -> live GitHub App installation identity and permissions
-    -> live write-capable grant of the Workspace's immutable GitHub Team on that repository
-    -> one-repository installation token for the repository id GitHub returned
+    -> live grant of the Workspace's immutable GitHub Team on that repository
+       (push/maintain/admin -> write tier, pull/triage -> read tier, none -> refused)
+    -> one-repository installation token of that tier for the repository id GitHub returned
 ```
 
 - It never asks which human last used the Workspace.
@@ -39,17 +47,28 @@ Workspace id + Workspace credential + repository (name or id)
 - The GitHub App private key exists only in the broker workload.
 - Every Workspace is bound to exactly one immutable GitHub Team id. The live
   GitHub Team grant is the scope: a Workspace can obtain a token for exactly
-  the repositories of the policy's Organization on which its Team holds a
-  `push`, `maintain` or `admin` grant at the moment of the request. The policy
-  holds no repository list, so it never grants anything GitHub has not granted
-  and never narrows what GitHub has granted. An Organization Admin who grants
-  a Team write access to a new repository makes it available to that Team's
-  Environment without a broker policy change or redeploy.
-- A minted token can read checks, rerun workflows, change repository contents
-  and create or update pull requests only for that one repository. GitHub has
-  no rerun-only installation permission, so `actions: write` also permits
-  other Actions mutations in that repository; the token still receives no
-  Checks write, administration, membership or cross-repository authority.
+  the repositories of the policy's Organization on which its Team holds any
+  repository grant at the moment of the request, and the grant decides the
+  tier. A `push`, `maintain` or `admin` grant mints the write tier; a `pull` or
+  `triage` grant mints the read tier. The policy holds no repository list and
+  no tier, so it never grants anything GitHub has not granted and never
+  narrows or widens what GitHub has granted. An Organization Admin who grants
+  a Team access to a new repository, or raises or lowers a grant, changes what
+  that Team's Environment can do on the next request, without a broker policy
+  change or redeploy.
+- A write-tier token can read checks, rerun workflows, change repository
+  contents and create or update pull requests only for that one repository.
+  GitHub has no rerun-only installation permission, so `actions: write` also
+  permits other Actions mutations in that repository; the token still receives
+  no Checks write, administration, membership or cross-repository authority.
+- A read-tier token can clone, fetch and read the contents of that one
+  repository. It receives no contents, pull request, Actions, Checks or
+  workflow write and no Checks or Actions read. With `issues: write` declared
+  it can also open issues, which is how an Agent without write access proposes
+  a change. GitHub has no create-only issue permission: `issues: write` also
+  lets the token edit, label, close, reopen and comment on existing issues in
+  that repository, which is closer to the `triage` role for issues than to a
+  person with read access.
 - Immutable ids are the authorization keys: the Workspace id, the Team id, the
   Organization id and the repository id GitHub returns from the live Team
   grant. Repository names are resolved live on every request and never cached.
@@ -107,12 +126,19 @@ Schema v3 binds each Workspace to its GitHub Team and names no repositories:
   `members: read` and `pull_requests: write`; the App reads Teams and Team
   repository grants through `members: read`.
 - `installation_permissions.workflows: write` is optional. When the
-  Organization accepted it and the policy declares it, every token also asks
-  for `workflows: write`, so a Workspace can push commits that add or change
-  `.github/workflows/` files in its repository, exactly like a Team member
-  with a write grant. Without it the token keeps the base set. Because the
-  installation gate compares permissions exactly, accept the permission and
-  deploy the policy that declares it in one short window.
+  Organization accepted it and the policy declares it, every write-tier token
+  also asks for `workflows: write`, so a Workspace can push commits that add
+  or change `.github/workflows/` files in its repository, exactly like a Team
+  member with a write grant. Without it the token keeps the base set. Because
+  the installation gate compares permissions exactly, accept the permission
+  and deploy the policy that declares it in one short window.
+- `installation_permissions.issues: write` is optional in the same way. When
+  the Organization accepted it and the policy declares it, every read-tier
+  token also asks for `issues: write`, so a Workspace whose Team holds a
+  `pull` or `triage` grant can open issues. Without it a read-tier token can
+  clone, fetch and read but not open issues. The write tier never asks for
+  `issues`. See [Read-only Team grants](#read-only-team-grants) for the App
+  permission this needs.
 - `workspaces[]` has `id`, `github_team_id`, optional `github_team_slug` and
   `credential_file`. Workspace ids, Team ids and credential files must each be
   unique, so exactly one broker Workspace exists per Team. The optional slug
@@ -130,8 +156,8 @@ Schema v2 (and the already retired v1) is rejected with a migration message.
 Migrate by setting `schema_version` to `lazurio.github_app_broker.policy.v3`
 and deleting `repositories` and every `workspaces[].repository_ids`; the live
 Team grant is the scope. Run `policy check --live` against the converted
-policy and compare the listed write-capable repositories of each Team with
-what that Team's Environment should reach. A Team that holds more write grants
+policy and compare the listed repositories of each Team with what that Team's
+Environment should reach. A Team that holds more write grants
 than its v2 allowlist gains those repositories; narrow such a Team on GitHub
 before switching. Only then deploy broker `0.10.0` with the v3 policy.
 
@@ -139,6 +165,69 @@ Roll out the broker before the client adapter: broker `0.10.0` accepts both
 the new `{"repository": ...}` body and the `{"repository_id": ...}` body that
 already deployed `0.9.0` adapters send. The `0.10.0` adapter sends only the
 name form and therefore needs a `0.10.0` broker.
+
+#### Read-only Team grants
+
+Since `0.11.0` a Team's `pull` or `triage` grant mints the read tier instead
+of being refused as `403 team_grant_missing`. An Organization can therefore
+give a Team only read access to some repositories (for example a knowledge
+base, planning data or the Organization root): the Team's Environment can
+still clone, pull and read them and propose changes as issues, while the
+people who hold write access change them from their own Environments under
+their own GitHub accounts. Before `0.11.0` lowering such a grant to read cut
+the Team's Environment off the repository completely.
+
+`triage` maps to the same read tier as `pull`. The installation permission
+that would add pull request triage is `pull_requests: write`, which also lets a
+token open and edit pull requests; an Environment without write access
+proposes through issues, so the read tier stays minimal. Issue triage comes
+with `issues: write` anyway, because GitHub has no create-only issue
+permission.
+
+The policy stays schema v3 and names no tier: the tier comes from the live
+grant on every request.
+
+**App permission prerequisite for issues.** Opening an issue needs the App to
+request the repository permission `Issues: Read and write`. The public Lazurio
+for GitHub App requested no `issues` permission when `0.11.0` was prepared, so
+issue creation needs, per Organization:
+
+1. once, an owner of the App adds `Issues: Read and write` in the App's
+   permission settings. GitHub then asks every installation to accept; an
+   installation that has not accepted keeps its previous permissions, so
+   nothing changes for that Organization yet;
+2. an Organization owner reviews and accepts the request in the Organization's
+   GitHub App settings. Accepting also accepts any other permission the App
+   requests at that moment, so read the whole request; and
+3. because the installation gate compares permissions exactly, the policy
+   then declares the whole newly accepted set, including
+   `installation_permissions.issues: write`, in the same short window.
+   Between acceptance and the policy deploy the Worker refuses every token
+   request of that Organization with `502 token_unavailable`, and the Node
+   adapter refuses to start and fails `--verify-only`, exactly as with
+   `workflows: write`.
+
+Without these steps the read tier still clones, fetches and reads; GitHub only
+refuses issue creation.
+
+**Rollout order.** The order matters, because a grant lowered before step 2
+cuts the Environment off the repository:
+
+1. Release `0.11.0`.
+2. Deploy broker `0.11.0` for each Organization. No policy change is needed
+   and write grants mint exactly what they minted before.
+3. Optionally pin the `0.11.0` adapter in the Workspaces, which explains a
+   refused write instead of leaving only GitHub's error. The `0.10.0` adapter
+   already works with read-tier tokens because it ignores `access`.
+4. Where the Organization wants issues from read-only Environments, follow the
+   App permission prerequisite above.
+5. Run `policy check --live` to see every Team's current grants and tiers, then
+   lower the Team grants on GitHub. A lowered repository mints the read tier on
+   the next request; a write-tier token minted earlier stays valid until it
+   expires on GitHub's installation-token schedule (at most one hour).
+
+Rolling the broker back to `0.10.0` refuses read-only Teams again with
+`team_grant_missing`; it never widens access.
 
 ### API
 
@@ -162,12 +251,16 @@ body with both keys, neither, any other key, a non-positive or non-integer id,
 or a name that is not exactly `Owner/name` is refused with `400`.
 
 The response contains the installation token, GitHub's expiry timestamp, the
-immutable `repository_id` and the canonical `repository` full name GitHub
-returned, with `Cache-Control: no-store`:
+immutable `repository_id`, the canonical `repository` full name GitHub
+returned and the `access` tier that was minted (`write` or `read`), with
+`Cache-Control: no-store`:
 
 ```json
-{"token": "<installation token>", "expires_at": "2030-01-01T00:00:00Z", "repository_id": 2345, "repository": "example-organization/example-repository"}
+{"token": "<installation token>", "expires_at": "2030-01-01T00:00:00Z", "repository_id": 2345, "repository": "example-organization/example-repository", "access": "write"}
 ```
+
+`access` is additive: clients that ignore it keep working, and brokers before
+`0.11.0` never send it because they mint only the write tier.
 
 `POST /v1/workspace` is the repository-independent connection proof the
 adapter uses for host-level discovery outside a repository checkout. It takes
@@ -195,14 +288,15 @@ and revocation; it only guarantees that no final repository token exists:
 3. installation gate: exact App identity, Organization target, selection mode
    and permissions (the Node adapter at startup, the Worker on every request);
 4. Team gate: the Workspace's Team exists with the asserted identity and holds
-   a write-capable grant on the repository; then the one-repository mint.
+   a grant on the repository, whose role selects the tier; then the
+   one-repository mint of that tier.
 
 | Status | `error` | Meaning |
 | --- | --- | --- |
 | `401` | `workspace_unauthorized` | Unknown Workspace id or wrong credential. No GitHub traffic. |
 | `400` | `invalid_request` | Body is not exactly one of the two forms. No GitHub traffic. |
 | `403` | `repository_denied` | The repository belongs to another owner than the policy's Organization. The name form is refused without GitHub traffic; the id form after the live readback. |
-| `403` | `team_grant_missing` | Live GitHub readback shows the Workspace's Team is gone, has a different identity than the policy asserts, or lacks a push/maintain/admin grant on the repository; or the repository id is not visible to the installation. |
+| `403` | `team_grant_missing` | Live GitHub readback shows the Workspace's Team is gone, has a different identity than the policy asserts, or holds no grant (none of pull, triage, push, maintain or admin) on the repository; or the repository id is not visible to the installation. |
 | `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, the mint left the requested scope, or the body exceeded the size limit. |
 | `415` | `unsupported_media_type` | Body is not JSON. |
 
@@ -226,17 +320,22 @@ requests are:
 3. `GET /organizations/{org_id}/team/{team_id}/repos/{owner}/{repo}` with
    `Accept: application/vnd.github.v3.repository+json` returns the repository
    with the Team's `permissions`. The broker requires the returned
-   `owner.id` to equal `github_owner.id`, `push`, `maintain` or `admin` to be
-   `true` and, for the id form, the returned id to equal the requested id. A
-   `404` or a `pull`/`triage`-only grant is `team_grant_missing`
+   `owner.id` to equal `github_owner.id`, at least one of `pull`, `triage`,
+   `push`, `maintain` or `admin` to be `true` and, for the id form, the
+   returned id to equal the requested id. `admin`, `maintain` or `push`
+   selects the write tier; otherwise `triage` or `pull` selects the read tier.
+   A `404` or a payload without any of these is `team_grant_missing`
    (Organization `members: read`; GitHub also lists this endpoint under
-   repository `administration: read`, which is not required). The probe also
-   needs repository `metadata: read`: without it GitHub answers `404` for
-   every private repository the probe cannot see, which would look like a
-   missing grant.
+   repository `administration: read`, which is not required). GitHub answers
+   `404` here for a Team without a grant even on a public repository, so a
+   public repository is not readable through the broker unless the Team was
+   granted it. The probe also needs repository `metadata: read`: without it
+   GitHub answers `404` for every private repository the probe cannot see,
+   which would look like a missing grant.
 
-The token is minted for the repository id GitHub returned in step 3. Archived
-repositories are not special-cased: GitHub itself refuses writes to them.
+The token is minted for the repository id GitHub returned in step 3, with the
+permission set of the tier that step selected. Archived repositories are not
+special-cased: GitHub itself refuses writes to them.
 Nothing from these readbacks is cached: revoking a Team grant on GitHub
 refuses the next token without a restart, granting one makes the next request
 succeed, and a token already issued expires on GitHub's installation-token
@@ -322,26 +421,37 @@ BROKER_POLICY_FILE=./policy.json \
 node src/broker.mjs policy check --live
 ```
 
-Without `--live` the command only parses the policy and prints the Workspace
-to Team binding; it needs no key and makes no GitHub call. With `--live` it
-first performs the same installation verification as `--verify-only`, then,
-with one `members: read` plus `metadata: read` probe token per Workspace,
-verifies the Team identity and lists the Team's live write-capable
-repositories of the policy's Organization:
+Without `--live` the command only parses the policy and prints the exact
+permission set each tier asks for under this policy, then the Workspace to
+Team binding; it needs no key and makes no GitHub call:
 
 ```text
-WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY         ROLE   STATUS   DETAIL
-alpha-team  4001     alpha-team  3001           example-org/alpha  write  ok
-alpha-team  4001     alpha-team  3003           example-org/gamma  admin  ok
-beta-team   4002     ?           -              -                  -      refused  Workspace beta-team GitHub Team 4002 no longer exists in the Organization
-2 Workspaces checked, 1 Teams ok, 1 refused; 2 write-capable repository grants
+lazurio.github_app_broker.policy.v3 owner=example-org installation=2001
+write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write pull_requests=write
+read tier (pull/triage grant) asks for: contents=read issues=write
+WORKSPACE   TEAM_ID  TEAM_SLUG
+alpha-team  4001     alpha-team
 ```
 
-The repository rows are information: they show the Team's live write grants
-as the probe sees them. In `selected` installation mode a listed repository is
-mintable only while it is also installed for the App; the check does not
-prove that per repository. A Team with no write-capable grant prints one `ok` row
-saying so. The output contains no token or credential. The command exits
+With `--live` it first performs the same installation verification as
+`--verify-only`, then, with one `members: read` plus `metadata: read` probe
+token per Workspace, verifies the Team identity and lists the Team's live
+repository grants of the policy's Organization with the tier each one mints:
+
+```text
+WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY            ROLE   ACCESS  STATUS   DETAIL
+alpha-team  4001     alpha-team  3001           example-org/alpha     write  write   ok
+alpha-team  4001     alpha-team  3003           example-org/gamma     admin  write   ok
+alpha-team  4001     alpha-team  3004           example-org/handbook  read   read    ok
+beta-team   4002     ?           -              -                     -      -       refused  Workspace beta-team GitHub Team 4002 no longer exists in the Organization
+2 Workspaces checked, 1 Teams ok, 1 refused; 3 repository grants (2 write, 1 read)
+```
+
+The repository rows are information: they show the Team's live grants as the
+probe sees them and the tier a token for each would have. In `selected`
+installation mode a listed repository is mintable only while it is also
+installed for the App; the check does not prove that per repository. A Team
+with no grant prints one `ok` row saying so. The output contains no token or credential. The command exits
 non-zero only when a Team is missing or its identity differs from the policy,
 or when the installation differs from the policy. The check never edits
 GitHub; a refused row is fixed by restoring the Team on GitHub or reviewing
@@ -441,6 +551,24 @@ same one-repository token as other repository commands and does not require a
 human `gh auth` login or a synthetic source commit. The adapter does not claim
 to narrow GitHub's `actions: write` permission to that single verb.
 
+The adapter refuses no repository command by access tier. It sends the
+repository, receives whichever tier the broker minted and runs official `gh`
+with that token; GitHub decides. With a read-tier token, a Git credential
+helper built on `requestGitHubAppToken` serves `git clone`, `fetch` and `pull`,
+and `gh repo view`, `gh api` reads and, where the policy declares
+`issues: write`, `gh issue create` work. A `git push` fails with GitHub's own
+`403` permission error. A `gh` command GitHub refuses, such as `gh pr create`,
+keeps official `gh`'s error and exit code, and the adapter adds one stderr line
+saying that the Environment has read access to that repository and suggesting
+an issue, so a refusal does not look like a broker outage. On a private
+repository pull request and check reads (`gh pr list`, `gh pr view`,
+`gh pr checks`) also fail under the read tier, because it asks for no
+`pull_requests` or `checks` access.
+
+`requestGitHubAppToken` returns the minted `access`. It accepts `read` or
+`write`, treats a missing value as `write` (brokers before `0.11.0` mint only
+that tier) and refuses any other value as an invalid broker response.
+
 Current T3 PR operations explicitly pass `--hostname github.com` to official
 `gh`. The adapter accepts only that exact host on repository commands; the
 discovery/viewer envelopes remain exact, a missing value or any other host is
@@ -500,7 +628,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.10.0` |
+| Adapter | `0.11.0` |
 | Cloudflare Wrangler | `4.127.1` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
