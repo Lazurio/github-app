@@ -52,9 +52,11 @@ function policyFixture() {
   };
 }
 
+/** Synthetic live grants of alpha's Team: name -> [repository id, access tier the grant mints]. */
 const SYNTHETIC_REPOSITORIES = new Map([
-  ["example-org/alpha", 3001],
-  ["example-org/beta", 3002],
+  ["example-org/alpha", [3001, "write"]],
+  ["example-org/beta", [3002, "write"]],
+  ["example-org/handbook", [3004, "read"]],
 ]);
 
 /** Synthetic Workspace Team proof: the bound Team exists with its asserted identity. */
@@ -63,27 +65,33 @@ const provenTeam = async (_policy, workspace) => ({
   slug: workspace.github_team_slug ?? workspace.id,
 });
 
-/** Synthetic Team gate: resolves both body forms to the canonical repository id and name. */
+/** Synthetic Team gate: resolves both body forms to the canonical repository id, name and tier. */
 const grantedTeam = async (_policy, workspace, target) => {
   const entry = target.repository_id === undefined
     ? [...SYNTHETIC_REPOSITORIES].find(([name]) => name === target.repository.toLowerCase())
-    : [...SYNTHETIC_REPOSITORIES].find(([, id]) => id === target.repository_id);
+    : [...SYNTHETIC_REPOSITORIES].find(([, [id]]) => id === target.repository_id);
   if (!entry) throw Object.assign(new Error("no grant"), { code: "team_grant_missing" });
+  const [fullName, [repositoryId, access]] = entry;
   return {
     workspace_id: workspace.id,
     github_team_id: workspace.github_team_id,
     github_team_slug: workspace.github_team_slug ?? workspace.id,
-    repository_id: entry[1],
-    full_name: entry[0],
-    role: "write",
+    repository_id: repositoryId,
+    full_name: fullName,
+    role: access === "write" ? "write" : "read",
+    access,
   };
 };
 
-async function withServer(run, mintToken = async (_policy, repositoryId) => ({
+/** Synthetic mint that honours the requested repository and access tier. */
+const syntheticMint = async (_policy, repositoryId, access) => ({
   token: `ghs_synthetic_${repositoryId}`,
   expires_at: "2030-01-01T00:00:00Z",
   repository_id: repositoryId,
-}), verifyTeamGrant = grantedTeam, verifyWorkspaceTeam = provenTeam) {
+  access,
+});
+
+async function withServer(run, mintToken = syntheticMint, verifyTeamGrant = grantedTeam, verifyWorkspaceTeam = provenTeam) {
   const server = createBrokerServer({
     policy: parsePolicy(policyFixture()),
     github: { verifyTeamGrant, verifyWorkspaceTeam, mintToken },
@@ -155,9 +163,69 @@ test("mints a non-cacheable token for the Team-granted repository in both body f
         expires_at: "2030-01-01T00:00:00Z",
         repository_id: 3001,
         repository: "example-org/alpha",
+        access: "write",
       });
     }
   });
+});
+
+test("mints the read tier for a read-granted repository and says so in the response", async () => {
+  const mints = [];
+  await withServer(
+    async (origin) => {
+      for (const body of [{ repository: "example-org/handbook" }, { repository_id: 3004 }]) {
+        const response = await request(origin, { body });
+        assert.equal(response.status, 200, JSON.stringify(body));
+        assert.equal(response.headers.get("cache-control"), "no-store");
+        assert.deepEqual(await response.json(), {
+          token: "ghs_synthetic_3004",
+          expires_at: "2030-01-01T00:00:00Z",
+          repository_id: 3004,
+          repository: "example-org/handbook",
+          access: "read",
+        });
+      }
+      assert.deepEqual(mints, [[3004, "read"], [3004, "read"]]);
+    },
+    async (policy, repositoryId, access) => {
+      mints.push([repositoryId, access]);
+      return syntheticMint(policy, repositoryId, access);
+    },
+  );
+});
+
+test("fails closed when the Team gate or the mint loses the access tier", async () => {
+  for (const [name, mintToken, verifyTeamGrant] of [
+    [
+      "gate without a tier",
+      async () => {
+        throw new Error("must not mint without a verified tier");
+      },
+      async (...args) => ({ ...(await grantedTeam(...args)), access: undefined }),
+    ],
+    [
+      "gate with an unknown tier",
+      async () => {
+        throw new Error("must not mint without a verified tier");
+      },
+      async (...args) => ({ ...(await grantedTeam(...args)), access: "admin" }),
+    ],
+    [
+      "mint of another tier",
+      async (policy, repositoryId) => syntheticMint(policy, repositoryId, "write"),
+      async (...args) => ({ ...(await grantedTeam(...args)), access: "read" }),
+    ],
+  ]) {
+    await withServer(
+      async (origin) => {
+        const response = await request(origin);
+        assert.equal(response.status, 502, name);
+        assert.deepEqual(await response.json(), { error: "token_unavailable" }, name);
+      },
+      mintToken,
+      verifyTeamGrant,
+    );
+  }
 });
 
 test("rejects an invalid Workspace credential without calling GitHub", async () => {
@@ -262,12 +330,13 @@ test("does not cache installation tokens between requests", async () => {
       assert.equal((await request(origin)).status, 200);
       assert.equal(calls, 2);
     },
-    async (_policy, repositoryId) => {
+    async (_policy, repositoryId, access) => {
       calls += 1;
       return {
         token: `ghs_synthetic_${repositoryId}_${calls}`,
         expires_at: "2030-01-01T00:00:00Z",
         repository_id: repositoryId,
+        access,
       };
     },
   );
@@ -482,10 +551,11 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     fetchImpl,
     now: () => now,
   });
-  assert.deepEqual(await github.mintToken(policy, 3001), {
+  assert.deepEqual(await github.mintToken(policy, 3001, "write"), {
     token: "ghs_scoped_synthetic_token",
     expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
     repository_id: 3001,
+    access: "write",
   });
 
   responsePermissions = {
@@ -495,7 +565,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     pull_requests: "write",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001),
+    () => github.mintToken(policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -506,7 +576,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     pull_requests: "write",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001),
+    () => github.mintToken(policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -517,7 +587,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     metadata: "read",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001),
+    () => github.mintToken(policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -530,7 +600,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     pull_requests: "write",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001),
+    () => github.mintToken(policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 });
@@ -558,7 +628,7 @@ test("asks for workflows: write only when the policy declares the accepted permi
   const withoutWorkflows = parsePolicy(policyFixture());
   responsePermissions = { ...base, metadata: "read", workflows: "write" };
   await assert.rejects(
-    () => github.mintToken(withoutWorkflows, 3001),
+    () => github.mintToken(withoutWorkflows, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
   assert.deepEqual(requested, base);
@@ -566,20 +636,104 @@ test("asks for workflows: write only when the policy declares the accepted permi
   const fixture = policyFixture();
   fixture.installation_permissions = { ...fixture.installation_permissions, emails: "read", workflows: "write" };
   const withWorkflows = parsePolicy(fixture);
-  assert.equal((await github.mintToken(withWorkflows, 3001)).repository_id, 3001);
+  assert.equal((await github.mintToken(withWorkflows, 3001, "write")).repository_id, 3001);
   assert.deepEqual(requested, { ...base, workflows: "write" });
 
   responsePermissions = { ...base, metadata: "read" };
   await assert.rejects(
-    () => github.mintToken(withWorkflows, 3001),
+    () => github.mintToken(withWorkflows, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
   responsePermissions = { ...base, metadata: "read", workflows: "write", emails: "read" };
   await assert.rejects(
-    () => github.mintToken(withWorkflows, 3001),
+    () => github.mintToken(withWorkflows, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
+
+  // The write tier never asks for issues, even when the installation accepted them.
+  fixture.installation_permissions.issues = "write";
+  responsePermissions = { ...base, metadata: "read", workflows: "write" };
+  assert.equal((await github.mintToken(parsePolicy(fixture), 3001, "write")).access, "write");
+  assert.deepEqual(requested, { ...base, workflows: "write" });
+});
+
+test("the read tier asks for contents: read, adds issues: write only when declared, and nothing else", async () => {
+  const now = 1_700_000_000_000;
+  let requests = 0;
+  let requested;
+  let responsePermissions;
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (_url, init) => {
+      requests += 1;
+      const body = JSON.parse(init.body);
+      assert.deepEqual(body.repository_ids, [3004]);
+      requested = body.permissions;
+      return jsonResponse({
+        token: "ghs_scoped_synthetic_token",
+        expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: 3004 }],
+        permissions: responsePermissions,
+      });
+    },
+    now: () => now,
+  });
+
+  // Base policy: no issues accepted. A workflows acceptance never leaks into the read tier.
+  const fixture = policyFixture();
+  fixture.installation_permissions.workflows = "write";
+  const withoutIssues = parsePolicy(fixture);
+  responsePermissions = { contents: "read", metadata: "read" };
+  assert.deepEqual(await github.mintToken(withoutIssues, 3004, "read"), {
+    token: "ghs_scoped_synthetic_token",
+    expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+    repository_id: 3004,
+    access: "read",
+  });
+  assert.deepEqual(requested, { contents: "read" });
+
+  fixture.installation_permissions.issues = "write";
+  const withIssues = parsePolicy(fixture);
+  responsePermissions = { contents: "read", issues: "write", metadata: "read" };
+  assert.equal((await github.mintToken(withIssues, 3004, "read")).access, "read");
+  assert.deepEqual(requested, { contents: "read", issues: "write" });
+
+  // An issues permission declared only as read is not the accepted write permission.
+  fixture.installation_permissions.issues = "read";
+  responsePermissions = { contents: "read", metadata: "read" };
+  await github.mintToken(parsePolicy(fixture), 3004, "read");
+  assert.deepEqual(requested, { contents: "read" });
+
+  // Any write beyond the requested read set, or a missing issues grant, is refused.
+  for (const permissions of [
+    { contents: "write", metadata: "read" },
+    { contents: "read", metadata: "read", pull_requests: "write" },
+    { contents: "read", metadata: "read", actions: "write" },
+    { contents: "read", metadata: "read", checks: "read" },
+    { contents: "read", metadata: "read", workflows: "write" },
+    { contents: "read", issues: "write", metadata: "read" },
+  ]) {
+    responsePermissions = permissions;
+    await assert.rejects(
+      () => github.mintToken(withoutIssues, 3004, "read"),
+      /outside the requested repository or permission scope/,
+      JSON.stringify(permissions),
+    );
+  }
+  responsePermissions = { contents: "read", metadata: "read" };
+  await assert.rejects(
+    () => github.mintToken(withIssues, 3004, "read"),
+    /outside the requested repository or permission scope/,
+  );
+
+  // There is no default tier: a missing or unknown tier never reaches GitHub.
+  const before = requests;
+  for (const access of [undefined, "", "admin", "WRITE"]) {
+    await assert.rejects(() => github.mintToken(withIssues, 3004, access), /access tier must be read or write/);
+  }
+  assert.equal(requests, before);
 });
 
 test("rejects duplicated Workspace credential values and aliased paths before listening", async () => {
@@ -635,11 +789,7 @@ test("keeps one verified credential snapshot for the complete server lifetime", 
     github: {
       verifyTeamGrant: grantedTeam,
       verifyWorkspaceTeam: provenTeam,
-      mintToken: async (_policy, repositoryId) => ({
-        token: `ghs_synthetic_${repositoryId}`,
-        expires_at: "2030-01-01T00:00:00Z",
-        repository_id: repositoryId,
-      }),
+      mintToken: syntheticMint,
     },
     readFile: (file) => {
       const count = (reads.get(file) ?? 0) + 1;
@@ -673,11 +823,7 @@ test("verifies live policy exactly once before serving runtime requests", async 
       },
       verifyTeamGrant: grantedTeam,
       verifyWorkspaceTeam: provenTeam,
-      mintToken: async (_policy, repositoryId) => ({
-        token: `ghs_synthetic_${repositoryId}`,
-        expires_at: "2030-01-01T00:00:00Z",
-        repository_id: repositoryId,
-      }),
+      mintToken: syntheticMint,
     },
     readFile: (file) => secretByPath.get(file) ?? "",
     realpath: (file) => file,
@@ -832,7 +978,7 @@ function teamGrantFetch({
   };
 }
 
-test("verifies the live Team binding and write-capable grant by name with a revoked probe", async () => {
+test("verifies the live Team binding and a write grant by name with a revoked probe", async () => {
   const policy = parsePolicy(policyFixture());
   const calls = [];
   const github = createGithubClient({
@@ -848,6 +994,7 @@ test("verifies the live Team binding and write-capable grant by name with a revo
     repository_id: 3001,
     full_name: "example-org/alpha",
     role: "write",
+    access: "write",
   });
   assert.deepEqual(calls.map(({ method, path }) => `${method} ${path}`), [
     "POST /app/installations/2001/access_tokens",
@@ -905,7 +1052,7 @@ test("returns the canonical repository name and id GitHub reports for a differen
   assert.ok(calls.includes("/organizations/1001/team/4001/repos/Example-Org/ALPHA"));
 });
 
-test("refuses with team_grant_missing when the Team is absent, drifted, or lacks a write grant", async () => {
+test("refuses with team_grant_missing when the Team is absent, drifted, or holds no grant", async () => {
   const policy = parsePolicy(policyFixture());
   const workspace = policy.workspaces[0];
   const privateKey = testPrivateKey();
@@ -948,34 +1095,40 @@ test("refuses with team_grant_missing when the Team is absent, drifted, or lacks
     },
     { name: "id not visible", fetch: teamGrantFetch(), target: { repository_id: 3999 }, message: /cannot see repository 3999/ },
     {
-      name: "pull-only grant",
-      fetch: teamGrantFetch({ grant: writeGrant({ permissions: { admin: false, maintain: false, pull: true, push: false, triage: false } }) }),
+      name: "grant payload without any permission",
+      fetch: teamGrantFetch({ grant: writeGrant({ permissions: { admin: false, maintain: false, pull: false, push: false, triage: false } }) }),
       target: byName,
-      message: /not write-capable/,
+      message: /holds no verifiable grant on repository example-org\/alpha/,
     },
     {
-      name: "triage-only grant",
-      fetch: teamGrantFetch({ grant: writeGrant({ permissions: { admin: false, maintain: false, pull: true, push: false, triage: true } }) }),
+      name: "grant payload without a permissions object",
+      fetch: teamGrantFetch({ grant: writeGrant({ permissions: undefined }) }),
       target: byId,
-      message: /not write-capable/,
+      message: /holds no verifiable grant/,
     },
     {
       name: "id form grant returns a different repository id",
       fetch: teamGrantFetch({ grant: writeGrant({ id: 3999 }) }),
       target: byId,
-      message: /not write-capable/,
+      message: /holds no verifiable grant/,
+    },
+    {
+      name: "read grant returns a different repository id",
+      fetch: teamGrantFetch({ grant: writeGrant({ id: 3999, permissions: { admin: false, maintain: false, pull: true, push: false, triage: false } }) }),
+      target: byId,
+      message: /holds no verifiable grant/,
     },
     {
       name: "grant without a canonical full name",
       fetch: teamGrantFetch({ grant: writeGrant({ full_name: undefined }) }),
       target: byName,
-      message: /not write-capable/,
+      message: /holds no verifiable grant/,
     },
     {
       name: "204 without permissions payload",
       fetch: teamGrantFetch(),
       target: byName,
-      message: /not write-capable/,
+      message: /holds no verifiable grant/,
     },
   ];
   for (const { name, fetch: fetchImpl, target, message } of cases) {
@@ -1056,22 +1209,39 @@ test("refuses a repository of another owner with repository_denied in both forms
   }
 });
 
-test("accepts maintain and admin grants and distinguishes outages from refusals", async () => {
+test("maps every live grant role to its access tier in both body forms", async () => {
   const policy = parsePolicy(policyFixture());
   const privateKey = testPrivateKey();
-  for (const [permissions, role] of [
-    [{ admin: false, maintain: true, pull: true, push: true, triage: true }, "maintain"],
-    [{ admin: true, maintain: true, pull: true, push: true, triage: true }, "admin"],
+  for (const [permissions, role, access] of [
+    [{ admin: false, maintain: false, pull: true, push: false, triage: false }, "read", "read"],
+    [{ admin: false, maintain: false, pull: true, push: false, triage: true }, "triage", "read"],
+    [{ admin: false, maintain: false, pull: true, push: true, triage: true }, "write", "write"],
+    [{ admin: false, maintain: true, pull: true, push: true, triage: true }, "maintain", "write"],
+    [{ admin: true, maintain: true, pull: true, push: true, triage: true }, "admin", "write"],
   ]) {
-    const github = createGithubClient({
-      appId: "42",
-      privateKey,
-      fetchImpl: teamGrantFetch({
-        grant: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions },
-      }),
-    });
-    assert.equal((await github.verifyTeamGrant(policy, policy.workspaces[0], { repository_id: 3001 })).role, role);
+    for (const target of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+      const calls = [];
+      const github = createGithubClient({
+        appId: "42",
+        privateKey,
+        fetchImpl: teamGrantFetch({
+          calls,
+          grant: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions },
+        }),
+      });
+      const grant = await github.verifyTeamGrant(policy, policy.workspaces[0], target);
+      assert.deepEqual([grant.role, grant.access, grant.repository_id, grant.full_name], [role, access, 3001, "example-org/alpha"], role);
+      // The tier comes from the same single grant read through the revoked probe; nothing else is read.
+      assert.deepEqual(calls[0].body, { permissions: PROBE_PERMISSIONS });
+      assert.equal(calls.at(-1).method, "DELETE");
+      assert.equal(calls.filter(({ path }) => path.includes("/team/4001/repos/")).length, 1);
+    }
   }
+});
+
+test("distinguishes Team grant outages from refusals", async () => {
+  const policy = parsePolicy(policyFixture());
+  const privateKey = testPrivateKey();
 
   const outage = createGithubClient({
     appId: "42",
@@ -1105,13 +1275,14 @@ test("mints only after a live Team grant and refuses with team_grant_missing oth
         }
         return grantedTeam(policy, workspace, target);
       },
-      mintToken: async (_policy, repositoryId) => {
+      mintToken: async (_policy, repositoryId, access) => {
         mints += 1;
         assert.equal(checks, mints, "the Team grant must be verified before every mint");
         return {
           token: `ghs_synthetic_${repositoryId}_${mints}`,
           expires_at: "2030-01-01T00:00:00Z",
           repository_id: repositoryId,
+          access,
         };
       },
     },
@@ -1157,17 +1328,19 @@ async function withLiveCoreServer(fetchImpl, run) {
   }
 }
 
-function mintingFetch(calls, teamFetch = teamGrantFetch()) {
+/** Synthetic GitHub that grants exactly the requested scoped permissions plus metadata: read. */
+function mintingFetch(calls, teamFetch = teamGrantFetch(), scopedMints = []) {
   return async (url, init) => {
     const path = new URL(url).pathname;
     calls.push(`${init.method} ${path}`);
     if (path === "/app/installations/2001/access_tokens" && JSON.parse(init.body).repository_ids) {
-      const [repositoryId] = JSON.parse(init.body).repository_ids;
+      const { repository_ids: [repositoryId], permissions } = JSON.parse(init.body);
+      scopedMints.push(permissions);
       return jsonResponse({
         token: `ghs_scoped_synthetic_${repositoryId}`,
         expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
         repositories: [{ id: repositoryId }],
-        permissions: { actions: "write", checks: "read", contents: "write", metadata: "read", pull_requests: "write" },
+        permissions: { ...permissions, metadata: "read" },
       });
     }
     return teamFetch(url, init);
@@ -1214,6 +1387,57 @@ test("end to end: a Team-granted repository mints for its id; other Teams, repos
       "each probe is revoked; only the two accepted requests minted a scoped token",
     );
     assert.equal(before, 4);
+  });
+});
+
+test("end to end: a pull or triage grant mints a read-tier token; push mints write; no grant mints nothing", async () => {
+  const readGrant = (triage) => teamGrantFetch({
+    grant: {
+      id: 3001,
+      full_name: "example-org/alpha",
+      owner: { id: 1001, login: "example-org" },
+      permissions: { admin: false, maintain: false, pull: true, push: false, triage },
+    },
+  });
+  for (const triage of [false, true]) {
+    const calls = [];
+    const scopedMints = [];
+    await withLiveCoreServer(mintingFetch(calls, readGrant(triage), scopedMints), async (origin) => {
+      for (const body of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+        const response = await request(origin, { body });
+        assert.equal(response.status, 200);
+        const json = await response.json();
+        assert.equal(json.access, "read");
+        assert.equal(json.repository_id, 3001);
+        assert.equal(json.repository, "example-org/alpha");
+      }
+      // The installation has not accepted issues: write, so the read tier asks for contents only.
+      assert.deepEqual(scopedMints, [{ contents: "read" }, { contents: "read" }]);
+
+      // Cross-Workspace: beta's Team holds nothing on alpha, whatever alpha's Team holds.
+      const crossWorkspace = await request(origin, {
+        workspace: "beta-team",
+        secret: secretByPath.get("/run/secrets/workspace-beta"),
+      });
+      assert.equal(crossWorkspace.status, 403);
+      assert.deepEqual(await crossWorkspace.json(), { error: "team_grant_missing" });
+      assert.equal(scopedMints.length, 2);
+    });
+  }
+
+  const writeMints = [];
+  await withLiveCoreServer(mintingFetch([], teamGrantFetch(), writeMints), async (origin) => {
+    const response = await request(origin);
+    assert.equal((await response.json()).access, "write");
+    assert.deepEqual(writeMints, [{ actions: "write", checks: "read", contents: "write", pull_requests: "write" }]);
+  });
+
+  const noneMints = [];
+  await withLiveCoreServer(mintingFetch([], teamGrantFetch({ grant: null }), noneMints), async (origin) => {
+    const response = await request(origin);
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "team_grant_missing" });
+    assert.deepEqual(noneMints, []);
   });
 });
 
@@ -1273,6 +1497,8 @@ test("policy check --live lists live Team grants as information and fails only o
     formatPolicySummary(policy),
     [
       "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
+      "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write pull_requests=write",
+      "read tier (pull/triage grant) asks for: contents=read",
       "WORKSPACE   TEAM_ID  TEAM_SLUG",
       "alpha-team  4001     alpha-team",
       "beta-team   4002     -",
@@ -1283,11 +1509,12 @@ test("policy check --live lists live Team grants as information and fails only o
   const probes = [];
   const rowsFor = {
     "alpha-team": [
-      { workspace_id: "alpha-team", github_team_id: 4001, github_team_slug: "alpha-team", repository_id: 3001, full_name: "example-org/alpha", role: "write", status: "ok", detail: "" },
-      { workspace_id: "alpha-team", github_team_id: 4001, github_team_slug: "alpha-team", repository_id: 3003, full_name: "example-org/gamma", role: "admin", status: "ok", detail: "" },
+      { workspace_id: "alpha-team", github_team_id: 4001, github_team_slug: "alpha-team", repository_id: 3001, full_name: "example-org/alpha", role: "write", access: "write", status: "ok", detail: "" },
+      { workspace_id: "alpha-team", github_team_id: 4001, github_team_slug: "alpha-team", repository_id: 3003, full_name: "example-org/gamma", role: "admin", access: "write", status: "ok", detail: "" },
+      { workspace_id: "alpha-team", github_team_id: 4001, github_team_slug: "alpha-team", repository_id: 3004, full_name: "example-org/handbook", role: "read", access: "read", status: "ok", detail: "" },
     ],
     "beta-team": [
-      { workspace_id: "beta-team", github_team_id: 4002, github_team_slug: "?", repository_id: "-", full_name: "-", role: "-", status: "refused", detail: "Workspace beta-team GitHub Team 4002 no longer exists in the Organization" },
+      { workspace_id: "beta-team", github_team_id: 4002, github_team_slug: "?", repository_id: "-", full_name: "-", role: "-", access: "-", status: "refused", detail: "Workspace beta-team GitHub Team 4002 no longer exists in the Organization" },
     ],
   };
   const github = {
@@ -1304,28 +1531,29 @@ test("policy check --live lists live Team grants as information and fails only o
   assert.equal(
     table,
     [
-      "WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY         ROLE   STATUS   DETAIL",
-      "alpha-team  4001     alpha-team  3001           example-org/alpha  write  ok",
-      "alpha-team  4001     alpha-team  3003           example-org/gamma  admin  ok",
-      "beta-team   4002     ?           -              -                  -      refused  Workspace beta-team GitHub Team 4002 no longer exists in the Organization",
-      "2 Workspaces checked, 1 Teams ok, 1 refused; 2 write-capable repository grants",
+      "WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY            ROLE   ACCESS  STATUS   DETAIL",
+      "alpha-team  4001     alpha-team  3001           example-org/alpha     write  write   ok",
+      "alpha-team  4001     alpha-team  3003           example-org/gamma     admin  write   ok",
+      "alpha-team  4001     alpha-team  3004           example-org/handbook  read   read    ok",
+      "beta-team   4002     ?           -              -                     -      -       refused  Workspace beta-team GitHub Team 4002 no longer exists in the Organization",
+      "2 Workspaces checked, 1 Teams ok, 1 refused; 3 repository grants (2 write, 1 read)",
       "",
     ].join("\n"),
   );
   assert.doesNotMatch(table, /ghs_|secret/i);
 
   rowsFor["beta-team"] = [
-    { workspace_id: "beta-team", github_team_id: 4002, github_team_slug: "beta", repository_id: "-", full_name: "-", role: "-", status: "ok", detail: "Team holds no write-capable repository grant" },
+    { workspace_id: "beta-team", github_team_id: 4002, github_team_slug: "beta", repository_id: "-", full_name: "-", role: "-", access: "-", status: "ok", detail: "Team holds no repository grant" },
   ];
   const healthy = await checkPolicyLive({ policy, github });
   assert.equal(healthy.ok, true, "a Team without grants is information, not drift");
-  assert.match(formatPolicyCheckTable(healthy.rows), /2 Workspaces checked, 2 Teams ok, 0 refused; 2 write-capable repository grants/);
+  assert.match(formatPolicyCheckTable(healthy.rows), /2 Workspaces checked, 2 Teams ok, 0 refused; 3 repository grants \(2 write, 1 read\)/);
 
   const failedInstallation = { ...github, verifyPolicy: async () => { throw new Error("live GitHub installation identity, selection or permissions differ from policy"); } };
   await assert.rejects(() => checkPolicyLive({ policy, github: failedInstallation }), /differ from policy/);
 });
 
-test("readWorkspaceTeamGrants paginates the Team's write-capable repositories with one probe", async () => {
+test("readWorkspaceTeamGrants paginates the Team's repository grants with their tier and one probe", async () => {
   const policy = parsePolicy(policyFixture());
   const calls = [];
   const writable = { admin: false, maintain: false, pull: true, push: true, triage: true };
@@ -1339,6 +1567,7 @@ test("readWorkspaceTeamGrants paginates the Team's write-capable repositories wi
     { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions: { ...writable, maintain: true } },
     { id: 9001, full_name: "other-org/foreign", owner: { id: 1002, login: "other-org" }, permissions: writable },
     { id: 3002, full_name: "example-org/beta", owner: { id: 1001, login: "example-org" }, permissions: { pull: true } },
+    { id: 3005, full_name: "example-org/none", owner: { id: 1001, login: "example-org" }, permissions: { pull: false } },
   ];
   const fetchImpl = async (url, init) => {
     const path = new URL(url).pathname + new URL(url).search;
@@ -1360,24 +1589,30 @@ test("readWorkspaceTeamGrants paginates the Team's write-capable repositories wi
   const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
 
   const alpha = await github.readWorkspaceTeamGrants(policy, policy.workspaces[0]);
-  assert.equal(alpha.length, 100, "99 write grants from page one plus alpha; triage, read-only and foreign rows are skipped");
-  assert.deepEqual(alpha.at(-1), {
+  assert.equal(alpha.length, 102, "100 grants from page one plus alpha and beta; foreign and grant-less rows are skipped");
+  assert.deepEqual(alpha.at(-2), {
     workspace_id: "alpha-team",
     github_team_id: 4001,
     github_team_slug: "alpha-team",
     repository_id: 3001,
     full_name: "example-org/alpha",
     role: "maintain",
+    access: "write",
     status: "ok",
     detail: "",
   });
-  assert.equal(alpha.some(({ repository_id }) => repository_id === 9001 || repository_id === 3002 || repository_id === 5000), false);
+  assert.deepEqual(
+    alpha.filter(({ access }) => access === "read").map(({ repository_id, role }) => [repository_id, role]),
+    [[5000, "triage"], [3002, "read"]],
+  );
+  assert.equal(alpha.filter(({ access }) => access === "write").length, 100);
+  assert.equal(alpha.some(({ repository_id }) => repository_id === 9001 || repository_id === 3005), false);
   assert.equal(calls.filter((call) => call === "POST /app/installations/2001/access_tokens").length, 1);
   assert.equal(calls.at(-1), "DELETE /installation/token");
 
   const beta = await github.readWorkspaceTeamGrants(policy, policy.workspaces[1]);
   assert.deepEqual(beta.map(({ repository_id, status, detail }) => [repository_id, status, detail]), [
-    ["-", "ok", "Team holds no write-capable repository grant"],
+    ["-", "ok", "Team holds no repository grant"],
   ]);
 });
 

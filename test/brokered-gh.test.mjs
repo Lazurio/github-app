@@ -17,6 +17,7 @@ import {
   classifyGhCommand,
   HOSTED_GITHUB_ACTOR,
   READ_ONLY_GH_CONFIG_DIR,
+  readAccessNotice,
   resolveGhRepository,
   runBrokeredGh,
   uncredentialedGhEnvironment,
@@ -117,6 +118,8 @@ test("requests one fresh repo-scoped token by name without exposing the Workspac
     repository: "Example/Alpha",
     repositoryId: 101,
     expiresAt: "2026-08-18T13:00:00Z",
+    // A broker before 0.11.0 sends no tier; it minted only for write-capable grants.
+    access: "write",
   });
   assert.equal(captured.url, "http://github-token-broker:8787/v1/token");
   assert.deepEqual(JSON.parse(captured.options.body), { repository: "example/alpha" });
@@ -249,6 +252,30 @@ test("rejects a broker response for another repository or without a canonical id
       () => requestGitHubAppToken({ ...shared, fetchImpl: async () => response(body) }),
       /invalid scoped response/,
       JSON.stringify(body),
+    );
+  }
+});
+
+test("reports the access tier the broker minted and rejects an unknown tier", async () => {
+  const shared = {
+    repository: "Example/Alpha",
+    environment,
+    readFile: () => "workspace-credential-with-at-least-32-bytes",
+    now: () => NOW,
+  };
+  for (const access of ["read", "write"]) {
+    const result = await requestGitHubAppToken({
+      ...shared,
+      fetchImpl: async () => response({ ...validToken(), access }),
+    });
+    assert.equal(result.access, access);
+    assert.equal(result.token, TOKEN);
+  }
+  for (const access of [null, "", "admin", "READ", 1]) {
+    await assert.rejects(
+      () => requestGitHubAppToken({ ...shared, fetchImpl: async () => response({ ...validToken(), access }) }),
+      /invalid scoped response/,
+      JSON.stringify(access),
     );
   }
 });
@@ -557,6 +584,97 @@ test("repository operations accept T3 lowercase identity and pass only an env-lo
   assert.equal(child.environment.HTTPS_PROXY, undefined);
   assert.equal(child.environment.https_proxy, undefined);
   assert.equal(child.environment.GH_CONFIG_DIR, READ_ONLY_GH_CONFIG_DIR);
+});
+
+test("the gh allow-list refuses no repository command by access tier", () => {
+  for (const args of [
+    ["pr", "create", "--title", "t", "--body", "b"],
+    ["pr", "merge", "1"],
+    ["pr", "comment", "1", "--body", "b"],
+    ["issue", "create", "--title", "t", "--body", "b"],
+    ["issue", "list"],
+    ["run", "rerun", "1"],
+    ["repo", "view"],
+    ["api", "repos/Example/Alpha/contents/README.md"],
+    ["api", "-X", "POST", "repos/Example/Alpha/issues", "-f", "title=t"],
+  ]) {
+    assert.equal(classifyGhCommand(args, environment), "repository", args.join(" "));
+  }
+});
+
+/** A requestToken that runs the real broker client against a stub broker answering `body`. */
+function brokerClientAnswering(body, requests = []) {
+  return (options) => requestGitHubAppToken({
+    ...options,
+    readFile: () => "workspace-credential-with-at-least-32-bytes",
+    exists: () => false,
+    fetchImpl: async (url, init) => {
+      requests.push({ url, body: JSON.parse(init.body) });
+      return response(body);
+    },
+    now: () => NOW,
+  });
+}
+
+test("a read-tier token runs official gh; reads succeed silently and a refused write is explained", async () => {
+  const readToken = { ...validToken(101, "Example/Alpha"), access: "read" };
+  const children = [];
+  const stderr = [];
+  const run = (args, exitCode, body = readToken) => runBrokeredGh({
+    args,
+    environment,
+    readOrigin: () => "https://github.com/Example/Alpha.git",
+    requestToken: brokerClientAnswering(body),
+    assertConfigDirectory: () => {},
+    runRealGh: (childArgs, childEnvironment) => {
+      children.push({ args: childArgs, token: childEnvironment.GH_TOKEN });
+      return exitCode;
+    },
+    writeStderr: (value) => stderr.push(value),
+  });
+
+  // Reads and issue creation go to official gh with the read-tier token and add no output.
+  assert.equal(await run(["issue", "create", "--title", "t", "--body", "b"], 0), 0);
+  assert.equal(await run(["api", "repos/Example/Alpha", "--jq", ".full_name"], 0), 0);
+  assert.deepEqual(stderr, []);
+
+  // A pull request is not refused up front: official gh runs, GitHub refuses, the exit code
+  // passes through and the adapter says why instead of looking like a broker outage.
+  assert.equal(await run(["pr", "create", "--title", "t", "--body", "b"], 1), 1);
+  assert.deepEqual(children.map(({ args }) => args[0]), ["issue", "api", "pr"]);
+  assert.ok(children.every(({ token }) => token === TOKEN));
+  assert.deepEqual(stderr, [readAccessNotice("Example/Alpha")]);
+  assert.match(stderr[0], /read access to Example\/Alpha/);
+  assert.match(stderr[0], /gh issue create/);
+  assert.equal(stderr.join("").includes(TOKEN), false);
+
+  // A write-tier failure, or one from a broker that reports no tier, stays official gh's own output.
+  assert.equal(await run(["pr", "create"], 1, { ...validToken(), access: "write" }), 1);
+  assert.equal(await run(["pr", "create"], 1, validToken()), 1);
+  assert.equal(stderr.length, 1);
+});
+
+test("discovery inside a checkout succeeds with a read-tier repository proof", async () => {
+  const stdout = [];
+  const requests = [];
+  assert.equal(
+    await runBrokeredGh({
+      args: ["auth", "status", "--json", "hosts"],
+      environment,
+      readOrigin: () => "https://github.com/Example/Alpha.git",
+      requestToken: brokerClientAnswering({ ...validToken(), access: "read" }, requests),
+      requestWorkspace: async () => {
+        throw new Error("a checkout proof never falls back to the Workspace proof");
+      },
+      writeStdout: (value) => stdout.push(value),
+      writeStderr: () => {},
+    }),
+    0,
+  );
+  assert.equal(JSON.parse(stdout.at(-1)).hosts["github.com"][0].state, "success");
+  assert.deepEqual(requests.map(({ url, body }) => [url, body]), [
+    ["http://github-token-broker:8787/v1/token", { repository: "Example/Alpha" }],
+  ]);
 });
 
 test("denied commands cannot reach the broker or official gh", async () => {

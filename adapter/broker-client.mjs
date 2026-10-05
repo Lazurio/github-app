@@ -158,7 +158,10 @@ export async function requestGitHubAppToken({
   } catch {
     returnedRepository = undefined;
   }
+  // Brokers before 0.11.0 send no `access`; they mint only for push/maintain/admin grants.
+  const access = result?.access === undefined ? "write" : result.access;
   if (
+    (access !== "read" && access !== "write") ||
     typeof result?.token !== "string" ||
     result.token.length < 20 ||
     returnedRepository === undefined ||
@@ -177,6 +180,7 @@ export async function requestGitHubAppToken({
     repository: returnedRepository,
     repositoryId: result.repository_id,
     expiresAt: result.expires_at,
+    access,
   });
 }
 
