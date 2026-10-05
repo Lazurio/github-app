@@ -27,31 +27,32 @@ const WRITE_TOKEN_PERMISSIONS = Object.freeze({
   pull_requests: "write",
 });
 /**
- * Pushing a commit that touches `.github/workflows/` needs `workflows: write`. The token asks for it
- * only when the Organization accepted it and the reviewed policy declares it, so a deployment whose
- * installation has not accepted the permission keeps minting the base set.
+ * A read-tier token can clone, fetch and read the repository and see its pull requests and check
+ * runs (plus GitHub's automatic `metadata: read`). It never asks for any contents, pull request,
+ * Actions or workflow write, nor for Actions read.
  */
-const WORKFLOW_TOKEN_PERMISSIONS = Object.freeze({ ...WRITE_TOKEN_PERMISSIONS, workflows: "write" });
-/**
- * A read-tier token can clone, fetch and read the repository (plus GitHub's automatic
- * `metadata: read`). It never asks for pull request, Actions, Checks or workflow access.
- */
-const READ_TOKEN_PERMISSIONS = Object.freeze({ contents: "read" });
-/**
- * Opening an issue needs `issues: write`, GitHub's smallest installation permission that can create
- * one. The read tier asks for it only when the Organization accepted it and the reviewed policy
- * declares it, exactly like `workflows: write` for the write tier.
- */
-const ISSUE_READ_TOKEN_PERMISSIONS = Object.freeze({ ...READ_TOKEN_PERMISSIONS, issues: "write" });
+const READ_TOKEN_PERMISSIONS = Object.freeze({
+  checks: "read",
+  contents: "read",
+  pull_requests: "read",
+});
 
-/** The exact permission set a token of `access` asks GitHub for under `policy`. */
+/**
+ * The exact permission set a token of `access` asks GitHub for under `policy`. Two opt-ins follow
+ * the permissions the Organization accepted and the reviewed policy declares, so a deployment
+ * whose installation has not accepted them keeps minting the base sets:
+ * - `workflows: write` (write tier only) lets a push touch `.github/workflows/`;
+ * - `issues: write` (both tiers) is GitHub's smallest installation permission that can open an
+ *   issue, so an Environment can propose a change or escalate through an issue.
+ */
 export function tokenPermissions(policy, access) {
+  const accepted = policy.installation_permissions;
+  const issues = accepted.issues === "write" ? { issues: "write" } : {};
   if (access === WRITE_ACCESS) {
-    return policy.installation_permissions.workflows === "write" ? WORKFLOW_TOKEN_PERMISSIONS : WRITE_TOKEN_PERMISSIONS;
+    const workflows = accepted.workflows === "write" ? { workflows: "write" } : {};
+    return Object.freeze({ ...WRITE_TOKEN_PERMISSIONS, ...workflows, ...issues });
   }
-  if (access === READ_ACCESS) {
-    return policy.installation_permissions.issues === "write" ? ISSUE_READ_TOKEN_PERMISSIONS : READ_TOKEN_PERMISSIONS;
-  }
+  if (access === READ_ACCESS) return Object.freeze({ ...READ_TOKEN_PERMISSIONS, ...issues });
   fail("token access tier must be read or write");
 }
 

@@ -633,15 +633,24 @@ test("a read-tier token runs official gh; reads succeed silently and a refused w
     writeStderr: (value) => stderr.push(value),
   });
 
-  // Reads and issue creation go to official gh with the read-tier token and add no output.
+  // Reads, pull request and check views and issue creation go to official gh with the read-tier
+  // token and add no output.
   assert.equal(await run(["issue", "create", "--title", "t", "--body", "b"], 0), 0);
   assert.equal(await run(["api", "repos/Example/Alpha", "--jq", ".full_name"], 0), 0);
+  assert.equal(await run(["pr", "view", "1", "--json", "state"], 0), 0);
+  assert.equal(await run(["pr", "checks", "1"], 0), 0);
   assert.deepEqual(stderr, []);
 
   // A pull request is not refused up front: official gh runs, GitHub refuses, the exit code
   // passes through and the adapter says why instead of looking like a broker outage.
   assert.equal(await run(["pr", "create", "--title", "t", "--body", "b"], 1), 1);
-  assert.deepEqual(children.map(({ args }) => args[0]), ["issue", "api", "pr"]);
+  assert.deepEqual(children.map(({ args }) => args.slice(0, 2).join(" ")), [
+    "issue create",
+    "api repos/Example/Alpha",
+    "pr view",
+    "pr checks",
+    "pr create",
+  ]);
   assert.ok(children.every(({ token }) => token === TOKEN));
   assert.deepEqual(stderr, [readAccessNotice("Example/Alpha")]);
   assert.match(stderr[0], /read access to Example\/Alpha/);

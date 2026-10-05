@@ -651,14 +651,63 @@ test("asks for workflows: write only when the policy declares the accepted permi
     /outside the requested repository or permission scope/,
   );
 
-  // The write tier never asks for issues, even when the installation accepted them.
+});
+
+test("the write tier adds issues: write only when the policy declares the accepted permission", async () => {
+  const now = 1_700_000_000_000;
+  const base = { actions: "write", checks: "read", contents: "write", pull_requests: "write" };
+  let requested;
+  let responsePermissions;
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (_url, init) => {
+      requested = JSON.parse(init.body).permissions;
+      return jsonResponse({
+        token: "ghs_scoped_synthetic_token",
+        expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: 3001 }],
+        permissions: responsePermissions,
+      });
+    },
+    now: () => now,
+  });
+
+  // Not declared: the write tier stays the base set and refuses an issues grant it did not ask for.
+  responsePermissions = { ...base, issues: "write", metadata: "read" };
+  await assert.rejects(
+    () => github.mintToken(parsePolicy(policyFixture()), 3001, "write"),
+    /outside the requested repository or permission scope/,
+  );
+  assert.deepEqual(requested, base);
+
+  // Declared alone, and together with workflows.
+  const fixture = policyFixture();
   fixture.installation_permissions.issues = "write";
-  responsePermissions = { ...base, metadata: "read", workflows: "write" };
+  responsePermissions = { ...base, issues: "write", metadata: "read" };
   assert.equal((await github.mintToken(parsePolicy(fixture), 3001, "write")).access, "write");
+  assert.deepEqual(requested, { ...base, issues: "write" });
+
+  fixture.installation_permissions.workflows = "write";
+  responsePermissions = { ...base, issues: "write", metadata: "read", workflows: "write" };
+  assert.equal((await github.mintToken(parsePolicy(fixture), 3001, "write")).access, "write");
+  assert.deepEqual(requested, { ...base, issues: "write", workflows: "write" });
+
+  // Declared but missing from GitHub's answer is refused.
+  responsePermissions = { ...base, metadata: "read", workflows: "write" };
+  await assert.rejects(
+    () => github.mintToken(parsePolicy(fixture), 3001, "write"),
+    /outside the requested repository or permission scope/,
+  );
+
+  // An issues permission declared only as read is not the accepted write permission.
+  fixture.installation_permissions.issues = "read";
+  responsePermissions = { ...base, metadata: "read", workflows: "write" };
+  await github.mintToken(parsePolicy(fixture), 3001, "write");
   assert.deepEqual(requested, { ...base, workflows: "write" });
 });
 
-test("the read tier asks for contents: read, adds issues: write only when declared, and nothing else", async () => {
+test("the read tier asks for contents, pull request and check reads, adds issues: write only when declared, and nothing else", async () => {
   const now = 1_700_000_000_000;
   let requests = 0;
   let requested;
@@ -681,39 +730,44 @@ test("the read tier asks for contents: read, adds issues: write only when declar
     now: () => now,
   });
 
+  const readBase = { checks: "read", contents: "read", pull_requests: "read" };
+
   // Base policy: no issues accepted. A workflows acceptance never leaks into the read tier.
   const fixture = policyFixture();
   fixture.installation_permissions.workflows = "write";
   const withoutIssues = parsePolicy(fixture);
-  responsePermissions = { contents: "read", metadata: "read" };
+  responsePermissions = { ...readBase, metadata: "read" };
   assert.deepEqual(await github.mintToken(withoutIssues, 3004, "read"), {
     token: "ghs_scoped_synthetic_token",
     expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
     repository_id: 3004,
     access: "read",
   });
-  assert.deepEqual(requested, { contents: "read" });
+  assert.deepEqual(requested, readBase);
 
   fixture.installation_permissions.issues = "write";
   const withIssues = parsePolicy(fixture);
-  responsePermissions = { contents: "read", issues: "write", metadata: "read" };
+  responsePermissions = { ...readBase, issues: "write", metadata: "read" };
   assert.equal((await github.mintToken(withIssues, 3004, "read")).access, "read");
-  assert.deepEqual(requested, { contents: "read", issues: "write" });
+  assert.deepEqual(requested, { ...readBase, issues: "write" });
 
   // An issues permission declared only as read is not the accepted write permission.
   fixture.installation_permissions.issues = "read";
-  responsePermissions = { contents: "read", metadata: "read" };
+  responsePermissions = { ...readBase, metadata: "read" };
   await github.mintToken(parsePolicy(fixture), 3004, "read");
-  assert.deepEqual(requested, { contents: "read" });
+  assert.deepEqual(requested, readBase);
 
-  // Any write beyond the requested read set, or a missing issues grant, is refused.
+  // Any write or read beyond the requested set, a missing read, or an undeclared issues grant is refused.
   for (const permissions of [
-    { contents: "write", metadata: "read" },
-    { contents: "read", metadata: "read", pull_requests: "write" },
-    { contents: "read", metadata: "read", actions: "write" },
-    { contents: "read", metadata: "read", checks: "read" },
-    { contents: "read", metadata: "read", workflows: "write" },
-    { contents: "read", issues: "write", metadata: "read" },
+    { ...readBase, contents: "write", metadata: "read" },
+    { ...readBase, pull_requests: "write", metadata: "read" },
+    { ...readBase, checks: "write", metadata: "read" },
+    { ...readBase, actions: "read", metadata: "read" },
+    { ...readBase, actions: "write", metadata: "read" },
+    { ...readBase, workflows: "write", metadata: "read" },
+    { ...readBase, issues: "write", metadata: "read" },
+    { contents: "read", pull_requests: "read", metadata: "read" },
+    { checks: "read", contents: "read", metadata: "read" },
   ]) {
     responsePermissions = permissions;
     await assert.rejects(
@@ -722,7 +776,7 @@ test("the read tier asks for contents: read, adds issues: write only when declar
       JSON.stringify(permissions),
     );
   }
-  responsePermissions = { contents: "read", metadata: "read" };
+  responsePermissions = { ...readBase, metadata: "read" };
   await assert.rejects(
     () => github.mintToken(withIssues, 3004, "read"),
     /outside the requested repository or permission scope/,
@@ -1411,8 +1465,9 @@ test("end to end: a pull or triage grant mints a read-tier token; push mints wri
         assert.equal(json.repository_id, 3001);
         assert.equal(json.repository, "example-org/alpha");
       }
-      // The installation has not accepted issues: write, so the read tier asks for contents only.
-      assert.deepEqual(scopedMints, [{ contents: "read" }, { contents: "read" }]);
+      // The installation has not accepted issues: write, so the read tier asks for reads only.
+      const readSet = { checks: "read", contents: "read", pull_requests: "read" };
+      assert.deepEqual(scopedMints, [readSet, readSet]);
 
       // Cross-Workspace: beta's Team holds nothing on alpha, whatever alpha's Team holds.
       const crossWorkspace = await request(origin, {
@@ -1498,7 +1553,7 @@ test("policy check --live lists live Team grants as information and fails only o
     [
       "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
       "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write pull_requests=write",
-      "read tier (pull/triage grant) asks for: contents=read",
+      "read tier (pull/triage grant) asks for: checks=read contents=read pull_requests=read",
       "WORKSPACE   TEAM_ID  TEAM_SLUG",
       "alpha-team  4001     alpha-team",
       "beta-team   4002     -",

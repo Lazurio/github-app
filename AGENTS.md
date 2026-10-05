@@ -16,11 +16,11 @@ dependency-light and customer-neutral.
 4. A token is limited to one repository and to exactly one of two permission
    sets (plus GitHub's automatic `metadata: read`), and expires on GitHub's
    installation-token schedule. The write tier is `actions: write`,
-   `checks: read`, `contents: write` and `pull_requests: write`, plus
-   `workflows: write` only when the reviewed policy declares that the
-   installation accepted it. The read tier is `contents: read`, plus
-   `issues: write` only when the reviewed policy declares that the
-   installation accepted it. A mint without an explicit tier fails.
+   `checks: read`, `contents: write` and `pull_requests: write`. The read tier
+   is `checks: read`, `contents: read` and `pull_requests: read`. Each tier
+   adds `issues: write`, and the write tier `workflows: write`, only when the
+   reviewed policy declares that the installation accepted that permission. A
+   mint without an explicit tier fails.
 5. Workspace credentials and installation tokens are never logged, committed,
    stored in Git configuration or persisted by this service.
 6. The broker authorizes a Workspace and repository, never a browser user.
@@ -46,7 +46,8 @@ operator documentation; never describe the token as rerun-only.
 that can open an issue. It also authorizes editing, labelling, closing,
 reopening and commenting on existing issues of the same repository. Never
 describe a read-tier token with `issues: write` as read-only or as able only
-to create issues.
+to create issues, and never describe a read-tier token as able to read
+GitHub Actions data: it asks for no `actions` access.
 
 Use an isolated worktree and pull request for every change. Code, comments,
 commits and pull-request descriptions are English. Run `npm test` and

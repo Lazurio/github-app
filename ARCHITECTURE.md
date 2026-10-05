@@ -41,10 +41,10 @@ GitHub to mint a new one-repository token with exactly the permission set of
 its tier, and refuses a response with any other scope or any other repository:
 
 - write tier: `actions: write`, `checks: read`, `contents: write` and
-  `pull_requests: write`, plus `workflows: write` when the policy declares
-  that the installation accepted it;
-- read tier: `contents: read`, plus `issues: write` when the policy declares
-  that the installation accepted it.
+  `pull_requests: write`, plus `workflows: write` and `issues: write` each
+  when the policy declares that the installation accepted it;
+- read tier: `checks: read`, `contents: read` and `pull_requests: read`, plus
+  `issues: write` when the policy declares that the installation accepted it.
 
 GitHub adds `metadata: read` to both. There is no default tier: a mint without
 an explicit tier fails before reaching GitHub, so a lost tier can never become
@@ -61,18 +61,24 @@ grant on exactly that repository and no Checks write access.
 
 The read tier exists so an Organization can keep some repositories read-only
 for a Team without cutting that Team's Environment off them. A read-tier token
-clones, fetches and reads one repository and receives no contents, pull
-request, Actions, Checks or workflow write and no Checks or Actions read.
-`issues: write` is the only write it can carry, so that an Agent without write
-access can propose a change as an issue the way a person with read access
-does. GitHub has no create-only issue permission: the same permission lets the
-token edit, label, close, reopen and comment on existing issues of that
-repository, which is closer to the `triage` role for issues than to read
-access. An Organization opts into that by accepting the App permission and
-declaring it in its reviewed policy; without it the read tier only reads.
-`triage` maps to the same read tier as `pull`, because the permission that
-would add pull request triage, `pull_requests: write`, also opens and edits
-pull requests.
+clones, fetches and reads one repository and lists and views its pull requests
+and check runs, so people in a read-only Environment see pull requests and CI.
+It receives no contents, pull request, Checks, Actions or workflow write and
+no Actions read; GitHub CLI views that also ask for the workflow run behind an
+Actions check therefore can fail under the read tier. `issues: write` is the
+only write it can carry, so that an Agent without write access can propose a
+change as an issue the way a person with read access does. GitHub has no
+create-only issue permission: the same permission lets the token edit, label,
+close, reopen and comment on existing issues of that repository, which is
+closer to the `triage` role for issues than to read access. `triage` maps to
+the same read tier as `pull`, because the permission that would add pull
+request triage, `pull_requests: write`, also opens and edits pull requests.
+
+`issues: write` is one opt-in for both tiers. An Organization opts in by
+accepting the App permission and declaring it in its reviewed policy; then a
+write-tier token also carries it, so a write-capable Environment can file the
+escalation issues its work asks for. Without the declaration neither tier asks
+for `issues` and the write tier is exactly its previous set.
 
 `workflows: write` lets a Workspace push commits that change
 `.github/workflows/`. Editing a workflow does not by itself run it or hand it
@@ -84,7 +90,7 @@ approval). That is the same capability a Team member with a write grant
 already has from GitHub, and an Organization opts into it by accepting the
 App permission and declaring it in its reviewed policy. A policy without it
 mints the base set, so the release can roll out before any Organization
-accepts. The same holds for `issues: write` in the read tier.
+accepts. The same holds for `issues: write` in both tiers.
 
 ## Team binding and live grant verification
 
