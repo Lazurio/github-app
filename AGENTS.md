@@ -13,15 +13,19 @@ dependency-light and customer-neutral.
    request and never cached; a name never selects a different object than the
    id GitHub returns for it.
 3. The App private key never leaves the broker workload.
-4. A token is limited to one repository and to exactly one of two permission
-   sets (plus GitHub's automatic `metadata: read`), and expires on GitHub's
+4. A token is limited to one repository and to the exact permission set of
+   one of two tiers (plus GitHub's automatic `metadata: read`), and expires on GitHub's
    installation-token schedule. The write tier is `actions: write`,
    `checks: read`, `contents: write`, `members: read` and
    `pull_requests: write`. The read tier is `actions: read`, `checks: read`,
    `contents: read`, `members: read` and `pull_requests: read`. Each tier
    adds `issues: write`, and the write tier `workflows: write`, only when the
    reviewed policy declares that the installation accepted that permission. A
-   mint without an explicit tier fails.
+   Workspace whose policy declares `permission_ceiling: "read"` mints only the
+   read tier with every permission lowered to `read`, so its tokens write
+   nothing on GitHub. A mint without an explicit tier or a Workspace of the
+   policy fails, and so does any set that asks for a permission or level the
+   installation has not accepted.
 5. Workspace credentials and installation tokens are never logged, committed,
    stored in Git configuration or persisted by this service.
 6. The broker authorizes a Workspace and repository, never a browser user.
@@ -32,8 +36,10 @@ dependency-light and customer-neutral.
    token issuance verifies live that the Team exists and holds a grant on the
    exact repository, failing closed with `team_grant_missing`. The grant's
    role selects the tier: `push`, `maintain` or `admin` mints the write tier,
-   `pull` or `triage` the read tier. The live Team grant is the scope: the
-   policy holds no repository list or tier and never narrows or widens it.
+   `pull` or `triage` the read tier; a Workspace's read ceiling turns every
+   usable grant into the read tier and never creates access. The live Team
+   grant is the scope: the policy holds no repository list or tier and never
+   narrows or widens which repositories it reaches.
    Nothing from that readback is cached; the policy, the Dashboard and any
    derived mapping are reviewed inputs, never a second ACL.
 

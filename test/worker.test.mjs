@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 
-import { RepositoryDeniedError, TeamGrantError } from "../src/core.mjs";
+import { RepositoryDeniedError, TeamGrantError, createGithubClient } from "../src/core.mjs";
 import {
   createWorkerEntrypoint,
   createWorkerJwtSigner,
@@ -84,7 +84,7 @@ function workerFixture({ teamGrant = grantedAlpha, workspaceTeam = provenTeam } 
         calls.order.push("workspace-team");
         return workspaceTeam(policy, workspace);
       },
-      async mintToken(_policy, repositoryId, access) {
+      async mintToken(_policy, _workspace, repositoryId, access) {
         calls.mint += 1;
         calls.order.push("mint");
         calls.tiers.push(access);
@@ -447,4 +447,64 @@ test("Worker /v1/workspace refuses bad credentials without GitHub, drift with 40
   const wrongTeam = workerFixture({ workspaceTeam: async () => ({ id: 4999, slug: "other" }) });
   const mismatch = await wrongTeam.worker.fetch(workspaceRequest(), environment());
   assert.equal(mismatch.status, 502);
+});
+
+test("Worker with the real core: a read-ceiling Workspace mints only reads; the other Workspace keeps its tiers", async () => {
+  const fixture = policyFixture();
+  fixture.installation_permissions = { ...fixture.installation_permissions, issues: "write", workflows: "write" };
+  fixture.workspaces[0].permission_ceiling = "read";
+  // Both Teams hold push on alpha; only the Workspace without a ceiling may use it.
+  const scopedMints = [];
+  const github = async (url, init) => {
+    const path = new URL(url).pathname;
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    if (path === "/app/installations/2001" && init.method === "GET") {
+      return Response.json({
+        app_id: 42,
+        app_slug: "example-app",
+        account: { id: 1001, login: "example-org" },
+        target_type: "Organization",
+        repository_selection: "selected",
+        permissions: fixture.installation_permissions,
+      });
+    }
+    if (path === "/app/installations/2001/access_tokens" && !body.repository_ids) return Response.json({ token: "ghs_probe" });
+    if (path === "/app/installations/2001/access_tokens") {
+      scopedMints.push(body.permissions);
+      return Response.json({
+        token: "ghs_scoped_synthetic",
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: 3001 }],
+        permissions: { ...body.permissions, metadata: "read" },
+      });
+    }
+    const team = path.match(/^\/organizations\/1001\/team\/(4001|4002)$/);
+    if (team) return Response.json({ id: Number(team[1]), slug: `team-${team[1]}`, organization: { id: 1001, login: "example-org" } });
+    if (/^\/organizations\/1001\/team\/400[12]\/repos\/example-org\/alpha$/.test(path)) {
+      return Response.json({ id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions: { pull: true, push: true } });
+    }
+    if (path === "/installation/token" && init.method === "DELETE") return new Response(null, { status: 204 });
+    throw new Error(`unexpected request ${init.method} ${path}`);
+  };
+  const worker = createWorkerEntrypoint({
+    createGithub: ({ appId }) => createGithubClient({ appId, signJwt: async () => "c2lnbmF0dXJl", fetchImpl: github }),
+  });
+  const env = environment({ BROKER_POLICY_JSON: JSON.stringify(fixture) });
+
+  const capped = await worker.fetch(tokenRequest(), env);
+  assert.equal(capped.status, 200);
+  assert.equal((await capped.json()).access, "read");
+  const uncapped = await worker.fetch(tokenRequest({ workspace: "beta-team", credential: BETA_CREDENTIAL }), env);
+  assert.equal(uncapped.status, 200);
+  assert.equal((await uncapped.json()).access, "write");
+  assert.deepEqual(scopedMints, [
+    { actions: "read", checks: "read", contents: "read", issues: "read", members: "read", pull_requests: "read" },
+    { actions: "write", checks: "read", contents: "write", issues: "write", members: "read", pull_requests: "write", workflows: "write" },
+  ]);
+
+  // An unsupported ceiling value is a configuration error, never an ignored key.
+  fixture.workspaces[0].permission_ceiling = "none";
+  const invalid = await worker.fetch(tokenRequest(), environment({ BROKER_POLICY_JSON: JSON.stringify(fixture) }));
+  assert.equal(invalid.status, 503);
+  assert.deepEqual(await invalid.json(), { error: "configuration_unavailable" });
 });
