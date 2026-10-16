@@ -8,15 +8,19 @@ predeclared Team Workspaces. Its deployment-owned policy binds:
 - one immutable GitHub Organization id and asserted login;
 - one installation id, its repository selection mode and the exact accepted
   permission set; and
-- each immutable Workspace id to exactly one immutable GitHub Team id and a
-  separate deployment credential reference.
+- each immutable Workspace id to exactly one immutable GitHub Team id, a
+  separate deployment credential reference and an optional read permission
+  ceiling.
 
 The policy names no repositories and no access tiers. The scope of a
 Workspace is the live GitHub Team grant: the repositories of the policy's
 Organization on which the Workspace's Team holds any repository grant at the
 moment of a request, and the grant's role selects the tier. A `push`,
 `maintain` or `admin` grant mints the write tier; a `pull` or `triage` grant
-mints the read tier. The policy no longer narrows below GitHub. An
+mints the read tier. The policy never narrows the scope below GitHub. Its
+only narrowing is the optional per-Workspace `permission_ceiling: "read"`,
+described below, which lowers the permissions of that Workspace's tokens and
+never changes which repositories it reaches. An
 Organization that wants a narrower scope for a Team Environment does it with
 GitHub Team grants: it grants that Team only the repositories the Environment
 should reach, at the role it should have, or binds the Environment to a
@@ -45,7 +49,15 @@ its tier, and refuses a response with any other scope or any other repository:
   when the policy declares that the installation accepted it;
 - read tier: `actions: read`, `checks: read`, `contents: read`,
   `members: read` and `pull_requests: read`, plus `issues: write` when the
-  policy declares that the installation accepted it.
+  policy declares that the installation accepted it;
+- read tier of a Workspace with `permission_ceiling: "read"`: the read tier
+  with every permission lowered to `read`, so an accepted `issues: write`
+  becomes `issues: read`.
+
+Before asking GitHub, the runtime refuses any set that asks for a permission
+or level the installation has not accepted, and any write tier for a
+Workspace with a read ceiling; the installation gate itself stays an exact
+comparison.
 
 GitHub adds `metadata: read` to both. `members: read` lets an Environment
 list the Organization Owners it mentions in an issue; GitHub answers that list
@@ -86,6 +98,19 @@ write-tier token also carries it, so a write-capable Environment can file the
 escalation issues its work asks for. Without the declaration neither tier asks
 for `issues` and the write tier is exactly its previous set.
 
+Because the accepted Issues permission is Organization-wide and the
+installation gate compares it exactly, a Workspace that must write nothing on
+GitHub (for example a shared visitor Environment) cannot be read-only by
+leaving `issues` out of the policy. It declares `permission_ceiling: "read"`
+instead. Its Team gate then selects the read tier for every usable grant,
+including `push`, `maintain` and `admin`, so a grant raised later on GitHub
+still mints only reads, and its read tier asks for each permission at `read`.
+A missing grant is refused as without a ceiling: the ceiling never creates
+access. A Workspace without the key mints exactly what it minted before the
+ceiling existed. A broker that predates the key would accept such a policy
+and mint the uncapped tiers, so a policy with a ceiling must only be deployed
+to a broker that understands it.
+
 `workflows: write` lets a Workspace push commits that change
 `.github/workflows/`. Editing a workflow does not by itself run it or hand it
 secrets, but a workflow it writes can, in an eligible run, reference and
@@ -110,7 +135,8 @@ different Team for the broker.
 
 The live GitHub Team-to-repository grants are the only grant authority and the
 whole scope: the policy never grants anything GitHub has not granted and never
-narrows what GitHub has granted. A request names its repository either as
+narrows which repositories GitHub has granted; a read ceiling only lowers the
+tier. A request names its repository either as
 `Owner/name` or, for adapters released before `0.10.0`, as an immutable id. A
 name whose owner is not the policy's Organization login is refused with
 `403 repository_denied` before any GitHub traffic. Otherwise, after the
@@ -123,6 +149,7 @@ the repository-permissions media type, revokes the probe, and only then mints
 the one-repository token of the grant's tier for the repository id GitHub
 returned. The returned `owner.id` must equal the policy's Organization id.
 `admin`, `maintain` or `push` selects the write tier, `triage` or `pull` the
+read tier, and a Workspace's read ceiling turns every one of them into the
 read tier. A missing Team, an identity that differs from the policy
 assertions, a missing grant or one without any of these roles, a repository
 the installation cannot see or, for the id form, a returned id that differs
@@ -156,8 +183,10 @@ service for other Workspaces; it is refused per request.
 
 `policy check --live` runs the installation gate and then, per Workspace,
 verifies the Team identity and lists the Team's live repository grants with
-the tier each one mints. Without `--live` it prints the exact permission set
-each tier asks for under the policy. It is the migration and readback gate an
+the tier each one mints, after any read ceiling, next to the live role.
+Without `--live` it prints the exact permission set each tier asks for under
+the policy and, when a Workspace declares a read ceiling, that set and a
+`CEILING` column. It is the migration and readback gate an
 operator runs before deploying a policy or lowering Team grants. The
 repository rows are information; the command exits non-zero only on a missing
 or drifted Team or installation drift, and its rows never contain a token or

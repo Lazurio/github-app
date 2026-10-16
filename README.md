@@ -15,6 +15,11 @@ repository selects one of two exact permission sets:
   `contents: read`, `members: read` plus `pull_requests: read`, and
   `issues: write` where the Organization's policy declares it.
 
+A Workspace whose policy entry declares `permission_ceiling: "read"` mints only
+the read tier, for every grant, with each permission lowered to `read` (an
+accepted `issues: write` becomes `issues: read`): its tokens carry no GitHub
+write of any kind. See [Read-only Workspaces](#read-only-workspaces-permission_ceiling).
+
 GitHub adds `metadata: read` to every token. Both tiers read Organization
 membership (`members: read`, which the installation already holds for the Team
 gate) so an Environment can find the Organization Owners to mention in an
@@ -46,6 +51,7 @@ Workspace id + Workspace credential + repository (name or id)
     -> live GitHub App installation identity and permissions
     -> live grant of the Workspace's immutable GitHub Team on that repository
        (push/maintain/admin -> write tier, pull/triage -> read tier, none -> refused)
+    -> the Workspace's optional permission ceiling (read: every grant -> read-only set)
     -> one-repository installation token of that tier for the repository id GitHub returned
 ```
 
@@ -59,7 +65,9 @@ Workspace id + Workspace credential + repository (name or id)
   tier. A `push`, `maintain` or `admin` grant mints the write tier; a `pull` or
   `triage` grant mints the read tier. The policy holds no repository list and
   no tier, so it never grants anything GitHub has not granted and never
-  narrows or widens what GitHub has granted. An Organization Admin who grants
+  widens what GitHub has granted. Its only narrowing is the optional
+  per-Workspace read ceiling, which lowers permissions and never changes which
+  repositories a Workspace reaches. An Organization Admin who grants
   a Team access to a new repository, or raises or lowers a grant, changes what
   that Team's Environment can do on the next request, without a broker policy
   change or redeploy.
@@ -81,6 +89,10 @@ Workspace id + Workspace credential + repository (name or id)
   issue permission: `issues: write` also lets the token edit, label, close,
   reopen and comment on existing issues in that repository, which is closer to
   the `triage` role for issues than to a person with read access.
+- A token of a Workspace with `permission_ceiling: "read"` is the read tier
+  with every permission at `read`, whatever the Team's grant: it reads the
+  repository, its pull requests, check runs, workflow runs and, where the
+  Organization accepted Issues, its issues, and writes nothing on GitHub.
 - Immutable ids are the authorization keys: the Workspace id, the Team id, the
   Organization id and the repository id GitHub returns from the live Team
   grant. Repository names are resolved live on every request and never cached.
@@ -152,12 +164,17 @@ Schema v3 binds each Workspace to its GitHub Team and names no repositories:
   `issues`, and the write tier keeps exactly its previous set. See
   [Read-only Team grants](#read-only-team-grants) for the App permission this
   needs.
-- `workspaces[]` has `id`, `github_team_id`, optional `github_team_slug` and
-  `credential_file`. Workspace ids, Team ids and credential files must each be
-  unique, so exactly one broker Workspace exists per Team. The optional slug
-  is a human-readback assertion: when present, the live Team slug must match;
-  a renamed Team fails closed until the policy is reviewed, and the slug never
-  selects a different Team.
+- `workspaces[]` has `id`, `github_team_id`, optional `github_team_slug`,
+  `credential_file` and optional `permission_ceiling`. Workspace ids, Team ids
+  and credential files must each be unique, so exactly one broker Workspace
+  exists per Team. The optional slug is a human-readback assertion: when
+  present, the live Team slug must match; a renamed Team fails closed until
+  the policy is reviewed, and the slug never selects a different Team.
+- `workspaces[].permission_ceiling` is optional and its only value is
+  `"read"`. Absent, the Workspace mints exactly what its live grant selects,
+  as before `0.12.0`. With `"read"` every token of that Workspace is
+  read-only; see [Read-only Workspaces](#read-only-workspaces-permission_ceiling).
+  Any other value, including `null`, is rejected.
 
 `repositories` and `workspaces[].repository_ids` no longer exist. A v3 policy
 that still contains either key is rejected, so a half-migrated policy fails
@@ -248,6 +265,71 @@ cuts the Environment off the repository:
 
 Rolling the broker back to `0.10.0` refuses read-only Teams again with
 `team_grant_missing`; it never widens access.
+
+#### Read-only Workspaces (`permission_ceiling`)
+
+Since `0.12.0` a Workspace can be strictly read-only on GitHub while the
+Organization keeps `issues: write` and the write tier for its other
+Workspaces. The installation's accepted Issues permission is
+Organization-wide and the installation gate compares permissions exactly, so
+the policy cannot leave `issues` out for one Workspace; instead that Workspace
+declares a ceiling:
+
+```json
+{
+  "id": "example-visitors",
+  "github_team_id": 4003,
+  "github_team_slug": "visitors",
+  "credential_file": "/run/secrets/workspace-example-visitors",
+  "permission_ceiling": "read"
+}
+```
+
+For such a Workspace:
+
+- every usable grant (`pull`, `triage`, `push`, `maintain` or `admin`) mints
+  the read tier, so a Team that is later given more than read still gets
+  nothing but reads; `policy check --live` shows the live `ROLE` next to the
+  capped `ACCESS`;
+- the read tier's permissions are each lowered to `read`. With the Organization
+  having accepted Issues the token asks for `actions: read`, `checks: read`,
+  `contents: read`, `issues: read`, `members: read` and `pull_requests: read`
+  (plus GitHub's automatic `metadata: read`); without it, the plain read tier.
+  GitHub answers `403` to any write, including opening, editing, closing or
+  commenting on issues;
+- no grant, a missing or drifted Team and a foreign owner are refused exactly
+  as without a ceiling. The ceiling never creates access and never changes
+  which repositories the Workspace reaches; the live Team grant still decides.
+
+The ceiling fails closed on every path: a mint of the write tier for such a
+Workspace is refused before GitHub is asked, a mint without a Workspace of the
+policy is refused, and any token permission set (with or without a ceiling)
+that asks for a permission or level the installation has not accepted is
+refused before the request instead of relying on GitHub to narrow it. The
+installation gate itself is unchanged.
+
+Offline `policy check` adds the ceiling's set and a `CEILING` column only when
+a Workspace declares one, so the output of every other policy is unchanged:
+
+```text
+lazurio.github_app_broker.policy.v3 owner=example-org installation=2001
+write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write issues=write members=read pull_requests=write
+read tier (pull/triage grant) asks for: actions=read checks=read contents=read issues=write members=read pull_requests=read
+read ceiling (any grant of a CEILING read Workspace) asks for: actions=read checks=read contents=read issues=read members=read pull_requests=read
+WORKSPACE         TEAM_ID  TEAM_SLUG   CEILING
+alpha-team        4001     alpha-team  -
+example-visitors  4003     visitors    read
+```
+
+**Rollout.** Deploy broker `0.12.0` with the unchanged policy first: without a
+`permission_ceiling` every Workspace mints exactly what it minted under
+`0.11.0`. Then add the ceiling to the Workspaces that must be read-only, run
+`policy check` and deploy the policy. A broker before `0.12.0` does not know
+the key: it accepts such a policy and mints the uncapped tiers. Never deploy a
+policy with a ceiling to an older broker, and never roll a read-only
+Workspace's broker back below `0.12.0` while its credential is in use; rotate
+that Workspace's credential first. A read-only Workspace's adapter needs no
+change.
 
 ### API
 
@@ -447,11 +529,14 @@ Team binding; it needs no key and makes no GitHub call:
 
 ```text
 lazurio.github_app_broker.policy.v3 owner=example-org installation=2001
-write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write issues=write pull_requests=write
-read tier (pull/triage grant) asks for: actions=read checks=read contents=read issues=write pull_requests=read
+write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write issues=write members=read pull_requests=write
+read tier (pull/triage grant) asks for: actions=read checks=read contents=read issues=write members=read pull_requests=read
 WORKSPACE   TEAM_ID  TEAM_SLUG
 alpha-team  4001     alpha-team
 ```
+
+A policy with a [read permission ceiling](#read-only-workspaces-permission_ceiling)
+adds that set and a `CEILING` column.
 
 With `--live` it first performs the same installation verification as
 `--verify-only`, then, with one `members: read` plus `metadata: read` probe
@@ -655,7 +740,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.11.0` |
+| Adapter | `0.12.0` |
 | Cloudflare Wrangler | `4.127.1` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
