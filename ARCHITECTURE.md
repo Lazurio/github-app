@@ -112,13 +112,16 @@ and mint the uncapped tiers, so a policy with a ceiling must only be deployed
 to a broker that understands it.
 
 The ceiling removes write permissions; it cannot remove one capability GitHub
-does not tie to them. GitHub authorizes opening an issue in a public
-repository for any installation token, whatever permissions it asks for and
-whatever repository it is limited to, including public repositories outside
-the installation ([#23](https://github.com/Lazurio/github-app/issues/23)). Commenting on, editing, closing and reopening issues
-stay refused without `issues: write`. No tier or ceiling can refuse issue
-creation in public repositories, so a Workspace used by untrusted people must
-decide at the Workspace whether it receives a token at all.
+did not tie to them in the live check ([#23](https://github.com/Lazurio/github-app/issues/23)). For an installation that accepted
+the Issues permission, GitHub authorized opening an issue in a public
+repository for every installation token tested, whatever permissions it asked
+for and whatever repository it was limited to, including a public repository
+outside the installation. Commenting was refused for all of them, and editing,
+closing and reopening for the read-ceiling token. An installation without the
+Issues permission was not tested. No tier or ceiling the broker can request
+refused issue creation in public repositories there, so a Workspace used by
+untrusted people must decide at the Workspace whether it receives a token at
+all.
 
 `workflows: write` lets a Workspace push commits that change
 `.github/workflows/`. Editing a workflow does not by itself run it or hand it

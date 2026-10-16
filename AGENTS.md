@@ -49,14 +49,15 @@ this permission also authorizes other Actions mutations inside the same exact
 repository. Keep that provider limitation explicit in architecture and
 operator documentation; never describe the token as rerun-only.
 
-`issues: write` is likewise GitHub's smallest installation-token permission
-that can open an issue in a private repository. It also authorizes editing,
-labelling, closing, reopening and commenting on existing issues of the same
-repository. Never describe a read-tier token with `issues: write` as read-only
-or as able only to create issues. GitHub also lets every installation token,
-whatever its permissions and repository, open issues in public repositories
-([#23](https://github.com/Lazurio/github-app/issues/23)): never describe any token, including a read-ceiling token, as unable to
-open issues or as writing nothing on GitHub. The read tier's `actions: read` likewise reads more than
+`issues: write` is likewise the installation-token permission GitHub documents
+for opening an issue. It also authorizes editing, labelling, closing, reopening
+and commenting on existing issues of the same repository. Never describe a
+read-tier token with `issues: write` as read-only or as able only to create
+issues. For an installation that accepted the Issues permission, GitHub also
+let every token tested, whatever its permissions and repository, open issues in
+public repositories ([#23](https://github.com/Lazurio/github-app/issues/23)): never describe a token of such an installation,
+including a read-ceiling token, as unable to open issues or as writing nothing
+on GitHub. The read tier's `actions: read` likewise reads more than
 check status: it also reads the repository's workflow run logs and artifacts.
 
 Use an isolated worktree and pull request for every change. Code, comments,
