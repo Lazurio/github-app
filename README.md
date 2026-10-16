@@ -17,8 +17,14 @@ repository selects one of two exact permission sets:
 
 A Workspace whose policy entry declares `permission_ceiling: "read"` mints only
 the read tier, for every grant, with each permission lowered to `read` (an
-accepted `issues: write` becomes `issues: read`): its tokens carry no GitHub
-write of any kind. See [Read-only Workspaces](#read-only-workspaces-permission_ceiling).
+accepted `issues: write` becomes `issues: read`): its tokens carry no write
+permission. See [Read-only Workspaces](#read-only-workspaces-permission_ceiling).
+
+**Provider limitation.** GitHub lets every installation token open an issue in
+a public repository, whatever permissions it asks for and whatever repository
+it is limited to, including public repositories outside the installation. No
+tier, ceiling or permission set can refuse it; see
+[Opening issues in public repositories](#opening-issues-in-public-repositories).
 
 GitHub adds `metadata: read` to every token. Both tiers read Organization
 membership (`members: read`, which the installation already holds for the Team
@@ -92,7 +98,9 @@ Workspace id + Workspace credential + repository (name or id)
 - A token of a Workspace with `permission_ceiling: "read"` is the read tier
   with every permission at `read`, whatever the Team's grant: it reads the
   repository, its pull requests, check runs, workflow runs and, where the
-  Organization accepted Issues, its issues, and writes nothing on GitHub.
+  Organization accepted Issues, its issues. GitHub refuses its edits,
+  comments, closing and reopening of issues and every other write the read
+  tier refuses, but still lets it open issues in public repositories.
 - Immutable ids are the authorization keys: the Workspace id, the Team id, the
   Organization id and the repository id GitHub returns from the live Team
   grant. Repository names are resolved live on every request and never cached.
@@ -209,7 +217,9 @@ the Team's Environment off the repository completely.
 
 The read tier reads contents, pull requests, check runs and GitHub Actions
 workflow runs, so people in a read-only Environment see pull requests and CI
-results, but it writes nothing except, where declared, issues.
+results, but it writes nothing except, where declared, issues. Like every
+installation token it can also open issues in public repositories (see
+[Opening issues in public repositories](#opening-issues-in-public-repositories)).
 
 `triage` maps to the same read tier as `pull`. The installation permission
 that would add pull request triage is `pull_requests: write`, which also lets a
@@ -295,8 +305,9 @@ For such a Workspace:
   having accepted Issues the token asks for `actions: read`, `checks: read`,
   `contents: read`, `issues: read`, `members: read` and `pull_requests: read`
   (plus GitHub's automatic `metadata: read`); without it, the plain read tier.
-  GitHub answers `403` to any write, including opening, editing, closing or
-  commenting on issues;
+  GitHub answers `403` to editing, closing, reopening, labelling or
+  commenting on issues and to every write the read tier refuses. Opening a new
+  issue in a public repository is the exception below;
 - no grant, a missing or drifted Team and a foreign owner are refused exactly
   as without a ceiling. The ceiling never creates access and never changes
   which repositories the Workspace reaches; the live Team grant still decides.
@@ -307,6 +318,26 @@ policy is refused, and any token permission set (with or without a ceiling)
 that asks for a permission or level the installation has not accepted is
 refused before the request instead of relying on GitHub to narrow it. The
 installation gate itself is unchanged.
+
+#### Opening issues in public repositories
+
+GitHub authorizes opening an issue in a public repository for any installation
+token of the App, whatever permissions the token asks for and whatever
+repository it is limited to ([#23](https://github.com/Lazurio/github-app/issues/23)). Observed against an installation that
+accepted the Issues permission: a token with only `metadata: read`, limited to
+one public repository, passed authorization for `POST /repos/{owner}/{repo}/issues`
+in that repository, in another public repository of the installation and in a
+public repository of an unrelated owner; with a title it opened the issue as
+the App's bot. GitHub sends `X-Accepted-GitHub-Permissions: issues=write` on
+that response but does not enforce it. Commenting on, editing, labelling,
+closing and reopening existing issues stay refused without `issues: write`.
+An installation that has not accepted the Issues permission was not tested.
+
+A read ceiling therefore removes every write permission, not this capability.
+A Workspace used by untrusted people cannot be made unable to open issues
+through the broker's tokens; decide that at the Workspace (for example, do not
+give a Workspace that only reads public repositories any token, since public
+repositories need none), not by policy.
 
 Offline `policy check` adds the ceiling's set and a `CEILING` column only when
 a Workspace declares one, so the output of every other policy is unchanged:
