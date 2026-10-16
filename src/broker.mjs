@@ -7,6 +7,7 @@ import http from "node:http";
 import {
   MAX_BODY_BYTES,
   READ_ACCESS,
+  READ_CEILING,
   WRITE_ACCESS,
   checkPolicyLive,
   createBrokerHandler,
@@ -161,21 +162,33 @@ function formatPermissions(permissions) {
 
 /**
  * Offline summary of the parsed Team binding and of the exact permission set each access tier
- * mints under this policy; no GitHub traffic and no secret.
+ * mints under this policy; no GitHub traffic and no secret. A policy whose Workspaces declare no
+ * permission ceiling prints exactly the two tier lines; a read ceiling adds the one set every
+ * grant of such a Workspace mints and a CEILING column.
  */
 export function formatPolicySummary(policy) {
-  const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG"];
+  const uncapped = policy.workspaces.find((workspace) => workspace.permission_ceiling === undefined);
+  const capped = policy.workspaces.find((workspace) => workspace.permission_ceiling === READ_CEILING);
+  const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG", ...(capped ? ["CEILING"] : [])];
   const rows = policy.workspaces.map((workspace) => [
     workspace.id,
     String(workspace.github_team_id),
     workspace.github_team_slug ?? "-",
+    ...(capped ? [workspace.permission_ceiling ?? "-"] : []),
   ]);
   const widths = header.map((title, column) => Math.max(title.length, ...rows.map((row) => row[column].length)));
   const line = (values) => values.map((value, column) => value.padEnd(widths[column])).join("  ").trimEnd();
   return [
     `${policy.schema_version} owner=${policy.github_owner.login} installation=${policy.installation_id}`,
-    `write tier (push/maintain/admin grant) asks for: ${formatPermissions(tokenPermissions(policy, WRITE_ACCESS))}`,
-    `read tier (pull/triage grant) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS))}`,
+    ...(uncapped
+      ? [
+          `write tier (push/maintain/admin grant) asks for: ${formatPermissions(tokenPermissions(policy, WRITE_ACCESS, uncapped))}`,
+          `read tier (pull/triage grant) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, uncapped))}`,
+        ]
+      : []),
+    ...(capped
+      ? [`read ceiling (any grant of a CEILING read Workspace) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, capped))}`]
+      : []),
     line(header),
     ...rows.map(line),
   ].join("\n") + "\n";

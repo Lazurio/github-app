@@ -8,7 +8,7 @@ const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
 const V3_MIGRATION =
   "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.11.0";
+const USER_AGENT = "lazurio-github-app-broker/0.12.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
@@ -47,28 +47,62 @@ const READ_TOKEN_PERMISSIONS = Object.freeze({
   pull_requests: "read",
 });
 
+/** The only `workspaces[].permission_ceiling` value: every token of the Workspace is read-only. */
+export const READ_CEILING = "read";
+
+const PERMISSION_LEVELS = Object.freeze({ read: 1, write: 2 });
+
 /**
- * The exact permission set a token of `access` asks GitHub for under `policy`. Two opt-ins follow
- * the permissions the Organization accepted and the reviewed policy declares, so a deployment
- * whose installation has not accepted them keeps minting the base sets:
+ * The exact permission set a token of `access` asks GitHub for under `policy` for `workspace`, which
+ * must be a Workspace of that policy. Two opt-ins follow the permissions the Organization accepted
+ * and the reviewed policy declares, so a deployment whose installation has not accepted them keeps
+ * minting the base sets:
  * - `workflows: write` (write tier only) lets a push touch `.github/workflows/`;
  * - `issues: write` (both tiers) is GitHub's smallest installation permission that can open an
  *   issue, so an Environment can propose a change or escalate through an issue.
+ *
+ * A Workspace with `permission_ceiling: "read"` mints only the read tier, with every permission
+ * lowered to `read`: an accepted `issues: write` becomes `issues: read`, so its tokens carry no
+ * write of any kind. A write tier for such a Workspace is refused, never silently lowered here; the
+ * Team gate already selects the read tier for it. Any set that asks for a permission or level the
+ * installation has not accepted is refused before GitHub is asked.
  */
-export function tokenPermissions(policy, access) {
+export function tokenPermissions(policy, access, workspace) {
+  if (!policy.workspaces.includes(workspace)) fail("token permissions need a Workspace of the policy");
   const accepted = policy.installation_permissions;
   const issues = accepted.issues === "write" ? { issues: "write" } : {};
+  let permissions;
   if (access === WRITE_ACCESS) {
+    if (workspace.permission_ceiling === READ_CEILING) {
+      fail(`Workspace ${workspace.id} permission ceiling is read; it never mints the write tier`);
+    }
     const workflows = accepted.workflows === "write" ? { workflows: "write" } : {};
-    return Object.freeze({ ...WRITE_TOKEN_PERMISSIONS, ...workflows, ...issues });
+    permissions = { ...WRITE_TOKEN_PERMISSIONS, ...workflows, ...issues };
+  } else if (access === READ_ACCESS) {
+    permissions = { ...READ_TOKEN_PERMISSIONS, ...issues };
+    // The read tier holds no write-only permission, so lowering each write to read keeps every key.
+    if (workspace.permission_ceiling === READ_CEILING) {
+      permissions = Object.fromEntries(Object.keys(permissions).map((permission) => [permission, "read"]));
+    }
+  } else {
+    fail("token access tier must be read or write");
   }
-  if (access === READ_ACCESS) return Object.freeze({ ...READ_TOKEN_PERMISSIONS, ...issues });
-  fail("token access tier must be read or write");
+  for (const [permission, level] of Object.entries(permissions)) {
+    if (!(PERMISSION_LEVELS[accepted[permission]] >= PERMISSION_LEVELS[level])) {
+      fail(`token asks for ${permission}: ${level}, which the installation has not accepted`);
+    }
+  }
+  return Object.freeze(permissions);
 }
 
-/** Maps a live Team grant role to its access tier; undefined means no usable grant. */
-function grantAccess(role) {
-  if (role === "admin" || role === "maintain" || role === "write") return WRITE_ACCESS;
+/**
+ * Maps a live Team grant role to the access tier it mints for `workspace`; undefined means no usable
+ * grant. A Workspace with a read permission ceiling gets the read tier for every usable grant, so a
+ * Team that is later given push still mints nothing but reads.
+ */
+function grantAccess(role, workspace) {
+  const ceiling = workspace.permission_ceiling === READ_CEILING;
+  if (role === "admin" || role === "maintain" || role === "write") return ceiling ? READ_ACCESS : WRITE_ACCESS;
   if (role === "triage" || role === "read") return READ_ACCESS;
   return undefined;
 }
@@ -247,11 +281,17 @@ export function parsePolicy(raw) {
     ) {
       fail(`workspaces[${index}].credential_file must be a canonical file below /run/secrets`);
     }
+    // Optional and absent by default: a Workspace without it mints exactly what its live grant selects.
+    const ceiling = workspace?.permission_ceiling;
+    if (ceiling !== undefined && ceiling !== READ_CEILING) {
+      fail(`workspaces[${index}].permission_ceiling must be "${READ_CEILING}" when present`);
+    }
     return Object.freeze({
       id,
       github_team_id: teamId,
       ...(teamSlug === undefined ? {} : { github_team_slug: teamSlug }),
       credential_file: credentialFile,
+      ...(ceiling === undefined ? {} : { permission_ceiling: ceiling }),
     });
   });
   if (new Set(workspaces.map(({ id }) => id)).size !== workspaces.length) {
@@ -439,7 +479,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       deny(`repository ${coordinate.full_name} belongs to another owner than the policy's Organization`);
     }
     const role = grantRole(grant?.permissions);
-    const access = grantAccess(role);
+    const access = grantAccess(role, workspace);
     const returned = parseRepositoryCoordinate(grant?.full_name);
     if (
       grant?.owner?.id !== policy.github_owner.id ||
@@ -520,7 +560,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
         if (!Array.isArray(repositories)) fail("GitHub returned an invalid Team repository list");
         for (const repository of repositories) {
           const role = grantRole(repository?.permissions);
-          const access = grantAccess(role);
+          const access = grantAccess(role, workspace);
           const coordinate = parseRepositoryCoordinate(repository?.full_name);
           if (
             repository?.owner?.id !== policy.github_owner.id ||
@@ -566,11 +606,12 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
   }
 
   /**
-   * Mints the one-repository token of the `access` tier the live Team gate resolved. The tier is
-   * required: there is no default, so a caller that lost the tier can never mint the write set.
+   * Mints the one-repository token of the `access` tier the live Team gate resolved for `workspace`.
+   * The tier and the Workspace are required: there is no default, so a caller that lost either can
+   * never mint the write set or skip the Workspace's permission ceiling.
    */
-  async function mintToken(policy, repositoryId, access) {
-    const requested = tokenPermissions(policy, access);
+  async function mintToken(policy, workspace, repositoryId, access) {
+    const requested = tokenPermissions(policy, access, workspace);
     const result = await request(`/app/installations/${policy.installation_id}/access_tokens`, {
       method: "POST",
       body: {
@@ -718,7 +759,7 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       fail("Team gate returned an invalid repository");
     }
     if (access !== WRITE_ACCESS && access !== READ_ACCESS) fail("Team gate returned an invalid access tier");
-    const minted = await github.mintToken(policy, repositoryId, access);
+    const minted = await github.mintToken(policy, workspace, repositoryId, access);
     if (minted?.repository_id !== repositoryId) fail("minted token is outside the verified repository");
     if (minted?.access !== access) fail("minted token is outside the verified access tier");
     return result(200, {

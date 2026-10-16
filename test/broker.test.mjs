@@ -15,6 +15,7 @@ import {
   parsePolicy,
   startBroker,
 } from "../src/broker.mjs";
+import { tokenPermissions } from "../src/core.mjs";
 
 const secretByPath = new Map([
   ["/run/secrets/workspace-alpha", "alpha-secret-value-with-at-least-32-bytes"],
@@ -84,7 +85,7 @@ const grantedTeam = async (_policy, workspace, target) => {
 };
 
 /** Synthetic mint that honours the requested repository and access tier. */
-const syntheticMint = async (_policy, repositoryId, access) => ({
+const syntheticMint = async (_policy, _workspace, repositoryId, access) => ({
   token: `ghs_synthetic_${repositoryId}`,
   expires_at: "2030-01-01T00:00:00Z",
   repository_id: repositoryId,
@@ -187,9 +188,9 @@ test("mints the read tier for a read-granted repository and says so in the respo
       }
       assert.deepEqual(mints, [[3004, "read"], [3004, "read"]]);
     },
-    async (policy, repositoryId, access) => {
+    async (policy, workspace, repositoryId, access) => {
       mints.push([repositoryId, access]);
-      return syntheticMint(policy, repositoryId, access);
+      return syntheticMint(policy, workspace, repositoryId, access);
     },
   );
 });
@@ -212,7 +213,7 @@ test("fails closed when the Team gate or the mint loses the access tier", async 
     ],
     [
       "mint of another tier",
-      async (policy, repositoryId) => syntheticMint(policy, repositoryId, "write"),
+      async (policy, workspace, repositoryId) => syntheticMint(policy, workspace, repositoryId, "write"),
       async (...args) => ({ ...(await grantedTeam(...args)), access: "read" }),
     ],
   ]) {
@@ -330,7 +331,7 @@ test("does not cache installation tokens between requests", async () => {
       assert.equal((await request(origin)).status, 200);
       assert.equal(calls, 2);
     },
-    async (_policy, repositoryId, access) => {
+    async (_policy, _workspace, repositoryId, access) => {
       calls += 1;
       return {
         token: `ghs_synthetic_${repositoryId}_${calls}`,
@@ -395,6 +396,11 @@ function jsonResponse(body, status = 200) {
     status,
     headers: status === 204 ? undefined : { "Content-Type": "application/json" },
   });
+}
+
+/** Mints through the real client for the policy's first Workspace, which declares no ceiling. */
+function mintForFirstWorkspace(github, policy, repositoryId, access) {
+  return github.mintToken(policy, policy.workspaces[0], repositoryId, access);
 }
 
 function testPrivateKey() {
@@ -553,7 +559,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     fetchImpl,
     now: () => now,
   });
-  assert.deepEqual(await github.mintToken(policy, 3001, "write"), {
+  assert.deepEqual(await mintForFirstWorkspace(github, policy, 3001, "write"), {
     token: "ghs_scoped_synthetic_token",
     expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
     repository_id: 3001,
@@ -568,7 +574,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     pull_requests: "write",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001, "write"),
+    () => mintForFirstWorkspace(github, policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -580,7 +586,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     pull_requests: "write",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001, "write"),
+    () => mintForFirstWorkspace(github, policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -592,7 +598,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     metadata: "read",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001, "write"),
+    () => mintForFirstWorkspace(github, policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -604,7 +610,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     pull_requests: "write",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001, "write"),
+    () => mintForFirstWorkspace(github, policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -618,7 +624,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     pull_requests: "write",
   };
   await assert.rejects(
-    () => github.mintToken(policy, 3001, "write"),
+    () => mintForFirstWorkspace(github, policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 });
@@ -646,7 +652,7 @@ test("asks for workflows: write only when the policy declares the accepted permi
   const withoutWorkflows = parsePolicy(policyFixture());
   responsePermissions = { ...base, metadata: "read", workflows: "write" };
   await assert.rejects(
-    () => github.mintToken(withoutWorkflows, 3001, "write"),
+    () => mintForFirstWorkspace(github, withoutWorkflows, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
   assert.deepEqual(requested, base);
@@ -654,18 +660,18 @@ test("asks for workflows: write only when the policy declares the accepted permi
   const fixture = policyFixture();
   fixture.installation_permissions = { ...fixture.installation_permissions, emails: "read", workflows: "write" };
   const withWorkflows = parsePolicy(fixture);
-  assert.equal((await github.mintToken(withWorkflows, 3001, "write")).repository_id, 3001);
+  assert.equal((await mintForFirstWorkspace(github, withWorkflows, 3001, "write")).repository_id, 3001);
   assert.deepEqual(requested, { ...base, workflows: "write" });
 
   responsePermissions = { ...base, metadata: "read" };
   await assert.rejects(
-    () => github.mintToken(withWorkflows, 3001, "write"),
+    () => mintForFirstWorkspace(github, withWorkflows, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
   responsePermissions = { ...base, metadata: "read", workflows: "write", emails: "read" };
   await assert.rejects(
-    () => github.mintToken(withWorkflows, 3001, "write"),
+    () => mintForFirstWorkspace(github, withWorkflows, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
@@ -694,7 +700,7 @@ test("the write tier adds issues: write only when the policy declares the accept
   // Not declared: the write tier stays the base set and refuses an issues grant it did not ask for.
   responsePermissions = { ...base, issues: "write", metadata: "read" };
   await assert.rejects(
-    () => github.mintToken(parsePolicy(policyFixture()), 3001, "write"),
+    () => mintForFirstWorkspace(github, parsePolicy(policyFixture()), 3001, "write"),
     /outside the requested repository or permission scope/,
   );
   assert.deepEqual(requested, base);
@@ -703,25 +709,25 @@ test("the write tier adds issues: write only when the policy declares the accept
   const fixture = policyFixture();
   fixture.installation_permissions.issues = "write";
   responsePermissions = { ...base, issues: "write", metadata: "read" };
-  assert.equal((await github.mintToken(parsePolicy(fixture), 3001, "write")).access, "write");
+  assert.equal((await mintForFirstWorkspace(github, parsePolicy(fixture), 3001, "write")).access, "write");
   assert.deepEqual(requested, { ...base, issues: "write" });
 
   fixture.installation_permissions.workflows = "write";
   responsePermissions = { ...base, issues: "write", metadata: "read", workflows: "write" };
-  assert.equal((await github.mintToken(parsePolicy(fixture), 3001, "write")).access, "write");
+  assert.equal((await mintForFirstWorkspace(github, parsePolicy(fixture), 3001, "write")).access, "write");
   assert.deepEqual(requested, { ...base, issues: "write", workflows: "write" });
 
   // Declared but missing from GitHub's answer is refused.
   responsePermissions = { ...base, metadata: "read", workflows: "write" };
   await assert.rejects(
-    () => github.mintToken(parsePolicy(fixture), 3001, "write"),
+    () => mintForFirstWorkspace(github, parsePolicy(fixture), 3001, "write"),
     /outside the requested repository or permission scope/,
   );
 
   // An issues permission declared only as read is not the accepted write permission.
   fixture.installation_permissions.issues = "read";
   responsePermissions = { ...base, metadata: "read", workflows: "write" };
-  await github.mintToken(parsePolicy(fixture), 3001, "write");
+  await mintForFirstWorkspace(github, parsePolicy(fixture), 3001, "write");
   assert.deepEqual(requested, { ...base, workflows: "write" });
 });
 
@@ -755,7 +761,7 @@ test("the read tier asks for contents, pull request, check and Actions reads, ad
   fixture.installation_permissions.workflows = "write";
   const withoutIssues = parsePolicy(fixture);
   responsePermissions = { ...readBase, metadata: "read" };
-  assert.deepEqual(await github.mintToken(withoutIssues, 3004, "read"), {
+  assert.deepEqual(await mintForFirstWorkspace(github, withoutIssues, 3004, "read"), {
     token: "ghs_scoped_synthetic_token",
     expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
     repository_id: 3004,
@@ -766,13 +772,13 @@ test("the read tier asks for contents, pull request, check and Actions reads, ad
   fixture.installation_permissions.issues = "write";
   const withIssues = parsePolicy(fixture);
   responsePermissions = { ...readBase, issues: "write", metadata: "read" };
-  assert.equal((await github.mintToken(withIssues, 3004, "read")).access, "read");
+  assert.equal((await mintForFirstWorkspace(github, withIssues, 3004, "read")).access, "read");
   assert.deepEqual(requested, { ...readBase, issues: "write" });
 
   // An issues permission declared only as read is not the accepted write permission.
   fixture.installation_permissions.issues = "read";
   responsePermissions = { ...readBase, metadata: "read" };
-  await github.mintToken(parsePolicy(fixture), 3004, "read");
+  await mintForFirstWorkspace(github, parsePolicy(fixture), 3004, "read");
   assert.deepEqual(requested, readBase);
 
   // Any write or read beyond the requested set, a missing read, or an undeclared issues grant is refused.
@@ -791,21 +797,21 @@ test("the read tier asks for contents, pull request, check and Actions reads, ad
   ]) {
     responsePermissions = permissions;
     await assert.rejects(
-      () => github.mintToken(withoutIssues, 3004, "read"),
+      () => mintForFirstWorkspace(github, withoutIssues, 3004, "read"),
       /outside the requested repository or permission scope/,
       JSON.stringify(permissions),
     );
   }
   responsePermissions = { ...readBase, metadata: "read" };
   await assert.rejects(
-    () => github.mintToken(withIssues, 3004, "read"),
+    () => mintForFirstWorkspace(github, withIssues, 3004, "read"),
     /outside the requested repository or permission scope/,
   );
 
   // There is no default tier: a missing or unknown tier never reaches GitHub.
   const before = requests;
   for (const access of [undefined, "", "admin", "WRITE"]) {
-    await assert.rejects(() => github.mintToken(withIssues, 3004, access), /access tier must be read or write/);
+    await assert.rejects(() => mintForFirstWorkspace(github, withIssues, 3004, access), /access tier must be read or write/);
   }
   assert.equal(requests, before);
 });
@@ -1349,7 +1355,7 @@ test("mints only after a live Team grant and refuses with team_grant_missing oth
         }
         return grantedTeam(policy, workspace, target);
       },
-      mintToken: async (_policy, repositoryId, access) => {
+      mintToken: async (_policy, _workspace, repositoryId, access) => {
         mints += 1;
         assert.equal(checks, mints, "the Team grant must be verified before every mint");
         return {
@@ -1384,10 +1390,10 @@ test("mints only after a live Team grant and refuses with team_grant_missing oth
 });
 
 /** Runs the real core client behind the Node server with a synthetic GitHub. */
-async function withLiveCoreServer(fetchImpl, run) {
+async function withLiveCoreServer(fetchImpl, run, policy = parsePolicy(policyFixture())) {
   const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl });
   const server = createBrokerServer({
-    policy: parsePolicy(policyFixture()),
+    policy,
     github,
     readFile: (file) => secretByPath.get(file) ?? "",
     realpath: (file) => file,
@@ -1811,4 +1817,249 @@ test("POST /v1/workspace is not a token route: it rejects other methods, media t
     const proof = await (await workspaceRequest(origin)).json();
     assert.equal("token" in proof, false);
   });
+});
+
+/** alpha-team keeps both tiers; beta-team declares the read permission ceiling. */
+function ceilingPolicyFixture({ issues = true, ceilingWorkspace = 1 } = {}) {
+  const fixture = policyFixture();
+  fixture.installation_permissions.workflows = "write";
+  if (issues) fixture.installation_permissions.issues = "write";
+  fixture.workspaces[ceilingWorkspace].permission_ceiling = "read";
+  return fixture;
+}
+
+const WRITE_SET = { actions: "write", checks: "read", contents: "write", members: "read", pull_requests: "write" };
+const READ_SET = { actions: "read", checks: "read", contents: "read", members: "read", pull_requests: "read" };
+
+test("policy accepts an optional read permission ceiling per Workspace and rejects any other value", () => {
+  const parsed = parsePolicy(ceilingPolicyFixture());
+  assert.equal(parsed.workspaces[1].permission_ceiling, "read");
+  // A Workspace without the key parses to exactly the shape it had before the ceiling existed.
+  assert.deepEqual(parsed.workspaces[0], {
+    id: "alpha-team",
+    github_team_id: 4001,
+    github_team_slug: "alpha-team",
+    credential_file: "/run/secrets/workspace-alpha",
+  });
+  assert.equal("permission_ceiling" in parsePolicy(policyFixture()).workspaces[1], false);
+
+  for (const value of ["write", "none", "READ", "", null, true, 0, { issues: "read" }]) {
+    const fixture = policyFixture();
+    fixture.workspaces[1].permission_ceiling = value;
+    assert.throws(() => parsePolicy(fixture), /workspaces\[1\]\.permission_ceiling must be "read" when present/, JSON.stringify(value));
+  }
+});
+
+test("a read ceiling mints only reads and lowers issues: write to read; the other Workspace is unchanged", async () => {
+  const now = 1_700_000_000_000;
+  const requests = [];
+  let responsePermissions;
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (_url, init) => {
+      requests.push(JSON.parse(init.body).permissions);
+      return jsonResponse({
+        token: "ghs_scoped_synthetic_token",
+        expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: 3004 }],
+        permissions: responsePermissions,
+      });
+    },
+    now: () => now,
+  });
+  const policy = parsePolicy(ceilingPolicyFixture());
+  const [alpha, beta] = policy.workspaces;
+
+  // The Workspace without a ceiling asks for exactly what it asked for before.
+  responsePermissions = { ...WRITE_SET, issues: "write", workflows: "write", metadata: "read" };
+  assert.equal((await github.mintToken(policy, alpha, 3004, "write")).access, "write");
+  responsePermissions = { ...READ_SET, issues: "write", metadata: "read" };
+  assert.equal((await github.mintToken(policy, alpha, 3004, "read")).access, "read");
+  assert.deepEqual(requests, [{ ...WRITE_SET, issues: "write", workflows: "write" }, { ...READ_SET, issues: "write" }]);
+
+  // The ceiling Workspace asks for the read set with issues lowered to read.
+  responsePermissions = { ...READ_SET, issues: "read", metadata: "read" };
+  assert.deepEqual(await github.mintToken(policy, beta, 3004, "read"), {
+    token: "ghs_scoped_synthetic_token",
+    expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+    repository_id: 3004,
+    access: "read",
+  });
+  assert.deepEqual(requests.at(-1), { ...READ_SET, issues: "read" });
+
+  // GitHub answering with issues: write (or any other write) for it is outside the requested scope.
+  for (const permissions of [
+    { ...READ_SET, issues: "write", metadata: "read" },
+    { ...READ_SET, contents: "write", issues: "read", metadata: "read" },
+    { ...READ_SET, metadata: "read" },
+  ]) {
+    responsePermissions = permissions;
+    await assert.rejects(
+      () => github.mintToken(policy, beta, 3004, "read"),
+      /outside the requested repository or permission scope/,
+      JSON.stringify(permissions),
+    );
+  }
+
+  // The write tier is refused for it before GitHub is asked, and so is a Workspace outside the policy.
+  const before = requests.length;
+  await assert.rejects(() => github.mintToken(policy, beta, 3004, "write"), /permission ceiling is read/);
+  for (const outsider of [undefined, "beta-team", { ...beta }, structuredClone(alpha)]) {
+    await assert.rejects(() => github.mintToken(policy, outsider, 3004, "read"), /need a Workspace of the policy/);
+  }
+  assert.equal(requests.length, before);
+
+  // Without the accepted Issues permission the ceiling Workspace asks for the plain read set.
+  const withoutIssues = parsePolicy(ceilingPolicyFixture({ issues: false }));
+  responsePermissions = { ...READ_SET, metadata: "read" };
+  await github.mintToken(withoutIssues, withoutIssues.workspaces[1], 3004, "read");
+  assert.deepEqual(requests.at(-1), READ_SET);
+});
+
+test("token permissions fail closed when a tier asks for more than the installation accepted", () => {
+  const workspace = { id: "alpha-team", github_team_id: 4001, credential_file: "/run/secrets/workspace-alpha" };
+  // Hand-built, because parsePolicy already refuses these installations.
+  const installation = (overrides) => ({
+    installation_permissions: { ...WRITE_SET, ...overrides },
+    workspaces: [workspace],
+  });
+  assert.throws(
+    () => tokenPermissions(installation({ actions: "read" }), "write", workspace),
+    /token asks for actions: write, which the installation has not accepted/,
+  );
+  assert.throws(
+    () => tokenPermissions(installation({ members: undefined }), "read", workspace),
+    /token asks for members: read, which the installation has not accepted/,
+  );
+  assert.throws(
+    () => tokenPermissions(installation({ checks: "none" }), "read", workspace),
+    /token asks for checks: read, which the installation has not accepted/,
+  );
+  assert.deepEqual(tokenPermissions(installation({}), "read", workspace), READ_SET);
+  assert.deepEqual(tokenPermissions(installation({}), "write", workspace), WRITE_SET);
+});
+
+test("the Team gate selects the read tier for every grant of a read-ceiling Workspace and reports the live role", async () => {
+  const policy = parsePolicy(ceilingPolicyFixture({ ceilingWorkspace: 0 }));
+  const privateKey = testPrivateKey();
+  for (const [permissions, role] of [
+    [{ admin: false, maintain: false, pull: true, push: false, triage: false }, "read"],
+    [{ admin: false, maintain: false, pull: true, push: false, triage: true }, "triage"],
+    [{ admin: false, maintain: false, pull: true, push: true, triage: true }, "write"],
+    [{ admin: false, maintain: true, pull: true, push: true, triage: true }, "maintain"],
+    [{ admin: true, maintain: true, pull: true, push: true, triage: true }, "admin"],
+  ]) {
+    for (const target of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+      const github = createGithubClient({
+        appId: "42",
+        privateKey,
+        fetchImpl: teamGrantFetch({
+          grant: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions },
+        }),
+      });
+      const grant = await github.verifyTeamGrant(policy, policy.workspaces[0], target);
+      assert.deepEqual([grant.role, grant.access], [role, "read"], role);
+    }
+  }
+  // No grant is still refused; the ceiling never creates access.
+  const none = createGithubClient({ appId: "42", privateKey, fetchImpl: teamGrantFetch({ grant: null }) });
+  await assert.rejects(
+    () => none.verifyTeamGrant(policy, policy.workspaces[0], { repository: "example-org/alpha" }),
+    (error) => error.code === "team_grant_missing",
+  );
+});
+
+test("end to end: a read-ceiling Workspace mints reads for a push grant; the other Workspace still mints write", async () => {
+  for (const issues of [true, false]) {
+    const ceilingFirst = parsePolicy(ceilingPolicyFixture({ issues, ceilingWorkspace: 0 }));
+    const scopedMints = [];
+    await withLiveCoreServer(mintingFetch([], teamGrantFetch(), scopedMints), async (origin) => {
+      for (const body of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+        const response = await request(origin, { body });
+        assert.equal(response.status, 200);
+        const json = await response.json();
+        assert.deepEqual([json.access, json.repository_id, json.repository], ["read", 3001, "example-org/alpha"]);
+      }
+      const readOnly = issues ? { ...READ_SET, issues: "read" } : READ_SET;
+      assert.deepEqual(scopedMints, [readOnly, readOnly]);
+      // Cross-Workspace: the other Team still holds nothing on alpha.
+      const crossWorkspace = await request(origin, { workspace: "beta-team", secret: secretByPath.get("/run/secrets/workspace-beta") });
+      assert.equal(crossWorkspace.status, 403);
+      assert.deepEqual(await crossWorkspace.json(), { error: "team_grant_missing" });
+      // Cross-repository and foreign owner are refused exactly as without a ceiling.
+      assert.equal((await request(origin, { body: { repository: "example-org/beta" } })).status, 403);
+      assert.deepEqual(await (await request(origin, { body: { repository: "other-org/alpha" } })).json(), { error: "repository_denied" });
+      assert.equal(scopedMints.length, 2);
+    }, ceilingFirst);
+
+    // The same grant for the Workspace without a ceiling mints the write tier as before.
+    const ceilingSecond = parsePolicy(ceilingPolicyFixture({ issues, ceilingWorkspace: 1 }));
+    const writeMints = [];
+    await withLiveCoreServer(mintingFetch([], teamGrantFetch(), writeMints), async (origin) => {
+      assert.equal((await (await request(origin)).json()).access, "write");
+      assert.deepEqual(writeMints, [{ ...WRITE_SET, workflows: "write", ...(issues ? { issues: "write" } : {}) }]);
+    }, ceilingSecond);
+  }
+});
+
+test("a Team gate that loses the ceiling fails closed instead of minting the write tier", async () => {
+  const scopedMints = [];
+  const github = createGithubClient({ appId: "42", privateKey: testPrivateKey(), fetchImpl: mintingFetch([], teamGrantFetch(), scopedMints) });
+  const server = createBrokerServer({
+    policy: parsePolicy(ceilingPolicyFixture({ ceilingWorkspace: 0 })),
+    // A gate that ignores the ceiling and reports the grant's write tier.
+    github: { ...github, verifyTeamGrant: async (...args) => ({ ...(await grantedTeam(...args)), access: "write" }) },
+    readFile: (file) => secretByPath.get(file) ?? "",
+    realpath: (file) => file,
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    const response = await request(`http://127.0.0.1:${server.address().port}`);
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), { error: "token_unavailable" });
+    assert.deepEqual(scopedMints, []);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("policy check prints the read-ceiling set and a CEILING column, and live rows show the capped tier", async () => {
+  assert.equal(
+    formatPolicySummary(parsePolicy(ceilingPolicyFixture())),
+    [
+      "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
+      "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write issues=write members=read pull_requests=write workflows=write",
+      "read tier (pull/triage grant) asks for: actions=read checks=read contents=read issues=write members=read pull_requests=read",
+      "read ceiling (any grant of a CEILING read Workspace) asks for: actions=read checks=read contents=read issues=read members=read pull_requests=read",
+      "WORKSPACE   TEAM_ID  TEAM_SLUG   CEILING",
+      "alpha-team  4001     alpha-team  -",
+      "beta-team   4002     -           read",
+      "",
+    ].join("\n"),
+  );
+
+  const allCapped = ceilingPolicyFixture();
+  allCapped.workspaces[0].permission_ceiling = "read";
+  assert.doesNotMatch(formatPolicySummary(parsePolicy(allCapped)), /tier \(/, "no Workspace mints the two tiers");
+
+  const policy = parsePolicy(ceilingPolicyFixture({ ceilingWorkspace: 0 }));
+  const page = [
+    { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions: { pull: true, push: true } },
+    { id: 3004, full_name: "example-org/handbook", owner: { id: 1001, login: "example-org" }, permissions: { pull: true } },
+  ];
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (url, init) => {
+      const path = new URL(url).pathname + new URL(url).search;
+      if (path === "/organizations/1001/team/4001/repos?per_page=100&page=1") return jsonResponse(page);
+      return teamGrantFetch()(url, init);
+    },
+  });
+  const rows = await github.readWorkspaceTeamGrants(policy, policy.workspaces[0]);
+  assert.deepEqual(rows.map(({ repository_id, role, access }) => [repository_id, role, access]), [[3001, "write", "read"], [3004, "read", "read"]]);
+  assert.match(formatPolicyCheckTable(rows), /2 repository grants \(0 write, 2 read\)/);
 });
