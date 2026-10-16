@@ -22,8 +22,8 @@ dependency-light and customer-neutral.
    adds `issues: write`, and the write tier `workflows: write`, only when the
    reviewed policy declares that the installation accepted that permission. A
    Workspace whose policy declares `permission_ceiling: "read"` mints only the
-   read tier with every permission lowered to `read`, so its tokens write
-   nothing on GitHub. A mint without an explicit tier or a Workspace of the
+   read tier with every permission lowered to `read`, so its tokens carry no
+   write permission. A mint without an explicit tier or a Workspace of the
    policy fails, and so does any set that asks for a permission or level the
    installation has not accepted.
 5. Workspace credentials and installation tokens are never logged, committed,
@@ -49,11 +49,15 @@ this permission also authorizes other Actions mutations inside the same exact
 repository. Keep that provider limitation explicit in architecture and
 operator documentation; never describe the token as rerun-only.
 
-`issues: write` is likewise GitHub's smallest installation-token permission
-that can open an issue. It also authorizes editing, labelling, closing,
-reopening and commenting on existing issues of the same repository. Never
-describe a read-tier token with `issues: write` as read-only or as able only
-to create issues. The read tier's `actions: read` likewise reads more than
+`issues: write` is likewise the installation-token permission GitHub documents
+for opening an issue. It also authorizes editing, labelling, closing, reopening
+and commenting on existing issues of the same repository. Never describe a
+read-tier token with `issues: write` as read-only or as able only to create
+issues. For an installation that accepted the Issues permission, GitHub also
+let every token tested, whatever its permissions and repository, open issues in
+public repositories ([#23](https://github.com/Lazurio/github-app/issues/23)): never describe a token of such an installation,
+including a read-ceiling token, as unable to open issues or as writing nothing
+on GitHub. The read tier's `actions: read` likewise reads more than
 check status: it also reads the repository's workflow run logs and artifacts.
 
 Use an isolated worktree and pull request for every change. Code, comments,

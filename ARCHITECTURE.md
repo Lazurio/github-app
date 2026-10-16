@@ -99,8 +99,8 @@ escalation issues its work asks for. Without the declaration neither tier asks
 for `issues` and the write tier is exactly its previous set.
 
 Because the accepted Issues permission is Organization-wide and the
-installation gate compares it exactly, a Workspace that must write nothing on
-GitHub (for example a shared visitor Environment) cannot be read-only by
+installation gate compares it exactly, a Workspace whose tokens must carry no
+write permission (for example a shared visitor Environment) cannot get there by
 leaving `issues` out of the policy. It declares `permission_ceiling: "read"`
 instead. Its Team gate then selects the read tier for every usable grant,
 including `push`, `maintain` and `admin`, so a grant raised later on GitHub
@@ -110,6 +110,18 @@ access. A Workspace without the key mints exactly what it minted before the
 ceiling existed. A broker that predates the key would accept such a policy
 and mint the uncapped tiers, so a policy with a ceiling must only be deployed
 to a broker that understands it.
+
+The ceiling removes write permissions; it cannot remove one capability GitHub
+did not tie to them in the live check ([#23](https://github.com/Lazurio/github-app/issues/23)). For an installation that accepted
+the Issues permission, GitHub authorized opening an issue in a public
+repository for every installation token tested, whatever permissions it asked
+for and whatever repository it was limited to, including a public repository
+outside the installation. Commenting was refused for all of them, and editing,
+closing and reopening for the read-ceiling token. An installation without the
+Issues permission was not tested. No tier or ceiling the broker can request
+refused issue creation in public repositories there, so a Workspace used by
+untrusted people must decide at the Workspace whether it receives a token at
+all.
 
 `workflows: write` lets a Workspace push commits that change
 `.github/workflows/`. Editing a workflow does not by itself run it or hand it
