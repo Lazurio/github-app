@@ -3,14 +3,20 @@
 ## What this service does
 
 The broker holds one GitHub App private key and mints installation tokens for
-predeclared Team Workspaces. Its deployment-owned policy binds:
+predeclared Team Workspaces and, since `0.13.0`, for GitHub Actions jobs of
+listed Deployment Repos (see
+[GitHub Actions OIDC purposes](#github-actions-oidc-purposes)). Its
+deployment-owned policy binds:
 
 - one immutable GitHub Organization id and asserted login;
 - one installation id, its repository selection mode and the exact accepted
-  permission set; and
+  permission set;
 - each immutable Workspace id to exactly one immutable GitHub Team id, a
   separate deployment credential reference and an optional read permission
-  ceiling.
+  ceiling; and
+- optionally, the OIDC purposes: this broker's audience, the Deployment Repos
+  by immutable repository and owner id, and per purpose its one repository,
+  workflow file, admission rules, exact permission set and per-run budget.
 
 The policy names no repositories and no access tiers. The scope of a
 Workspace is the live GitHub Team grant: the repositories of the policy's
@@ -210,6 +216,139 @@ that input is reviewed and published in the owner Deployment Repository and
 grants nothing by itself. Neither the Dashboard nor the policy is a second
 ACL: the broker's live check against GitHub is the authority for every token.
 
+## GitHub Actions OIDC purposes
+
+Rollouts move from an operator's computer to short-lived GitHub-hosted
+runners. Such a runner needs GitHub tokens the workflow's own `GITHUB_TOKEN`
+cannot provide: Organization-scoped facts for the Permit evidence of the
+Deployment Repo, and a read of a private release repository of another
+Organization. It must not hold a stored secret, and it must never hold the App
+private key. `POST /v1/oidc/token` gives it exactly one installation token per
+request, for one configured purpose.
+
+The credential is the job's GitHub Actions OIDC token, which GitHub signs per
+job for the audience the job asks for. The broker accepts only its own exact
+public origin as audience, verifies the signature against GitHub's published
+keys with jose and then decides from signed claims alone, in this order:
+
+1. the caller's immutable `repository_id` is a listed Deployment Repo and its
+   `repository_owner_id` is the owner listed with it;
+2. the purpose is configured, and a purpose for the caller's own repository
+   serves only repositories of the policy's Organization;
+3. the runner environment is admitted (`github-hosted` unless the policy also
+   admits `self-hosted`);
+4. one rule of the purpose admits the job's event, its exact branch ref, the
+   reviewed workflow file at that ref (`workflow_ref`), the job being defined
+   in that file itself (`job_workflow_ref`) and its GitHub Environment;
+5. the run guard has not seen this OIDC token and the purpose has budget left
+   in this workflow run attempt;
+6. the live installation gate, unchanged.
+
+The purpose then fixes everything the token can do: its one repository (the
+caller's own Deployment Repo, or one fixed repository of the Organization) and
+its exact permission set, which the parser has checked against the
+installation's accepted permissions. A rule may lower the set to `read`; a rule
+that admits an event a person without write access can start must do so
+whenever the set contains a write. The token response is the `/v1/token` shape
+plus the permission set. A token outside the requested scope is revoked before
+the refusal.
+
+Purposes are configuration so that the next one (for example a read of the
+Permit ledger) is a reviewed policy entry rather than a broker change. The
+code keeps the invariants that make any entry safe: immutable ids, one exact
+branch per rule, the reviewed workflow file, read-only rules for events others
+can start, one repository per token, the installation's accepted permissions
+as the ceiling, one use per OIDC token and a per-run budget.
+
+The run guard is the broker's only state. It is one Durable Object per
+workflow run attempt, named from verified claims, holding used token ids and
+grant counts, and it can only refuse; it never allows a request admission
+refused, and it caches nothing GitHub decides. Without it, an OIDC token could
+be replayed until it expires and a buggy or compromised run could mint
+without bound. Workspace authorization does not use it.
+
+Every decision of the route writes one audit line to the Worker's log stream:
+the decision and its code, the purpose, the verified caller claims and, for a
+grant, the repository, access, permission set and expiry, never a token.
+
+Only the Worker adapter serves the route. A GitHub-hosted runner can reach only
+a public broker, which is where the Worker runs; the Node adapter runs inside
+an Organization's private network. The Node adapter parses the same policy,
+lists its purposes in `policy check` and answers `404` on the route, so jose
+and the run guard never enter the OCI image.
+
+## Threat model
+
+The broker is a small boundary around a powerful secret: the App private key
+can mint any installation token of every installation the App has, within the
+permissions each Organization accepted. Everything the broker does is to hand
+out narrower, short-lived tokens for decisions it can verify.
+
+**Trusted.** GitHub (identity, Team grants, installation permissions, Actions
+OIDC tokens and the GitHub-hosted runners), the deployment owner's Cloudflare
+account and secret custody, and the reviewed policy. A deployment owner who
+can change the policy or the Worker can grant anything the installation holds;
+review of the owner Deployment Repository is that boundary.
+
+**Workspace route.** A caller must present one Workspace's credential. The
+live Team grant on the exact repository decides; the policy can only lower
+access. A stolen Workspace credential acts as that Workspace until the
+credential is rotated.
+
+**OIDC route: a broker that holds the App private key is now reachable by CI
+runners.** The route is public: anyone can send a request, and any GitHub
+Actions workflow anywhere can obtain a validly signed OIDC token for this
+broker's audience. The rules above bound what that reach can achieve:
+
+- Without a token GitHub signed for this exact audience, a request fails
+  before any state or GitHub request. Forged, expired, foreign-audience and
+  key-less tokens are refused; GitHub's key set is fetched at most once per
+  cooldown, so invalid tokens cannot drive traffic to GitHub's JWKS endpoint.
+- A validly signed token from a repository that is not listed, or whose owner
+  changed, is refused first, so strangers learn nothing about the purposes.
+- A listed repository obtains a token only from the reviewed workflow file on
+  its default branch, for a job defined in that file, for the admitted events
+  and GitHub Environment. Code that runs with the token therefore passed the
+  Deployment Repo's own review and branch rules, and an apply additionally
+  waited for the Environment's required reviewers before the job started. A
+  pull request cannot change which workflow runs: `pull_request` runs never
+  match, and `pull_request_target` runs, which execute the default branch's
+  workflow, receive only read permissions.
+- Only GitHub-hosted runners are admitted by default: an ephemeral virtual
+  machine per job, with no persistent foreign host that could keep the token.
+- One OIDC token yields at most one installation token; a run attempt yields
+  at most the purpose's budget.
+- The installation token reaches one repository with the purpose's exact
+  permission set, never more than the installation accepted, for at most an
+  hour, and the runner revokes it when it finishes. It never reaches another
+  Organization: an installation token is bound to its installation, and a
+  fixed-repository purpose names one repository of the broker's own
+  Organization.
+- The App private key, the App JWT and the Workspace credentials never leave
+  the Worker and are not used to answer anything but GitHub itself.
+
+What remains:
+
+- Whoever can merge to a Deployment Repo's default branch can change the
+  workflow and so control a job that receives that repository's
+  `deployment-apply` token; for an apply, the Environment's reviewers still
+  have to approve the run. This is the same trust the Permit gate already
+  places in the Deployment Repo's review rules.
+- A compromised step inside an admitted job, for example a compromised action
+  the workflow uses, can use the token within its repository, set and expiry.
+  Pinning actions by commit and keeping the job small are the workflow's part.
+- The installation grows by the permissions `deployment-apply` needs
+  (repository administration read, Organization administration or plan read,
+  issues read). Workspace tokens never request them, but a leaked App private
+  key could; key custody stays the main control.
+- A key GitHub withdraws can verify tokens until the cached key set expires,
+  at most ten minutes.
+- An allowlisted Deployment Repo of another Organization can read the one
+  fixed release repository on every run, which is the purpose of
+  `machines-release`; removing it from the allowlist stops it at the next
+  request.
+- Audit lines name the workflow's actor and are kept by the deployment owner.
+
 ## What this service does not do
 
 - It is not a human login service or membership database.
@@ -217,6 +356,9 @@ ACL: the broker's live check against GitHub is the authority for every token.
 - It does not attribute a shared Workspace push to the last connected person.
 - It does not store OpenAI credentials, GitHub OAuth tokens or Git data.
 - It does not expose the App private key or a general GitHub API proxy.
+- It does not let a CI runner choose a repository or a permission set, keep
+  the OIDC tokens it verifies, or offer a revocation route for tokens it no
+  longer holds.
 
 Human ingress is implemented separately with a standard OAuth gateway. The
 gateway checks the live GitHub Team for every new session/reconnect; removing a
@@ -237,6 +379,12 @@ continue after the browser disconnects.
   its issuance.
 - Rotate the App private key in deployment custody and restart the Node broker
   or publish a new Worker secret version.
+- Remove a Deployment Repo from `oidc.deployment_repositories`, or a purpose
+  from `oidc.purposes`, and deploy the policy to refuse its next OIDC request.
+  A token already issued stays valid until it expires or its holder revokes
+  it; for an emergency, an Organization owner can suspend the App
+  installation on GitHub, which blocks the App's access to that
+  Organization's resources while it stays suspended.
 - Keep the prior immutable image or Worker version available for source
   rollback, but never roll back a revoked credential or repository grant.
 
@@ -262,6 +410,10 @@ provider call.
 This deliberately trades extra GitHub readback latency for convergence without
 module-state caches. Missing or duplicated secrets fail the whole Worker
 configuration closed; neither errors nor observability contain secret values.
+Two exceptions hold no authorization: GitHub's OIDC signing keys, which jose
+caches per isolate for at most ten minutes, and the deny-only OIDC run guard in
+a Durable Object. A policy with OIDC purposes and no run guard binding is an
+incomplete configuration and fails closed like a missing secret.
 
 A Cloudflare deployment is a separate service boundary. It is not a third
 workload on a Conglomerate Host or Organization Host, and it does not turn the

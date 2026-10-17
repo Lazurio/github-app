@@ -25,13 +25,26 @@ dependency-light and customer-neutral.
    read tier with every permission lowered to `read`, so its tokens carry no
    write permission. A mint without an explicit tier or a Workspace of the
    policy fails, and so does any set that asks for a permission or level the
-   installation has not accepted.
-5. Workspace credentials and installation tokens are never logged, committed,
-   stored in Git configuration or persisted by this service.
-6. The broker authorizes a Workspace and repository, never a browser user.
+   installation has not accepted. A token of a GitHub Actions OIDC purpose is
+   limited to the purpose's one repository and its exact reviewed permission
+   set (plus `metadata: read`), which the parser checks against the
+   installation's accepted permissions; a rule that admits an event other than
+   `push` or `workflow_dispatch` must be `read_only` when the set holds a write.
+5. Workspace credentials, GitHub Actions OIDC tokens and installation tokens
+   are never logged, committed, stored in Git configuration or persisted by
+   this service. Audit lines carry decisions and verified claims, never a
+   token or a request header.
+6. The broker authorizes a Workspace and repository, or an admitted GitHub
+   Actions job for one configured purpose, never a browser user. A caller never
+   chooses the repository or the permissions of a purpose token.
 7. No customer-specific policy, ids or credentials belong in this public repo.
+   Deployment Repo ids, fixed purpose repositories and audiences live in each
+   Organization's private deployment policy.
 8. Every behavior change requires focused tests for the positive path and
-   cross-Workspace, cross-repository and foreign-owner denial.
+   cross-Workspace, cross-repository and foreign-owner denial; for the OIDC
+   route also an unlisted repository, a changed owner, another Organization's
+   Deployment Repo, every event, ref, workflow, job workflow and Environment
+   outside the rules, a replayed token and an exhausted run budget.
 9. Every Workspace is bound to exactly one immutable GitHub Team id, and every
    token issuance verifies live that the Team exists and holds a grant on the
    exact repository, failing closed with `team_grant_missing`. The grant's
@@ -42,6 +55,21 @@ dependency-light and customer-neutral.
    narrows or widens which repositories it reaches.
    Nothing from that readback is cached; the policy, the Dashboard and any
    derived mapping are reviewed inputs, never a second ACL.
+10. `POST /v1/oidc/token` admits a GitHub Actions job only from signed claims:
+    this broker's exact audience, a listed immutable repository id with its
+    listed owner id, the purpose's workflow file on one exact branch with the
+    job defined in that file, an admitted event, GitHub Environment and runner
+    environment (`github-hosted` unless configured). Each OIDC token is used
+    once and each purpose has a per-run budget, kept in a deny-only Durable
+    Object that never allows anything admission refused; it is the broker's
+    only state. Purposes are configuration; a new purpose is a reviewed policy
+    entry, never a code path for one Organization. Only the Worker adapter
+    serves the route.
+11. jose, pinned exactly, is the only runtime dependency. Only `src/oidc.mjs`
+    imports it, and only the Worker entry imports that module, so the core and
+    the Node adapter in the OCI image stay dependency-free. The Worker entry
+    module exports only functions and classes: workerd refuses to start a
+    Worker whose entry module exports a plain value.
 
 `actions: write` is GitHub's smallest installation-token permission that can
 rerun a workflow. GitHub does not provide a rerun-only token capability, so
@@ -59,6 +87,11 @@ public repositories ([#23](https://github.com/Lazurio/github-app/issues/23)): ne
 including a read-ceiling token, as unable to open issues or as writing nothing
 on GitHub. The read tier's `actions: read` likewise reads more than
 check status: it also reads the repository's workflow run logs and artifacts.
+
+Describe an OIDC purpose's permissions exactly as GitHub defines them, and say
+which of them a live probe has not proven yet. `contents: write` on a
+Deployment Repo pushes any ref there, not only the Permit consumption, and
+`administration: read` reads every repository setting GitHub ties to it.
 
 Use an isolated worktree and pull request for every change. Code, comments,
 commits and pull-request descriptions are English. Run `npm test` and
