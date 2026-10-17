@@ -121,6 +121,15 @@ function countsOf(calls) {
   return { verify: calls.verify, teamGrant: calls.teamGrant, mint: calls.mint };
 }
 
+test("the Worker entry module exports only functions and classes, which workerd accepts as entrypoints", async () => {
+  // workerd refuses to start a Worker whose entry module exports a plain value.
+  const entry = await import("../src/worker.mjs");
+  for (const [name, value] of Object.entries(entry)) {
+    if (name === "default") continue;
+    assert.equal(typeof value, "function", `export ${name} must be a function or class`);
+  }
+});
+
 test("maps immutable Workspace ids to independent Worker secret bindings", () => {
   assert.equal(workspaceCredentialBindingName("blue-team"), "WORKSPACE_CREDENTIAL_BLUE_TEAM");
   assert.throws(() => workspaceCredentialBindingName("Blue_Team"), /cannot be mapped/);

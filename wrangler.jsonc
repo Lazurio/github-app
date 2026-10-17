@@ -5,5 +5,11 @@
   "compatibility_date": "2026-08-29",
   "workers_dev": true,
   "preview_urls": false,
-  "send_metrics": false
+  "send_metrics": false,
+  // The per-run OIDC replay and grant record (src/worker.mjs OidcRunGuard). Required only when
+  // the deployment's policy declares OIDC purposes; SQLite-backed, so it needs no paid plan.
+  "durable_objects": {
+    "bindings": [{ "name": "OIDC_RUN_GUARD", "class_name": "OidcRunGuard" }]
+  },
+  "migrations": [{ "tag": "oidc-run-guard-v1", "new_sqlite_classes": ["OidcRunGuard"] }]
 }

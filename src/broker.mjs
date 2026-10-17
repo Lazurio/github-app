@@ -161,10 +161,34 @@ function formatPermissions(permissions) {
 }
 
 /**
+ * Offline lines for the OIDC purposes of a policy: the audience, admitted runner environments and
+ * Deployment Repos, then per purpose its repository, workflow, per-run budget and, per rule, the
+ * exact permission set it asks for. Empty for a policy without an `oidc` section.
+ */
+function formatOidcSummary(oidc) {
+  if (oidc === undefined) return [];
+  const repositories = oidc.deployment_repositories
+    .map(({ repository_id, repository_owner_id }) => `${repository_id}/${repository_owner_id}`)
+    .join(",");
+  return [
+    `oidc audience=${oidc.audience} runners=${oidc.runner_environments.join(",")} deployment_repositories=${repositories}`,
+    ...oidc.purposes.flatMap((purpose) => [
+      `purpose ${purpose.purpose} repository=${purpose.repository === "caller" ? "caller" : purpose.repository.repository_id} workflow=${purpose.workflow} per_run=${purpose.max_grants_per_run}`,
+      ...purpose.rules.map((rule) => {
+        const permissions = rule.read_only
+          ? Object.fromEntries(Object.keys(purpose.permissions).map((permission) => [permission, "read"]))
+          : purpose.permissions;
+        return `  ${rule.events.join(",")} ${rule.ref} environment=${rule.environment ?? "-"}${rule.read_only ? " read-only" : ""} asks for: ${formatPermissions(permissions)}`;
+      }),
+    ]),
+  ];
+}
+
+/**
  * Offline summary of the parsed Team binding and of the exact permission set each access tier
  * mints under this policy; no GitHub traffic and no secret. A policy whose Workspaces declare no
  * permission ceiling prints exactly the two tier lines; a read ceiling adds the one set every
- * grant of such a Workspace mints and a CEILING column.
+ * grant of such a Workspace mints and a CEILING column. OIDC purposes, when declared, follow.
  */
 export function formatPolicySummary(policy) {
   const uncapped = policy.workspaces.find((workspace) => workspace.permission_ceiling === undefined);
@@ -189,8 +213,8 @@ export function formatPolicySummary(policy) {
     ...(capped
       ? [`read ceiling (any grant of a CEILING read Workspace) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, capped))}`]
       : []),
-    line(header),
-    ...rows.map(line),
+    ...(rows.length > 0 ? [line(header), ...rows.map(line)] : ["no Workspaces"]),
+    ...formatOidcSummary(policy.oidc),
   ].join("\n") + "\n";
 }
 

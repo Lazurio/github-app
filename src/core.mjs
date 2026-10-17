@@ -8,7 +8,7 @@ const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
 const V3_MIGRATION =
   "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.12.0";
+const USER_AGENT = "lazurio-github-app-broker/0.13.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
@@ -137,6 +137,56 @@ export class RepositoryDeniedError extends Error {
   }
 }
 
+/**
+ * Every refusal of `POST /v1/oidc/token`: one concrete code and its HTTP status. The body is
+ * `{"error": "<code>"}` like every other refusal of the broker; it never echoes claims or policy.
+ */
+export const OIDC_REFUSALS = Object.freeze({
+  token_missing: 401,
+  token_malformed: 401,
+  token_algorithm_refused: 401,
+  token_key_unknown: 401,
+  token_signature_invalid: 401,
+  token_issuer_mismatch: 401,
+  token_audience_mismatch: 401,
+  token_expired: 401,
+  token_not_yet_valid: 401,
+  token_claims_invalid: 401,
+  token_replayed: 401,
+  invalid_request: 400,
+  repository_not_admitted: 403,
+  repository_owner_mismatch: 403,
+  purpose_unknown: 403,
+  repository_denied: 403,
+  runner_not_allowed: 403,
+  event_not_allowed: 403,
+  ref_not_allowed: 403,
+  workflow_not_allowed: 403,
+  job_workflow_not_allowed: 403,
+  environment_mismatch: 403,
+  unsupported_media_type: 415,
+  rate_limited: 429,
+  token_unavailable: 502,
+  jwks_unavailable: 503,
+});
+
+/** A refused GitHub Actions OIDC request; `code` is a key of OIDC_REFUSALS. */
+export class OidcRefusal extends Error {
+  constructor(code) {
+    if (!Object.hasOwn(OIDC_REFUSALS, code)) throw new Error(`unknown OIDC refusal ${code}`);
+    super(`OIDC request refused: ${code}`);
+    this.name = "OidcRefusal";
+    this.code = code;
+    this.status = OIDC_REFUSALS[code];
+  }
+}
+
+/** Seconds of clock tolerance for GitHub Actions OIDC token times (exp, nbf, iat). */
+export const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
+/** How long a run's replay and grant record lives after its first grant. */
+export const RUN_GUARD_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const AUDIT_SCHEMA = "lazurio.github_app_broker.audit.v1";
+
 function fail(message) {
   throw new Error(message);
 }
@@ -147,6 +197,10 @@ function refuse(message) {
 
 function deny(message) {
   throw new RepositoryDeniedError(message);
+}
+
+function refuseOidc(code) {
+  throw new OidcRefusal(code);
 }
 
 const OWNER_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -194,6 +248,234 @@ export function parseTokenRequest(bodyText) {
     return Number.isSafeInteger(id) && id > 0 ? Object.freeze({ repository_id: id }) : undefined;
   }
   return undefined;
+}
+
+const PURPOSE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const WORKFLOW_PATH_PATTERN = /^\.github\/workflows\/[A-Za-z0-9._-]{1,200}\.ya?ml$/;
+const BRANCH_REF_PATTERN = /^refs\/heads\/[A-Za-z0-9._/-]{1,200}$/;
+const EVENT_NAME_PATTERN = /^[a-z][a-z_]{0,63}$/;
+const RUNNER_ENVIRONMENTS = Object.freeze(["github-hosted", "self-hosted"]);
+const MAX_GRANTS_PER_RUN = 100;
+/**
+ * The only events whose initiator needs write access to the repository: a push to the branch or a
+ * manual dispatch. A rule that admits any other event (for example the `pull_request_target` of a
+ * Plan) must be read-only, so a run another person can start never receives a write permission.
+ */
+const WRITE_EVENTS = Object.freeze(["push", "workflow_dispatch"]);
+
+/**
+ * Parses the `POST /v1/oidc/token` body: exactly `{"purpose": "<name>"}`. Returns the purpose name
+ * or undefined for anything else.
+ */
+export function parseOidcTokenRequest(bodyText) {
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return undefined;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const keys = Object.keys(body);
+  if (keys.length !== 1 || keys[0] !== "purpose") return undefined;
+  return typeof body.purpose === "string" && PURPOSE_NAME_PATTERN.test(body.purpose) ? body.purpose : undefined;
+}
+
+function plainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${label} must be an object`);
+  return value;
+}
+
+/** Refuses unknown keys, so a misspelled admission rule fails closed instead of being ignored. */
+function exactKeys(value, allowed, required, label) {
+  plainObject(value, label);
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) fail(`${label}.${key} is not a known key`);
+  }
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) fail(`${label}.${key} is required`);
+  }
+  return value;
+}
+
+function canonicalHttpsOrigin(value, label) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    fail(`${label} must be a canonical HTTPS origin`);
+  }
+  if (
+    typeof value !== "string" ||
+    url.protocol !== "https:" ||
+    url.origin !== value ||
+    url.port !== "" ||
+    url.username ||
+    url.password
+  ) {
+    fail(`${label} must be a canonical HTTPS origin without a path, port or trailing slash`);
+  }
+  return value;
+}
+
+function lowerToRead(permissions) {
+  return Object.freeze(Object.fromEntries(Object.keys(permissions).map((permission) => [permission, "read"])));
+}
+
+/** Fails when `permissions` asks for a permission or level the installation has not accepted. */
+function assertAccepted(accepted, permissions, label) {
+  for (const [permission, level] of Object.entries(permissions)) {
+    if (!(PERMISSION_LEVELS[accepted[permission]] >= PERMISSION_LEVELS[level])) {
+      fail(`${label} asks for ${permission}: ${level}, which the installation has not accepted`);
+    }
+  }
+}
+
+function parseOidcRule(rule, label, purposePermissions) {
+  exactKeys(rule, ["events", "ref", "environment", "read_only"], ["events", "ref", "environment"], label);
+  const events = rule.events;
+  if (
+    !Array.isArray(events) ||
+    events.length === 0 ||
+    events.some((event) => typeof event !== "string" || !EVENT_NAME_PATTERN.test(event)) ||
+    new Set(events).size !== events.length
+  ) {
+    fail(`${label}.events must be a non-empty list of distinct GitHub event names`);
+  }
+  const ref = rule.ref;
+  if (
+    typeof ref !== "string" ||
+    !BRANCH_REF_PATTERN.test(ref) ||
+    ref.includes("..") ||
+    ref.includes("//") ||
+    ref.endsWith("/") ||
+    ref.endsWith(".lock")
+  ) {
+    fail(`${label}.ref must be one exact branch ref such as refs/heads/main`);
+  }
+  const environment = rule.environment;
+  if (
+    environment !== null &&
+    (typeof environment !== "string" || environment.length === 0 || environment.length > 255 || /[\u0000-\u001f\u007f]/.test(environment))
+  ) {
+    fail(`${label}.environment must be a GitHub Environment name or null for a job without one`);
+  }
+  const readOnly = rule.read_only ?? false;
+  if (typeof readOnly !== "boolean") fail(`${label}.read_only must be true or false`);
+  const writes = Object.values(purposePermissions).includes("write");
+  if (writes && !readOnly && events.some((event) => !WRITE_EVENTS.includes(event))) {
+    fail(`${label} admits an event that a person without write access can start; set read_only: true`);
+  }
+  return Object.freeze({
+    events: Object.freeze([...events]),
+    ref,
+    environment,
+    read_only: readOnly,
+  });
+}
+
+function parseOidcPurpose(purpose, index, installationPermissions) {
+  const label = `oidc.purposes[${index}]`;
+  exactKeys(
+    purpose,
+    ["purpose", "repository", "workflow", "rules", "permissions", "max_grants_per_run"],
+    ["purpose", "repository", "workflow", "rules", "permissions", "max_grants_per_run"],
+    label,
+  );
+  if (typeof purpose.purpose !== "string" || !PURPOSE_NAME_PATTERN.test(purpose.purpose)) {
+    fail(`${label}.purpose must be a lowercase name`);
+  }
+  let repository;
+  if (purpose.repository === "caller") {
+    repository = "caller";
+  } else {
+    exactKeys(purpose.repository, ["repository_id"], ["repository_id"], `${label}.repository`);
+    repository = Object.freeze({
+      repository_id: positiveInteger(purpose.repository.repository_id, `${label}.repository.repository_id`),
+    });
+  }
+  if (typeof purpose.workflow !== "string" || !WORKFLOW_PATH_PATTERN.test(purpose.workflow)) {
+    fail(`${label}.workflow must be a workflow file below .github/workflows/`);
+  }
+  const permissions = plainObject(purpose.permissions, `${label}.permissions`);
+  if (
+    Object.keys(permissions).length === 0 ||
+    Object.entries(permissions).some(
+      ([key, value]) => !/^[a-z][a-z0-9_]*$/.test(key) || key === "metadata" || !["read", "write"].includes(value),
+    )
+  ) {
+    fail(`${label}.permissions must name at least one permission as read or write (GitHub adds metadata: read)`);
+  }
+  assertAccepted(installationPermissions, permissions, label);
+  if (!Array.isArray(purpose.rules) || purpose.rules.length === 0) fail(`${label}.rules must be a non-empty list`);
+  const rules = purpose.rules.map((rule, ruleIndex) => parseOidcRule(rule, `${label}.rules[${ruleIndex}]`, permissions));
+  const maxGrants = purpose.max_grants_per_run;
+  if (!Number.isSafeInteger(maxGrants) || maxGrants < 1 || maxGrants > MAX_GRANTS_PER_RUN) {
+    fail(`${label}.max_grants_per_run must be an integer from 1 to ${MAX_GRANTS_PER_RUN}`);
+  }
+  return Object.freeze({
+    purpose: purpose.purpose,
+    repository,
+    workflow: purpose.workflow,
+    rules: Object.freeze(rules),
+    permissions: Object.freeze({ ...permissions }),
+    max_grants_per_run: maxGrants,
+  });
+}
+
+/**
+ * The optional `oidc` section: the purposes for which GitHub Actions workflows of the listed
+ * Deployment Repos may exchange an OIDC token for one installation token. Absent, the broker has no
+ * OIDC route. Every purpose is configuration: a new purpose is one more reviewed entry.
+ */
+function parseOidc(input, installationPermissions, ownerId) {
+  exactKeys(
+    input,
+    ["audience", "runner_environments", "deployment_repositories", "purposes"],
+    ["audience", "deployment_repositories", "purposes"],
+    "oidc",
+  );
+  const audience = canonicalHttpsOrigin(input.audience, "oidc.audience");
+  const runnerEnvironments = input.runner_environments ?? ["github-hosted"];
+  if (
+    !Array.isArray(runnerEnvironments) ||
+    runnerEnvironments.length === 0 ||
+    runnerEnvironments.some((value) => !RUNNER_ENVIRONMENTS.includes(value)) ||
+    new Set(runnerEnvironments).size !== runnerEnvironments.length
+  ) {
+    fail("oidc.runner_environments must list github-hosted and optionally self-hosted");
+  }
+  if (!Array.isArray(input.deployment_repositories) || input.deployment_repositories.length === 0) {
+    fail("oidc.deployment_repositories must be a non-empty list");
+  }
+  const deploymentRepositories = input.deployment_repositories.map((entry, index) => {
+    const label = `oidc.deployment_repositories[${index}]`;
+    exactKeys(entry, ["repository_id", "repository_owner_id"], ["repository_id", "repository_owner_id"], label);
+    return Object.freeze({
+      repository_id: positiveInteger(entry.repository_id, `${label}.repository_id`),
+      repository_owner_id: positiveInteger(entry.repository_owner_id, `${label}.repository_owner_id`),
+    });
+  });
+  if (new Set(deploymentRepositories.map(({ repository_id }) => repository_id)).size !== deploymentRepositories.length) {
+    fail("oidc.deployment_repositories must list each repository id once");
+  }
+  if (!Array.isArray(input.purposes) || input.purposes.length === 0) fail("oidc.purposes must be a non-empty list");
+  const purposes = input.purposes.map((purpose, index) => parseOidcPurpose(purpose, index, installationPermissions));
+  if (new Set(purposes.map(({ purpose }) => purpose)).size !== purposes.length) {
+    fail("oidc.purposes must name each purpose once");
+  }
+  // A purpose for the caller's own repository can only ever serve this Organization's repositories.
+  if (
+    purposes.some(({ repository }) => repository === "caller") &&
+    !deploymentRepositories.some(({ repository_owner_id }) => repository_owner_id === ownerId)
+  ) {
+    fail("a purpose for the caller's repository needs a Deployment Repo of the policy's Organization");
+  }
+  return Object.freeze({
+    audience,
+    runner_environments: Object.freeze([...runnerEnvironments]),
+    deployment_repositories: Object.freeze(deploymentRepositories),
+    purposes: Object.freeze(purposes),
+  });
 }
 
 function positiveInteger(value, label) {
@@ -258,8 +540,12 @@ export function parsePolicy(raw) {
     );
   }
 
-  if (!Array.isArray(input.workspaces) || input.workspaces.length === 0) {
-    fail("workspaces must be a non-empty array");
+  // Optional and absent by default: without it the broker serves Workspaces only and has no OIDC route.
+  const oidc = input.oidc === undefined ? undefined : parseOidc(input.oidc, installationPermissions, ownerId);
+
+  // A broker that only serves OIDC purposes may hold no Workspace; otherwise at least one is required.
+  if (!Array.isArray(input.workspaces) || (input.workspaces.length === 0 && oidc === undefined)) {
+    fail("workspaces must be a non-empty array (or an empty array when the policy declares oidc purposes)");
   }
   const workspaces = input.workspaces.map((workspace, index) => {
     if (workspace && typeof workspace === "object" && Object.hasOwn(workspace, "repository_ids")) {
@@ -312,7 +598,117 @@ export function parsePolicy(raw) {
     installation_repository_selection: installationRepositorySelection,
     installation_permissions: Object.freeze({ ...installationPermissions }),
     workspaces: Object.freeze(workspaces),
+    ...(oidc === undefined ? {} : { oidc }),
   });
+}
+
+/** The GitHub Actions OIDC claims the broker reads, as the verifier normalized them. */
+function decimalClaim(value) {
+  return typeof value === "string" && /^[1-9][0-9]{0,19}$/.test(value) && Number.isSafeInteger(Number(value))
+    ? Number(value)
+    : undefined;
+}
+
+/** The checks of one rule, in order; a refusal names the check of the rule that came closest. */
+const OIDC_RULE_CHECKS = Object.freeze([
+  "event_not_allowed",
+  "ref_not_allowed",
+  "workflow_not_allowed",
+  "job_workflow_not_allowed",
+  "environment_mismatch",
+]);
+
+function oidcRuleRefusal(purpose, rule, claims) {
+  if (!rule.events.includes(claims.event_name)) return "event_not_allowed";
+  if (claims.ref !== rule.ref) return "ref_not_allowed";
+  // The reviewed workflow file of the caller's repository, at the admitted branch.
+  if (claims.workflow_ref !== `${claims.repository}/${purpose.workflow}@${rule.ref}`) return "workflow_not_allowed";
+  // The job itself is defined in that file, not in a reusable workflow it calls.
+  if (claims.job_workflow_ref !== claims.workflow_ref) return "job_workflow_not_allowed";
+  if (claims.environment !== rule.environment) return "environment_mismatch";
+  return undefined;
+}
+
+/**
+ * Pure admission of one verified GitHub Actions OIDC caller for one purpose. Throws OidcRefusal with
+ * the first failed check. The order reveals as little as possible to a caller that is not admitted:
+ * any GitHub workflow can obtain a token for this audience, so the Deployment Repo allowlist comes
+ * first. Returns the one repository to mint for, the exact permission set and the access it implies.
+ */
+export function admitOidcRequest(policy, claims, purposeName) {
+  const oidc = policy?.oidc;
+  if (!oidc) fail("the policy declares no OIDC purposes");
+  const repositoryId = decimalClaim(claims?.repository_id);
+  const ownerId = decimalClaim(claims?.repository_owner_id);
+  if (repositoryId === undefined || ownerId === undefined) refuseOidc("token_claims_invalid");
+  const listed = oidc.deployment_repositories.find((entry) => entry.repository_id === repositoryId);
+  if (!listed) refuseOidc("repository_not_admitted");
+  // Repository ids survive a transfer; the owner id binds the entry to the Organization it names.
+  if (listed.repository_owner_id !== ownerId) refuseOidc("repository_owner_mismatch");
+  const purpose = oidc.purposes.find((entry) => entry.purpose === purposeName);
+  if (!purpose) refuseOidc("purpose_unknown");
+  if (purpose.repository === "caller" && ownerId !== policy.github_owner.id) refuseOidc("repository_denied");
+  if (!oidc.runner_environments.includes(claims.runner_environment)) refuseOidc("runner_not_allowed");
+
+  let refusal;
+  for (const rule of purpose.rules) {
+    const ruleRefused = oidcRuleRefusal(purpose, rule, claims);
+    if (ruleRefused === undefined) {
+      const permissions = rule.read_only ? lowerToRead(purpose.permissions) : purpose.permissions;
+      return Object.freeze({
+        purpose: purpose.purpose,
+        repository_id: purpose.repository === "caller" ? repositoryId : purpose.repository.repository_id,
+        permissions,
+        access: Object.values(permissions).includes("write") ? WRITE_ACCESS : READ_ACCESS,
+        max_grants_per_run: purpose.max_grants_per_run,
+      });
+    }
+    if (refusal === undefined || OIDC_RULE_CHECKS.indexOf(ruleRefused) > OIDC_RULE_CHECKS.indexOf(refusal)) {
+      refusal = ruleRefused;
+    }
+  }
+  refuseOidc(refusal);
+}
+
+const JTI_PATTERN = /^[\x21-\x7e]{1,256}$/;
+
+/**
+ * Deny-only per-run state behind the OIDC route: each OIDC token (`jti`) is accepted once, and each
+ * purpose at most `limit` times per workflow run attempt. `storage` is one run's Durable Object
+ * storage (or an equivalent with get, put, getAlarm and setAlarm). It never allows anything the
+ * admission refused; it only refuses. Returns "admitted", "replayed" or "rate_limited".
+ */
+export async function admitRunGrant(storage, request, now) {
+  const { jti, expires_at: expiresAt, purpose, limit } = request ?? {};
+  if (
+    typeof jti !== "string" ||
+    !JTI_PATTERN.test(jti) ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= 0 ||
+    typeof purpose !== "string" ||
+    !PURPOSE_NAME_PATTERN.test(purpose) ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > MAX_GRANTS_PER_RUN
+  ) {
+    fail("run guard request is invalid");
+  }
+  const stored = await storage.get("run");
+  const nowSeconds = Math.floor(now / 1000);
+  // A token past its expiry and the verifier's tolerance can no longer be presented at all.
+  const jtis = (Array.isArray(stored?.jtis) ? stored.jtis : []).filter(
+    ([, expiry]) => expiry + 2 * OIDC_CLOCK_TOLERANCE_SECONDS >= nowSeconds,
+  );
+  const grants = Array.isArray(stored?.grants) ? stored.grants : [];
+  if (jtis.some(([seen]) => seen === jti)) return "replayed";
+  const used = grants.find(([name]) => name === purpose)?.[1] ?? 0;
+  if (used >= limit) return "rate_limited";
+  await storage.put("run", {
+    jtis: [...jtis, [jti, expiresAt]],
+    grants: [...grants.filter(([name]) => name !== purpose), [purpose, used + 1]],
+  });
+  if ((await storage.getAlarm()) === null) await storage.setAlarm(now + RUN_GUARD_RETENTION_MS);
+  return "admitted";
 }
 
 function base64urlJson(value) {
@@ -610,8 +1006,13 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
    * The tier and the Workspace are required: there is no default, so a caller that lost either can
    * never mint the write set or skip the Workspace's permission ceiling.
    */
-  async function mintToken(policy, workspace, repositoryId, access) {
-    const requested = tokenPermissions(policy, access, workspace);
+  /**
+   * Mints one installation token for exactly `repositoryId` with exactly `requested` (plus GitHub's
+   * automatic `metadata: read`). A response outside that scope is revoked at once with its own token
+   * and refused, so a token nobody may hold never outlives the request. `sameIdentity` adds checks of
+   * the returned repository object.
+   */
+  async function mintScopedToken(policy, repositoryId, requested, sameIdentity = () => true) {
     const result = await request(`/app/installations/${policy.installation_id}/access_tokens`, {
       method: "POST",
       body: {
@@ -634,14 +1035,61 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       Object.entries(returnedPermissions).some(
         ([permission, level]) =>
           requested[permission] !== level && !(permission === "metadata" && level === "read"),
-      )
+      ) ||
+      !sameIdentity(returnedRepositories[0])
     ) {
+      if (typeof result?.token === "string" && /^[!-~]{1,255}$/.test(result.token)) {
+        // The refusal is the outcome; a failed revocation must not disguise it.
+        await request("/installation/token", { method: "DELETE", authorization: `Bearer ${result.token}` }).catch(
+          () => {},
+        );
+      }
       fail("GitHub returned a token outside the requested repository or permission scope");
     }
+    return result;
+  }
+
+  async function mintToken(policy, workspace, repositoryId, access) {
+    const requested = tokenPermissions(policy, access, workspace);
+    const result = await mintScopedToken(policy, repositoryId, requested);
     return { token: result.token, expires_at: result.expires_at, repository_id: repositoryId, access };
   }
 
-  return Object.freeze({ verifyPolicy, verifyTeamGrant, verifyWorkspaceTeam, readWorkspaceTeamGrants, mintToken });
+  /**
+   * Mints the token of an admitted OIDC purpose: one repository of the policy's Organization and
+   * exactly the purpose's permission set, which must lie within the accepted installation
+   * permissions. Returns the canonical repository name GitHub reports for that id.
+   */
+  async function mintPurposeToken(policy, repositoryId, permissions) {
+    if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) fail("purpose token needs a repository id");
+    const requested = Object.freeze({ ...plainObject(permissions, "purpose permissions") });
+    if (Object.keys(requested).length === 0 || Object.values(requested).some((level) => !PERMISSION_LEVELS[level])) {
+      fail("purpose token needs an exact permission set");
+    }
+    assertAccepted(policy.installation_permissions, requested, "purpose token");
+    const result = await mintScopedToken(
+      policy,
+      repositoryId,
+      requested,
+      (repository) => repository?.owner?.id === policy.github_owner.id && parseRepositoryCoordinate(repository?.full_name) !== undefined,
+    );
+    return {
+      token: result.token,
+      expires_at: result.expires_at,
+      repository_id: repositoryId,
+      repository: parseRepositoryCoordinate(result.repositories[0].full_name).full_name,
+      permissions: requested,
+    };
+  }
+
+  return Object.freeze({
+    verifyPolicy,
+    verifyTeamGrant,
+    verifyWorkspaceTeam,
+    readWorkspaceTeamGrants,
+    mintToken,
+    mintPurposeToken,
+  });
 }
 
 /**
@@ -700,7 +1148,54 @@ function result(status, body) {
   return Object.freeze({ status, body });
 }
 
-export function createBrokerHandler({ policy, github, credentials, secretMatches }) {
+/** The verified claims of an OIDC caller that an audit line keeps; never the token itself. */
+function auditedCaller(claims) {
+  return Object.freeze({
+    repository_id: claims.repository_id ?? null,
+    repository_owner_id: claims.repository_owner_id ?? null,
+    repository: claims.repository ?? null,
+    event_name: claims.event_name ?? null,
+    ref: claims.ref ?? null,
+    environment: claims.environment ?? null,
+    workflow_ref: claims.workflow_ref ?? null,
+    job_workflow_ref: claims.job_workflow_ref ?? null,
+    runner_environment: claims.runner_environment ?? null,
+    run_id: claims.run_id ?? null,
+    run_attempt: claims.run_attempt ?? null,
+    actor_id: claims.actor_id ?? null,
+    actor: claims.actor ?? null,
+    sha: claims.sha ?? null,
+    jti: claims.jti ?? null,
+  });
+}
+
+/**
+ * One audit line per OIDC decision (`lazurio.github_app_broker.audit.v1`). It carries the decision,
+ * its code, the purpose, the verified caller claims (none for a token that did not verify) and, for
+ * a grant, the repository, access, permissions and expiry. It never carries a token, the OIDC token
+ * or a request header.
+ */
+function oidcAuditRecord({ at, status, code, purpose, claims, grant }) {
+  return Object.freeze({
+    schema_version: AUDIT_SCHEMA,
+    at,
+    event: "oidc_token",
+    decision: status === 200 ? "granted" : "refused",
+    status,
+    code,
+    purpose: purpose ?? null,
+    caller: claims ? auditedCaller(claims) : null,
+    grant: grant ?? null,
+  });
+}
+
+/**
+ * `oidc` holds the adapter's OIDC capabilities: `verify(token)` returns verified claims or throws
+ * OidcRefusal, `guard.admit(...)` is the per-run replay and grant budget, `audit(record)` receives
+ * one line per decision and `now()` is the clock. Without them, or without an `oidc` policy section,
+ * `POST /v1/oidc/token` does not exist (404).
+ */
+export function createBrokerHandler({ policy, github, credentials, secretMatches, oidc }) {
   if (!(credentials instanceof Map)) fail("Workspace credentials must be a Map");
   if (typeof secretMatches !== "function") fail("secret matcher is missing");
   if (
@@ -709,6 +1204,17 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     typeof github?.mintToken !== "function"
   ) {
     fail("GitHub client must verify the Team grant and Workspace Team and mint tokens");
+  }
+  const oidcEnabled = policy.oidc !== undefined && oidc !== undefined;
+  if (
+    oidcEnabled &&
+    (typeof oidc.verify !== "function" ||
+      typeof oidc.guard?.admit !== "function" ||
+      typeof oidc.audit !== "function" ||
+      typeof oidc.now !== "function" ||
+      typeof github.mintPurposeToken !== "function")
+  ) {
+    fail("OIDC purposes need a verifier, a run guard, an audit sink, a clock and a purpose mint");
   }
   const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
   const ownerKey = policy.github_owner.login.toLowerCase();
@@ -790,6 +1296,94 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     });
   }
 
+  /**
+   * `POST /v1/oidc/token`: a GitHub Actions OIDC token and `{"purpose": "<name>"}` in, one
+   * installation token for the purpose's one repository out. Gates, in order: token verification,
+   * body, admission by the purpose table, the per-run replay and grant budget, then (in the adapter)
+   * the live installation gate and the scoped mint. Every outcome writes one audit line.
+   */
+  async function oidcToken({ contentType, authorization, readBody }) {
+    let claims;
+    let purposeName;
+    const audit = (status, code, grant) => {
+      try {
+        oidc.audit(
+          oidcAuditRecord({ at: new Date(oidc.now()).toISOString(), status, code, purpose: purposeName, claims, grant }),
+        );
+      } catch {
+        // An audit sink failure never changes the decision.
+      }
+    };
+    const refused = (code) => {
+      const status = OIDC_REFUSALS[code];
+      audit(status, code);
+      return result(status, { error: code });
+    };
+    if (!contentType.toLowerCase().startsWith("application/json")) return refused("unsupported_media_type");
+    try {
+      const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+      if (bearer === "") return refused("token_missing");
+      claims = await oidc.verify(bearer);
+
+      if (typeof readBody !== "function") fail("request body reader is missing");
+      const bodyText = await readBody();
+      if (typeof bodyText !== "string") fail("request body reader returned an invalid value");
+      if (new TextEncoder().encode(bodyText).byteLength > MAX_BODY_BYTES) fail("request body is too large");
+      purposeName = parseOidcTokenRequest(bodyText);
+      if (purposeName === undefined) return refused(INVALID_REQUEST);
+
+      const admitted = admitOidcRequest(policy, claims, purposeName);
+      if (
+        decimalClaim(claims.run_id) === undefined ||
+        decimalClaim(claims.run_attempt) === undefined ||
+        typeof claims.jti !== "string" ||
+        !Number.isSafeInteger(claims.exp)
+      ) {
+        return refused("token_claims_invalid");
+      }
+      const decision = await oidc.guard.admit({
+        key: `${claims.repository_id}/${claims.run_id}/${claims.run_attempt}`,
+        jti: claims.jti,
+        expires_at: claims.exp,
+        purpose: admitted.purpose,
+        limit: admitted.max_grants_per_run,
+      });
+      if (decision === "replayed") return refused("token_replayed");
+      if (decision === "rate_limited") return refused("rate_limited");
+      if (decision !== "admitted") fail("run guard returned an invalid decision");
+
+      const minted = await github.mintPurposeToken(policy, admitted.repository_id, admitted.permissions);
+      const repository = parseRepositoryCoordinate(minted?.repository);
+      if (
+        typeof minted?.token !== "string" ||
+        minted.repository_id !== admitted.repository_id ||
+        !repository ||
+        canonicalObject(minted.permissions) !== canonicalObject(admitted.permissions)
+      ) {
+        fail("minted purpose token is outside the admitted repository or permission set");
+      }
+      const grant = Object.freeze({
+        repository_id: admitted.repository_id,
+        repository: repository.full_name,
+        access: admitted.access,
+        permissions: admitted.permissions,
+        expires_at: minted.expires_at,
+      });
+      audit(200, "granted", grant);
+      return result(200, {
+        token: minted.token,
+        expires_at: minted.expires_at,
+        repository_id: admitted.repository_id,
+        repository: repository.full_name,
+        access: admitted.access,
+        permissions: admitted.permissions,
+      });
+    } catch (error) {
+      if (error instanceof OidcRefusal) return refused(error.code);
+      return refused("token_unavailable");
+    }
+  }
+
   return async ({
     method,
     path,
@@ -800,6 +1394,9 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
   }) => {
     if (method === "GET" && path === "/health") {
       return result(204, null);
+    }
+    if (method === "POST" && path === "/v1/oidc/token" && oidcEnabled) {
+      return oidcToken({ contentType, authorization, readBody });
     }
     if (method !== "POST" || (path !== "/v1/token" && path !== "/v1/workspace")) {
       return result(404, { error: "not_found" });

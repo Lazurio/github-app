@@ -11,6 +11,18 @@ the official GitHub CLI. GitHub CLI 2.97.0 is licensed under the MIT License:
 - copyright: Copyright (c) 2019 GitHub Inc.
 - license text: [`third_party/github-cli/LICENSE`](./third_party/github-cli/LICENSE)
 
+The Cloudflare Worker bundle built from this source includes jose, which
+verifies GitHub Actions OIDC tokens. jose 6.2.12 is licensed under the MIT
+License:
+
+- project: <https://github.com/panva/jose>
+- exact release source: <https://github.com/panva/jose/tree/v6.2.12>
+- copyright: Copyright (c) 2018 Filip Skokan
+- license text: [`third_party/jose/LICENSE.md`](./third_party/jose/LICENSE.md)
+
+The OCI image does not contain jose: the Node.js broker in the image serves no
+OIDC route and never loads it.
+
 The official Node.js base image and its Debian packages retain their own
 license materials in the image. The exact release SBOM enumerates the
 components present in each immutable OCI artifact.
