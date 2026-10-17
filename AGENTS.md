@@ -56,10 +56,13 @@ dependency-light and customer-neutral.
    Nothing from that readback is cached; the policy, the Dashboard and any
    derived mapping are reviewed inputs, never a second ACL.
 10. `POST /v1/oidc/token` admits a GitHub Actions job only from signed claims:
-    this broker's exact audience, a listed immutable repository id with its
-    listed owner id, the purpose's workflow file on one exact branch with the
-    job defined in that file, an admitted event, GitHub Environment and runner
-    environment (`github-hosted` unless configured). Each OIDC token is used
+    this broker's origin as the token's only audience, a listed immutable
+    repository id with its listed owner id, the purpose's workflow file on one
+    exact branch as `workflow_ref` (sent on every token; admission keys on it),
+    a `job_workflow_ref` that is absent or names that same file (GitHub
+    documents it only for reusable workflows, so never require it), an
+    admitted event, GitHub Environment and runner environment
+    (`github-hosted` unless configured). Each OIDC token is used
     once and each purpose has a per-run budget, kept in a deny-only Durable
     Object that never allows anything admission refused; it is the broker's
     only state. Purposes are configuration; a new purpose is a reviewed policy

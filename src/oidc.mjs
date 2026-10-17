@@ -2,9 +2,10 @@
 //
 // GitHub Actions OIDC token verification with jose: RS256 only, GitHub's key set from its JWKS
 // (cached by jose, refetched for an unknown key id at most once per cooldown, every fetch bounded
-// by a timeout), the exact issuer and audience, required exp and iat and 60 seconds of clock
-// tolerance. The broker's admission (core.mjs) reads only claims returned from here, so nothing it
-// decides on is a claim GitHub did not sign. Only the Worker adapter imports this module.
+// by a timeout), the exact issuer, the broker's origin as the token's only audience, required exp
+// and iat and 60 seconds of clock tolerance. The broker's admission (core.mjs) reads only claims
+// returned from here, so nothing it decides on is a claim GitHub did not sign. Only the Worker
+// adapter imports this module.
 import { createRemoteJWKSet, customFetch, decodeProtectedHeader, errors, jwtVerify } from "jose";
 
 import { OIDC_CLOCK_TOLERANCE_SECONDS, OidcRefusal } from "./core.mjs";
@@ -81,15 +82,23 @@ function decimalClaim(payload, name) {
   return value;
 }
 
-/** The claims admission reads, normalized: ids stay GitHub's decimal strings, a missing environment is null. */
-function claimsOf(payload) {
-  const environment = payload.environment;
-  if (
-    environment !== undefined &&
-    (typeof environment !== "string" || environment.length === 0 || environment.length > 255)
-  ) {
+/** An optional string claim: null when GitHub did not send it, refused when it is present but invalid. */
+function optionalStringClaim(payload, name, maxLength = 512) {
+  if (payload[name] === undefined) return null;
+  const value = payload[name];
+  if (typeof value !== "string" || value.length === 0 || value.length > maxLength) {
     throw new OidcRefusal("token_claims_invalid");
   }
+  return value;
+}
+
+/**
+ * The claims admission reads, normalized: ids stay GitHub's decimal strings; a missing `environment`
+ * is null, and so is a missing `job_workflow_ref`, which GitHub documents for jobs that use a
+ * reusable workflow and need not send for a job defined directly in the workflow file.
+ */
+function claimsOf(payload) {
+  const environment = optionalStringClaim(payload, "environment", 255);
   const sha = typeof payload.sha === "string" && COMMIT.test(payload.sha) ? payload.sha : null;
   return Object.freeze({
     jti: stringClaim(payload, "jti", JTI),
@@ -101,9 +110,9 @@ function claimsOf(payload) {
     repository_owner_id: decimalClaim(payload, "repository_owner_id"),
     ref: stringClaim(payload, "ref"),
     event_name: stringClaim(payload, "event_name"),
-    environment: environment ?? null,
+    environment,
     workflow_ref: stringClaim(payload, "workflow_ref"),
-    job_workflow_ref: stringClaim(payload, "job_workflow_ref"),
+    job_workflow_ref: optionalStringClaim(payload, "job_workflow_ref"),
     runner_environment: stringClaim(payload, "runner_environment"),
     run_id: decimalClaim(payload, "run_id"),
     run_attempt: decimalClaim(payload, "run_attempt"),
@@ -114,9 +123,17 @@ function claimsOf(payload) {
 }
 
 /**
+ * jose accepts an `aud` array that merely contains the expected audience. The broker requires its
+ * origin to be the token's only audience: the string itself, or an array of exactly that string.
+ */
+function audienceIsExactly(aud, audience) {
+  return aud === audience || (Array.isArray(aud) && aud.length === 1 && aud[0] === audience);
+}
+
+/**
  * Returns `verify(token)`, which resolves to the verified claims of one GitHub Actions OIDC token
- * for exactly `audience` (this broker's public origin) or throws OidcRefusal. A token without a key
- * id is malformed: it would otherwise verify against any single key of the set.
+ * whose only audience is `audience` (this broker's public origin) or throws OidcRefusal. A token
+ * without a key id is malformed: it would otherwise verify against any single key of the set.
  */
 export function createOidcVerifier({ audience, keySet, now = () => Date.now() }) {
   if (typeof audience !== "string" || audience.length === 0) throw new Error("OIDC audience is missing");
@@ -146,8 +163,9 @@ export function createOidcVerifier({ audience, keySet, now = () => Date.now() })
     } catch (error) {
       throw refusalFor(error);
     }
-    // jose has checked exp, nbf, iss, aud and that exp and iat exist; a token issued in the future
-    // is refused here.
+    // jose has checked exp, nbf, iss, that aud contains the audience and that exp and iat exist; a
+    // token for several audiences and a token issued in the future are refused here.
+    if (!audienceIsExactly(payload.aud, audience)) throw new OidcRefusal("token_audience_mismatch");
     if (payload.iat > Math.floor(current / 1000) + OIDC_CLOCK_TOLERANCE_SECONDS) {
       throw new OidcRefusal("token_not_yet_valid");
     }
