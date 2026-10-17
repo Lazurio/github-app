@@ -621,10 +621,14 @@ const OIDC_RULE_CHECKS = Object.freeze([
 function oidcRuleRefusal(purpose, rule, claims) {
   if (!rule.events.includes(claims.event_name)) return "event_not_allowed";
   if (claims.ref !== rule.ref) return "ref_not_allowed";
-  // The reviewed workflow file of the caller's repository, at the admitted branch.
+  // The reviewed workflow file of the caller's repository, at the admitted branch. GitHub sends
+  // `workflow_ref` on every token, so admission keys on it.
   if (claims.workflow_ref !== `${claims.repository}/${purpose.workflow}@${rule.ref}`) return "workflow_not_allowed";
-  // The job itself is defined in that file, not in a reusable workflow it calls.
-  if (claims.job_workflow_ref !== claims.workflow_ref) return "job_workflow_not_allowed";
+  // GitHub documents `job_workflow_ref` for a job that runs a reusable workflow; a job defined
+  // directly in the file may omit it. When present it must name that same file: no reusable-workflow
+  // indirection is admitted.
+  const jobWorkflowRef = claims.job_workflow_ref ?? null;
+  if (jobWorkflowRef !== null && jobWorkflowRef !== claims.workflow_ref) return "job_workflow_not_allowed";
   if (claims.environment !== rule.environment) return "environment_mismatch";
   return undefined;
 }

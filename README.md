@@ -775,7 +775,7 @@ is [`examples/policy.oidc.example.json`](./examples/policy.oidc.example.json):
 
 - `audience` is this broker's exact public origin (`https`, no path, port or
   trailing slash). A token GitHub issued for any other audience, such as the
-  rollout gateway's, is refused.
+  rollout gateway's, or for several audiences at once, is refused.
 - `deployment_repositories` lists the callers by immutable repository id and
   the owner id that repository must still have. A transferred repository keeps
   its id, so the owner id is checked too.
@@ -834,10 +834,12 @@ with one concrete code. Nothing before step 10 costs a GitHub API request
 8. `runner_environment` is admitted (`403 runner_not_allowed`), and one rule
    admits the job: its `event_name` (`403 event_not_allowed`), its `ref`
    (`403 ref_not_allowed`), `workflow_ref` equal to
-   `<repository>/<workflow>@<ref>` (`403 workflow_not_allowed`),
-   `job_workflow_ref` equal to `workflow_ref`, so the job is defined in that
-   file and not in a reusable workflow it calls
-   (`403 job_workflow_not_allowed`), and its GitHub Environment
+   `<repository>/<workflow>@<ref>` (`403 workflow_not_allowed`), which GitHub
+   sends on every token and on which admission keys; `job_workflow_ref`, which
+   GitHub documents for a job that runs a reusable workflow and need not send
+   for a job defined directly in the file, either absent or equal to
+   `workflow_ref`, so no reusable workflow stands between the reviewed file and
+   the token (`403 job_workflow_not_allowed`); and its GitHub Environment
    (`403 environment_mismatch`). With several rules, the refusal names the
    check of the rule that came closest;
 9. the run guard: each OIDC token once (`401 token_replayed`) and each purpose
@@ -862,16 +864,20 @@ with one concrete code. Nothing before step 10 costs a GitHub API request
 ### Token verification
 
 The Worker verifies the token with [jose](https://github.com/panva/jose): the
-issuer `https://token.actions.githubusercontent.com`, the exact `audience`,
-`RS256` only, a required key id (a token without one would otherwise verify
-against a key set that holds a single key), required `exp` and `iat`, `60`
-seconds of clock tolerance and no `iat` in the future. GitHub's key set comes
+issuer `https://token.actions.githubusercontent.com`, `RS256` only, a required
+key id (a token without one would otherwise verify against a key set that
+holds a single key), required `exp` and `iat`, `60` seconds of clock
+tolerance and no `iat` in the future. The broker's `audience` must be the
+token's only audience: `aud` is that string, or an array holding exactly it.
+jose alone also accepts an array that merely contains it, so the broker checks
+`aud` again after jose. GitHub's key set comes
 from its JWKS endpoint, cached by jose per Worker isolate for at most ten
 minutes, refetched for an unknown key id at most once per 30-second cooldown,
 each fetch bounded by five seconds. A key set that cannot be fetched is
 `503 jwks_unavailable`, never a refusal of the token. Admission reads only the
 verified claims: ids such as `repository_id` stay GitHub's decimal strings and
-a job without a GitHub Environment has `environment: null`.
+a job without a GitHub Environment has `environment: null`, as a job without
+`job_workflow_ref` has `job_workflow_ref: null`.
 
 ### Run guard
 

@@ -228,8 +228,9 @@ request, for one configured purpose.
 
 The credential is the job's GitHub Actions OIDC token, which GitHub signs per
 job for the audience the job asks for. The broker accepts only its own exact
-public origin as audience, verifies the signature against GitHub's published
-keys with jose and then decides from signed claims alone, in this order:
+public origin as the token's only audience, verifies the signature against
+GitHub's published keys with jose and then decides from signed claims alone,
+in this order:
 
 1. the caller's immutable `repository_id` is a listed Deployment Repo and its
    `repository_owner_id` is the owner listed with it;
@@ -238,8 +239,11 @@ keys with jose and then decides from signed claims alone, in this order:
 3. the runner environment is admitted (`github-hosted` unless the policy also
    admits `self-hosted`);
 4. one rule of the purpose admits the job's event, its exact branch ref, the
-   reviewed workflow file at that ref (`workflow_ref`), the job being defined
-   in that file itself (`job_workflow_ref`) and its GitHub Environment;
+   reviewed workflow file at that ref (`workflow_ref`, which GitHub sends on
+   every token) and its GitHub Environment; a `job_workflow_ref`, which GitHub
+   documents for jobs that run a reusable workflow, must be absent or name that
+   same file, so no reusable workflow is admitted unless a later policy names
+   one;
 5. the run guard has not seen this OIDC token and the purpose has budget left
    in this workflow run attempt;
 6. the live installation gate, unchanged.
@@ -300,15 +304,16 @@ runners.** The route is public: anyone can send a request, and any GitHub
 Actions workflow anywhere can obtain a validly signed OIDC token for this
 broker's audience. The rules above bound what that reach can achieve:
 
-- Without a token GitHub signed for this exact audience, a request fails
-  before any state or GitHub request. Forged, expired, foreign-audience and
-  key-less tokens are refused; GitHub's key set is fetched at most once per
-  cooldown, so invalid tokens cannot drive traffic to GitHub's JWKS endpoint.
+- Without a token GitHub signed for this broker as its only audience, a
+  request fails before any state or GitHub request. Forged, expired,
+  foreign-audience, multi-audience and key-less tokens are refused; GitHub's
+  key set is fetched at most once per cooldown, so invalid tokens cannot drive
+  traffic to GitHub's JWKS endpoint.
 - A validly signed token from a repository that is not listed, or whose owner
   changed, is refused first, so strangers learn nothing about the purposes.
 - A listed repository obtains a token only from the reviewed workflow file on
-  its default branch, for a job defined in that file, for the admitted events
-  and GitHub Environment. Code that runs with the token therefore passed the
+  its default branch, never through a reusable workflow that file calls, for
+  the admitted events and GitHub Environment. Code that runs with the token therefore passed the
   Deployment Repo's own review and branch rules, and an apply additionally
   waited for the Environment's required reviewers before the job started. A
   pull request cannot change which workflow runs: `pull_request` runs never

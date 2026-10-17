@@ -342,6 +342,34 @@ test("admission refuses every event, ref, workflow, job workflow and environment
   assert.equal(refusalOf(() => admit({ ...OTHER_ORG, environment: "staging" }, "machines-release")), "environment_mismatch");
 });
 
+test("admission keys on workflow_ref; job_workflow_ref may be absent, may equal it, and is refused when it differs", () => {
+  const reusable = "other-org/shared/.github/workflows/apply.yml@refs/heads/main";
+  const ownReusable = `example-org/deployment/.github/workflows/apply-reusable.yml@refs/heads/main`;
+  for (const [purpose, job] of [
+    ["deployment-apply", {}],
+    ["deployment-apply", PLAN_RUN],
+    ["machines-release", {}],
+    ["machines-release", PLAN_RUN],
+    ["machines-release", OTHER_ORG],
+  ]) {
+    const label = `${purpose} ${JSON.stringify(job)}`;
+    // A job defined directly in the admitted workflow file: GitHub need not send the claim.
+    assert.equal(admit({ ...job, job_workflow_ref: null }, purpose).purpose, purpose, `absent: ${label}`);
+    assert.equal(admit({ ...job, job_workflow_ref: undefined }, purpose).purpose, purpose, `undefined: ${label}`);
+    // The same job when GitHub does send it: it names the admitted file itself.
+    assert.equal(admit(job, purpose).purpose, purpose, `equal: ${label}`);
+    // A job that runs a reusable workflow, of another repository or of the caller's own: refused.
+    for (const job_workflow_ref of [reusable, ownReusable]) {
+      assert.equal(refusalOf(() => admit({ ...job, job_workflow_ref }, purpose)), "job_workflow_not_allowed", `different: ${label}`);
+    }
+  }
+  // Absence never stands in for the workflow itself: workflow_ref still decides.
+  assert.equal(
+    refusalOf(() => admit({ job_workflow_ref: null, workflow_ref: `example-org/deployment/.github/workflows/other.yml@refs/heads/main` })),
+    "workflow_not_allowed",
+  );
+});
+
 test("admission names the check of the rule that came closest to admitting the run", () => {
   // The push rule fails only at its environment; the Plan rule already fails at its event.
   assert.equal(refusalOf(() => admit({ environment: "staging" })), "environment_mismatch");
@@ -441,6 +469,51 @@ async function signedToken(
   return new SignJWT(payload).setProtectedHeader(header).sign(privateKey);
 }
 
+/**
+ * The claim set GitHub documents for a job defined directly in its workflow file, as runner mode's
+ * `plan` and `apply` jobs are: no reusable-workflow claim `job_workflow_ref`, plus the claims the
+ * broker does not read (`sub`, `workflow`, `ref_type`, `x5t`, ...). `plan` makes it the
+ * `pull_request_target` Plan job, which runs without a GitHub Environment.
+ */
+async function plainJobToken({ plan = false, ...overrides } = {}) {
+  const repository = "example-org/deployment";
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    jti: crypto.randomUUID(),
+    sub: plan ? `repo:${repository}:pull_request` : `repo:${repository}:environment:production`,
+    ...(plan ? {} : { environment: "production" }),
+    aud: AUDIENCE,
+    ref: "refs/heads/main",
+    sha: "b".repeat(40),
+    repository,
+    repository_owner: "example-org",
+    actor_id: "5001",
+    repository_visibility: "private",
+    repository_id: "3101",
+    repository_owner_id: "1001",
+    run_id: plan ? "9201" : "9202",
+    run_number: "12",
+    run_attempt: "1",
+    runner_environment: "github-hosted",
+    actor: "example-user",
+    workflow: "Lazurio rollout",
+    head_ref: plan ? "lane-change" : "",
+    base_ref: plan ? "main" : "",
+    event_name: plan ? "pull_request_target" : "push",
+    ref_type: "branch",
+    workflow_ref: `${repository}/${WORKFLOW}@refs/heads/main`,
+    workflow_sha: "b".repeat(40),
+    iss: GITHUB_ACTIONS_ISSUER,
+    nbf: now - 300,
+    exp: now + 300,
+    iat: now,
+    ...overrides,
+  };
+  return new SignJWT(payload)
+    .setProtectedHeader({ typ: "JWT", alg: "RS256", x5t: "example-thumbprint", kid: "github-key-1" })
+    .sign(keyPair.privateKey);
+}
+
 function verifier(keySet = localKeySet, now = () => NOW_SECONDS * 1000) {
   return createOidcVerifier({ audience: AUDIENCE, keySet, now });
 }
@@ -466,6 +539,28 @@ test("the verifier returns GitHub's signed claims, with a job without an Environ
   const plan = await verifier()(await signedToken({ event_name: "pull_request_target", environment: null }));
   assert.equal(plan.environment, null);
   assert.equal(plan.event_name, "pull_request_target");
+});
+
+test("the verifier accepts a job without job_workflow_ref, keeps one GitHub sent and refuses an invalid one", async () => {
+  const verify = verifier(localKeySet, () => Date.now());
+  // A job defined directly in its workflow file need not carry the reusable-workflow claim.
+  for (const plan of [false, true]) {
+    const claims = await verify(await plainJobToken({ plan }));
+    assert.equal(claims.job_workflow_ref, null);
+    assert.equal(claims.workflow_ref, `example-org/deployment/${WORKFLOW}@refs/heads/main`);
+    assert.equal(claims.environment, plan ? null : "production");
+  }
+  // When GitHub sends it, the verifier passes it on unchanged for admission to compare.
+  const sent = `example-org/deployment/${WORKFLOW}@refs/heads/main`;
+  assert.equal((await verify(await plainJobToken({ job_workflow_ref: sent }))).job_workflow_ref, sent);
+  const reusable = "other-org/shared/.github/workflows/apply.yml@refs/heads/main";
+  assert.equal((await verify(await plainJobToken({ job_workflow_ref: reusable }))).job_workflow_ref, reusable);
+  // Present but not a claim GitHub could have sent.
+  for (const job_workflow_ref of ["", 42, null, ["x"], "x".repeat(513)]) {
+    assert.equal(await verifyRefusal(verify, await plainJobToken({ job_workflow_ref })), "token_claims_invalid", JSON.stringify(job_workflow_ref));
+  }
+  // workflow_ref, which GitHub sends on every token, stays required.
+  assert.equal(await verifyRefusal(verify, await plainJobToken({ workflow_ref: undefined })), "token_claims_invalid");
 });
 
 test("the verifier refuses missing, malformed, key-less and oversized tokens", async () => {
@@ -513,11 +608,21 @@ test("the verifier refuses another issuer or audience, expired, future and incom
   for (const aud of ["https://gateway.example.com", `${AUDIENCE}/`, [`${AUDIENCE}/v1`]]) {
     assert.equal(await verifyRefusal(verify, await signedToken({ aud })), "token_audience_mismatch", JSON.stringify(aud));
   }
+  // jose accepts an audience array that merely contains the broker's origin; the broker does not.
+  for (const aud of [
+    [AUDIENCE, "https://gateway.example.com"],
+    ["https://gateway.example.com", AUDIENCE],
+    [AUDIENCE, AUDIENCE],
+  ]) {
+    assert.equal(await verifyRefusal(verify, await signedToken({ aud })), "token_audience_mismatch", JSON.stringify(aud));
+  }
+  // The origin as the only audience, as a string or a one-element array, is the same audience.
+  assert.equal((await verify(await signedToken({ aud: [AUDIENCE] }))).repository_id, "3101");
   assert.equal(await verifyRefusal(verify, await signedToken({ iat: NOW_SECONDS - 400, exp: NOW_SECONDS - 61 })), "token_expired");
   assert.equal((await verify(await signedToken({ iat: NOW_SECONDS - 400, exp: NOW_SECONDS - 59 }))).repository_id, "3101");
   assert.equal(await verifyRefusal(verify, await signedToken({ nbf: NOW_SECONDS + 120 })), "token_not_yet_valid");
   assert.equal(await verifyRefusal(verify, await signedToken({ iat: NOW_SECONDS + 120, exp: NOW_SECONDS + 420 })), "token_not_yet_valid");
-  for (const name of ["exp", "iat", "repository_id", "repository_owner_id", "workflow_ref", "job_workflow_ref", "run_id", "runner_environment", "jti"]) {
+  for (const name of ["exp", "iat", "repository_id", "repository_owner_id", "workflow_ref", "run_id", "runner_environment", "jti"]) {
     assert.equal(await verifyRefusal(verify, await signedToken({}, { omit: [name] })), "token_claims_invalid", name);
   }
   for (const overrides of [{ repository_id: 3101 }, { run_id: "12a" }, { run_attempt: "0" }, { environment: "" }, { repository: "example-org" }]) {
@@ -1084,6 +1189,35 @@ test("Worker end to end: a push apply mints one scoped token after the installat
   assert.deepEqual(records.map(({ code }) => code), ["granted", "token_replayed"]);
   assert.equal(JSON.stringify(records).includes(body.token), false);
   assert.equal(JSON.stringify(records).includes(token), false);
+});
+
+test("Worker end to end: plain Plan and apply jobs without job_workflow_ref get their tokens; a reusable workflow does not", async () => {
+  const { worker, env, github, records } = workerFixture();
+  const apply = await worker.fetch(oidcRequest(await plainJobToken()), env);
+  assert.equal(apply.status, 200);
+  const applyBody = await apply.json();
+  assert.equal(applyBody.access, "write");
+  assert.deepEqual(applyBody.permissions, DEPLOYMENT_APPLY);
+
+  const planRelease = await worker.fetch(oidcRequest(await plainJobToken({ plan: true }), "machines-release"), env);
+  assert.equal(planRelease.status, 200);
+  assert.deepEqual((await planRelease.json()).permissions, RELEASE_READ);
+  const planDeployment = await worker.fetch(oidcRequest(await plainJobToken({ plan: true })), env);
+  assert.equal(planDeployment.status, 200);
+  assert.deepEqual((await planDeployment.json()).permissions, DEPLOYMENT_PLAN);
+
+  const before = github.calls.length;
+  for (const purpose of ["deployment-apply", "machines-release"]) {
+    const delegated = await worker.fetch(
+      oidcRequest(await plainJobToken({ job_workflow_ref: "other-org/shared/.github/workflows/apply.yml@refs/heads/main" }), purpose),
+      env,
+    );
+    assert.equal(delegated.status, 403);
+    assert.deepEqual(await delegated.json(), { error: "job_workflow_not_allowed" });
+  }
+  assert.equal(github.calls.length, before, "a refused reusable workflow costs no GitHub request");
+  assert.deepEqual(records.map(({ code }) => code), ["granted", "granted", "granted", "job_workflow_not_allowed", "job_workflow_not_allowed"]);
+  assert.equal(records[0].caller.job_workflow_ref, null);
 });
 
 test("Worker end to end: the per-run budget refuses a third deployment token of the same run", async () => {
