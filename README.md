@@ -816,7 +816,9 @@ No deployment enables it with this release.
 ### Admission and refusals
 
 Every request passes these gates in order; the first failure is the answer,
-with one concrete code, and nothing before step 9 costs a GitHub request:
+with one concrete code. Nothing before step 10 costs a GitHub API request
+(verifying the token may fetch GitHub's published signing keys, see
+[Token verification](#token-verification)):
 
 1. media type `application/json` (`415 unsupported_media_type`);
 2. a bearer OIDC token that verifies (`401`, see
