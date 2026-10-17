@@ -1,6 +1,6 @@
 {
   "name": "@lazurio/github-app-broker",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
   "license": "Apache-2.0",
   "repository": {
@@ -12,7 +12,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "check": "npm run license:check && node --check src/core.mjs && node --check src/broker.mjs && node --check src/worker.mjs && node --check adapter/broker-client.mjs && node --check adapter/brokered-gh.mjs && node --check scripts/check-licenses.mjs && node --check test/broker.test.mjs && node --check test/brokered-gh.test.mjs && node --check test/worker.test.mjs && npm run worker:dry-run",
+    "check": "npm run license:check && node --check src/core.mjs && node --check src/broker.mjs && node --check src/worker.mjs && node --check src/oidc.mjs && node --check adapter/broker-client.mjs && node --check adapter/brokered-gh.mjs && node --check scripts/check-licenses.mjs && node --check test/broker.test.mjs && node --check test/brokered-gh.test.mjs && node --check test/worker.test.mjs && node --check test/oidc.test.mjs && npm run worker:dry-run",
     "dev:worker": "wrangler dev",
     "license:check": "node scripts/check-licenses.mjs",
     "test": "node --test",
@@ -20,5 +20,8 @@
   },
   "devDependencies": {
     "wrangler": "4.127.1"
+  },
+  "dependencies": {
+    "jose": "6.2.12"
   }
 }

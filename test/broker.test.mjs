@@ -524,7 +524,7 @@ test("rejects a different configured or live GitHub App identity", async () => {
   await assert.rejects(() => wrongLiveApp.verifyPolicy(policy), /identity, selection or permissions/);
 });
 
-test("mints through repository_ids and rejects under- or over-scoped responses", async () => {
+test("mints through repository_ids and rejects under- or over-scoped responses, revoking them", async () => {
   const policy = parsePolicy(policyFixture());
   const now = 1_700_000_000_000;
   let responsePermissions = {
@@ -535,7 +535,12 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     metadata: "read",
     pull_requests: "write",
   };
-  const fetchImpl = async (_url, init) => {
+  const revocations = [];
+  const fetchImpl = async (url, init) => {
+    if (new URL(url).pathname === "/installation/token" && init.method === "DELETE") {
+      revocations.push(init.headers.Authorization);
+      return jsonResponse(null, 204);
+    }
     assert.deepEqual(JSON.parse(init.body), {
       repository_ids: [3001],
       permissions: {
@@ -565,6 +570,7 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     repository_id: 3001,
     access: "write",
   });
+  assert.deepEqual(revocations, [], "a token inside its scope is delivered, not revoked");
 
   responsePermissions = {
     checks: "read",
@@ -627,6 +633,8 @@ test("mints through repository_ids and rejects under- or over-scoped responses",
     () => mintForFirstWorkspace(github, policy, 3001, "write"),
     /outside the requested repository or permission scope/,
   );
+  // Every refused token was revoked with its own credential before the refusal.
+  assert.deepEqual(revocations, Array(5).fill("Bearer ghs_scoped_synthetic_token"));
 });
 
 test("asks for workflows: write only when the policy declares the accepted permission", async () => {

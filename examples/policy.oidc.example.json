@@ -1,0 +1,67 @@
+{
+  "schema_version": "lazurio.github_app_broker.policy.v3",
+  "github_app": {
+    "id": 1234,
+    "slug": "customer-app"
+  },
+  "github_owner": {
+    "id": 1001,
+    "login": "example-organization"
+  },
+  "installation_id": 2001,
+  "installation_repository_selection": "selected",
+  "installation_permissions": {
+    "actions": "write",
+    "administration": "read",
+    "checks": "read",
+    "contents": "write",
+    "issues": "read",
+    "members": "read",
+    "metadata": "read",
+    "organization_administration": "read",
+    "pull_requests": "write"
+  },
+  "workspaces": [],
+  "oidc": {
+    "audience": "https://github-broker.example.com",
+    "runner_environments": ["github-hosted"],
+    "deployment_repositories": [
+      { "repository_id": 3101, "repository_owner_id": 1001 },
+      { "repository_id": 7101, "repository_owner_id": 7001 }
+    ],
+    "purposes": [
+      {
+        "purpose": "deployment-apply",
+        "repository": "caller",
+        "workflow": ".github/workflows/lazurio-rollout.yml",
+        "rules": [
+          { "events": ["push", "workflow_dispatch"], "ref": "refs/heads/main", "environment": "production" },
+          { "events": ["pull_request_target"], "ref": "refs/heads/main", "environment": null, "read_only": true }
+        ],
+        "permissions": {
+          "administration": "read",
+          "checks": "read",
+          "contents": "write",
+          "issues": "read",
+          "members": "read",
+          "organization_administration": "read",
+          "pull_requests": "read"
+        },
+        "max_grants_per_run": 2
+      },
+      {
+        "purpose": "machines-release",
+        "repository": { "repository_id": 3201 },
+        "workflow": ".github/workflows/lazurio-rollout.yml",
+        "rules": [
+          { "events": ["push", "workflow_dispatch"], "ref": "refs/heads/main", "environment": "production" },
+          { "events": ["pull_request_target"], "ref": "refs/heads/main", "environment": null }
+        ],
+        "permissions": {
+          "contents": "read"
+        },
+        "max_grants_per_run": 4
+      }
+    ]
+  }
+}
