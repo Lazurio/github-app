@@ -20,6 +20,13 @@ the read tier, for every grant, with each permission lowered to `read` (an
 accepted `issues: write` becomes `issues: read`): its tokens carry no write
 permission. See [Read-only Workspaces](#read-only-workspaces-permission_ceiling).
 
+Since `0.13.0` the Cloudflare Worker adapter also serves short-lived GitHub
+Actions runners: a job of an allowlisted Deployment Repo exchanges its GitHub
+Actions OIDC token for one installation token of a configured purpose, limited
+to one repository and to that purpose's exact permission set, with no secret
+stored in GitHub. See
+[CI runners: GitHub Actions OIDC purposes](#ci-runners-github-actions-oidc-purposes).
+
 **Provider limitation.** For an installation that accepted the Issues
 permission, GitHub let every installation token tested open an issue in a
 public repository, whatever permissions it asked for and whatever repository it
@@ -110,6 +117,23 @@ Workspace id + Workspace credential + repository (name or id)
 - Installation tokens are neither logged nor written to disk by this service.
 - The client credential helper must also avoid disk persistence.
 
+A GitHub Actions job takes the second decision the broker makes, through the
+Worker adapter only:
+
+```text
+GitHub Actions OIDC token + {"purpose": name}
+    -> GitHub's signature, issuer, this broker's exact audience and expiry
+    -> listed Deployment Repo (immutable repository id and owner id)
+    -> configured purpose: repository, workflow file on one exact branch, event,
+       GitHub Environment and runner environment
+    -> each OIDC token once, at most N tokens of the purpose per workflow run attempt
+    -> live GitHub App installation identity and permissions
+    -> one-repository installation token with exactly the purpose's permission set
+```
+
+It never involves a Workspace, a Team grant or a browser user, and a caller
+never chooses the repository or the permissions: the purpose does.
+
 Human entry to T3 Code, Launchpad and module applications is a separate
 GitHub-backed gateway decision. See [ARCHITECTURE.md](./ARCHITECTURE.md).
 
@@ -124,7 +148,11 @@ two runtime adapters:
 
 The adapters do not own different policy schemas or authorization rules. A
 deployment chooses one adapter and supplies the same customer-neutral source
-with deployment-owned policy and secrets.
+with deployment-owned policy and secrets. Only the Worker adapter serves the
+GitHub Actions OIDC route: a GitHub-hosted runner reaches a broker only over
+the public internet, which is where the Worker runs. The Node adapter parses
+the same policy, prints its OIDC purposes in `policy check` and answers
+`404` on that route.
 
 ### Node.js / OCI
 
@@ -186,6 +214,12 @@ Schema v3 binds each Workspace to its GitHub Team and names no repositories:
   as before `0.12.0`. With `"read"` every token of that Workspace is
   read-only; see [Read-only Workspaces](#read-only-workspaces-permission_ceiling).
   Any other value, including `null`, is rejected.
+- `oidc` is optional (since `0.13.0`). It declares the purposes for which
+  GitHub Actions jobs of listed Deployment Repos may obtain a token; see
+  [The `oidc` purpose table](#the-oidc-purpose-table). Absent, the broker has
+  no OIDC route. A policy that declares `oidc` may list no Workspace
+  (`"workspaces": []`), for a broker that serves only CI runners; every other
+  policy still needs at least one Workspace.
 
 `repositories` and `workspaces[].repository_ids` no longer exist. A v3 policy
 that still contains either key is rejected, so a half-migrated policy fails
@@ -446,7 +480,7 @@ and revocation; it only guarantees that no final repository token exists:
 | `400` | `invalid_request` | Body is not exactly one of the two forms. No GitHub traffic. |
 | `403` | `repository_denied` | The repository belongs to another owner than the policy's Organization. The name form is refused without GitHub traffic; the id form after the live readback. |
 | `403` | `team_grant_missing` | Live GitHub readback shows the Workspace's Team is gone, has a different identity than the policy asserts, or holds no grant (none of pull, triage, push, maintain or admin) on the repository; or the repository id is not visible to the installation. |
-| `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, the mint left the requested scope, or the body exceeded the size limit. |
+| `502` | `token_unavailable` | GitHub was unreachable, rate-limited or over quota, returned an unexpected shape, the mint left the requested scope (since `0.13.0` the broker revokes such a token with its own credential before refusing), or the body exceeded the size limit. |
 | `415` | `unsupported_media_type` | Body is not JSON. |
 
 `POST /v1/workspace` uses the same codes: `401 workspace_unauthorized` with no
@@ -454,6 +488,10 @@ GitHub traffic, `403 team_grant_missing` when the Workspace's Team is gone or
 its identity differs from the policy, `502 token_unavailable` on any GitHub
 failure and `415` for a non-JSON media type. It never returns `400` or
 `repository_denied` because it names no repository.
+
+`POST /v1/oidc/token` takes a GitHub Actions OIDC token instead of a Workspace
+credential and has its own codes; see
+[CI runners: GitHub Actions OIDC purposes](#ci-runners-github-actions-oidc-purposes).
 
 The Team gate runs live on every mint with a short-lived `members: read` plus
 `metadata: read` probe token that is revoked immediately afterwards. Its read
@@ -583,7 +621,20 @@ alpha-team  4001     alpha-team
 ```
 
 A policy with a [read permission ceiling](#read-only-workspaces-permission_ceiling)
-adds that set and a `CEILING` column.
+adds that set and a `CEILING` column. A policy with
+[OIDC purposes](#the-oidc-purpose-table) adds them after the table, one line
+per rule with the exact set it asks for (a policy without Workspaces prints
+`no Workspaces` instead of the table):
+
+```text
+oidc audience=https://github-broker.example.com runners=github-hosted deployment_repositories=3101/1001,7101/7001
+purpose deployment-apply repository=caller workflow=.github/workflows/lazurio-rollout.yml per_run=2
+  push,workflow_dispatch refs/heads/main environment=production asks for: administration=read checks=read contents=write issues=read members=read organization_administration=read pull_requests=read
+  pull_request_target refs/heads/main environment=- read-only asks for: administration=read checks=read contents=read issues=read members=read organization_administration=read pull_requests=read
+```
+
+`--live` adds nothing for OIDC purposes beyond the installation gate, which
+already compares the permissions they rely on.
 
 With `--live` it first performs the same installation verification as
 `--verify-only`, then, with one `members: read` plus `metadata: read` probe
@@ -627,14 +678,20 @@ The Worker reads these deployment bindings:
 - one independent secret per Workspace, named
   `WORKSPACE_CREDENTIAL_<WORKSPACE_ID>`, where the lowercase Workspace id is
   uppercased and `-` becomes `_` (for example `blue-team` becomes
-  `WORKSPACE_CREDENTIAL_BLUE_TEAM`).
+  `WORKSPACE_CREDENTIAL_BLUE_TEAM`); and
+- when the policy declares `oidc`, the Durable Object binding
+  `OIDC_RUN_GUARD` of the class `OidcRunGuard`, which holds each workflow
+  run's used OIDC token ids and grant counts.
 
-All four classes are deployment bindings and none belongs in Git or Wrangler
-configuration. Workspace ids make the secret-binding mapping injective because
+The first four classes are secrets or policy and none belongs in Git or
+Wrangler configuration. Workspace ids make the secret-binding mapping injective because
 policy ids allow only lowercase letters, digits and hyphens. Credential values
 must remain unique. A missing, malformed or duplicated binding makes the
 Worker return `503 configuration_unavailable` without disclosing which secret
-failed.
+failed; so does a policy with `oidc` on a Worker without `OIDC_RUN_GUARD`.
+The public `wrangler.jsonc` declares the Durable Object binding and the
+migration that creates its class (`new_sqlite_classes`, which needs no paid
+plan); a deployment that uses its own Wrangler configuration adds both.
 
 Unlike the always-on Node process, a Worker has no trustworthy startup phase.
 It therefore parses the policy and credential snapshot on each request and,
@@ -659,6 +716,296 @@ use the deployment-owned Cloudflare account and explicit Worker name, load all
 secrets through Cloudflare secret custody, then record the exact public source
 commit and resulting immutable Worker version id. This repository deliberately
 does not declare an account id, customer route or shared production Worker.
+
+## CI runners: GitHub Actions OIDC purposes
+
+Since `0.13.0` the Worker adapter serves short-lived GitHub Actions runners,
+such as the runner mode of Lazurio Machines rollouts, which plans and applies
+on a GitHub-hosted runner instead of an operator's computer. A job of an
+allowlisted Deployment Repo presents its GitHub Actions OIDC token and names a
+purpose; the broker mints one installation token for that purpose's one
+repository with that purpose's exact permission set. No repository,
+Environment or Organization secret holds a broker credential, and the job
+never sees the App private key.
+
+```http
+POST /v1/oidc/token
+Authorization: Bearer <GitHub Actions OIDC token, audience = this broker's public origin>
+Content-Type: application/json
+
+{"purpose": "deployment-apply"}
+```
+
+The body is exactly one purpose name. The response has the shape of
+`/v1/token` plus the exact permission set, with `Cache-Control: no-store`;
+`access` is `write` when any permission of the set is `write`, else `read`:
+
+```json
+{"token": "<installation token>", "expires_at": "2030-01-01T00:00:00Z", "repository_id": 3101, "repository": "example-organization/deployment", "access": "write", "permissions": {"contents": "write", "pull_requests": "read"}}
+```
+
+### The `oidc` purpose table
+
+Purposes are reviewed policy, not code. A complete example with synthetic ids
+is [`examples/policy.oidc.example.json`](./examples/policy.oidc.example.json):
+
+```json
+"oidc": {
+  "audience": "https://github-broker.example.com",
+  "runner_environments": ["github-hosted"],
+  "deployment_repositories": [
+    { "repository_id": 3101, "repository_owner_id": 1001 },
+    { "repository_id": 7101, "repository_owner_id": 7001 }
+  ],
+  "purposes": [
+    {
+      "purpose": "deployment-apply",
+      "repository": "caller",
+      "workflow": ".github/workflows/lazurio-rollout.yml",
+      "rules": [
+        { "events": ["push", "workflow_dispatch"], "ref": "refs/heads/main", "environment": "production" },
+        { "events": ["pull_request_target"], "ref": "refs/heads/main", "environment": null, "read_only": true }
+      ],
+      "permissions": { "administration": "read", "checks": "read", "contents": "write", "issues": "read", "members": "read", "organization_administration": "read", "pull_requests": "read" },
+      "max_grants_per_run": 2
+    }
+  ]
+}
+```
+
+- `audience` is this broker's exact public origin (`https`, no path, port or
+  trailing slash). A token GitHub issued for any other audience, such as the
+  rollout gateway's, is refused.
+- `deployment_repositories` lists the callers by immutable repository id and
+  the owner id that repository must still have. A transferred repository keeps
+  its id, so the owner id is checked too.
+- `runner_environments` is optional and defaults to `["github-hosted"]`; add
+  `"self-hosted"` only for a domain that accepts self-hosted runners.
+- `purposes[]` names, per purpose:
+  - `purpose`: the name a caller sends;
+  - `repository`: `"caller"`, the calling Deployment Repo itself, which must
+    belong to the policy's Organization, or `{"repository_id": N}`, one fixed
+    repository of the policy's Organization that any listed Deployment Repo
+    may read;
+  - `workflow`: the one workflow file the job must be defined in;
+  - `rules`: each with `events`, one exact branch `ref`, `environment` (a GitHub
+    Environment name, or `null` for a job without one) and optional
+    `read_only`, which lowers every permission of the set to `read`;
+  - `permissions`: the exact set, within the installation's accepted
+    permissions (GitHub adds `metadata: read`);
+  - `max_grants_per_run`: how many tokens of this purpose one workflow run
+    attempt may receive (1 to 100).
+
+Unknown keys are refused at every level, so a misspelled rule fails closed.
+Two rules are code: a rule whose purpose asks for any `write` and that admits
+an event other than `push` or `workflow_dispatch`, the only events whose
+initiator needs write access to the repository, must be `read_only`; and `ref`
+is one exact branch, so a `pull_request` run, whose ref is
+`refs/pull/<n>/merge` and whose workflow file comes from the pull request,
+never matches.
+
+A later purpose is one more entry. For example, if the rollout gateway's
+Permit-ledger probe ran as a workflow of the Deployment Repo, its read would be:
+
+```json
+{ "purpose": "gateway-ledger-read", "repository": "caller", "workflow": ".github/workflows/lazurio-ledger-probe.yml", "rules": [{ "events": ["schedule", "workflow_dispatch"], "ref": "refs/heads/main", "environment": null }], "permissions": { "contents": "read" }, "max_grants_per_run": 1 }
+```
+
+No deployment enables it with this release.
+
+### Admission and refusals
+
+Every request passes these gates in order; the first failure is the answer,
+with one concrete code, and nothing before step 9 costs a GitHub request:
+
+1. media type `application/json` (`415 unsupported_media_type`);
+2. a bearer OIDC token that verifies (`401`, see
+   [Token verification](#token-verification));
+3. the body is exactly `{"purpose": "<name>"}` (`400 invalid_request`);
+4. `repository_id` is a listed Deployment Repo (`403 repository_not_admitted`).
+   Any GitHub workflow anywhere can request a token for this audience, so a
+   caller that is not listed learns nothing else;
+5. `repository_owner_id` is the listed owner (`403 repository_owner_mismatch`);
+6. the purpose is configured (`403 purpose_unknown`);
+7. for `repository: "caller"`, the caller belongs to the policy's Organization
+   (`403 repository_denied`);
+8. `runner_environment` is admitted (`403 runner_not_allowed`), and one rule
+   admits the job: its `event_name` (`403 event_not_allowed`), its `ref`
+   (`403 ref_not_allowed`), `workflow_ref` equal to
+   `<repository>/<workflow>@<ref>` (`403 workflow_not_allowed`),
+   `job_workflow_ref` equal to `workflow_ref`, so the job is defined in that
+   file and not in a reusable workflow it calls
+   (`403 job_workflow_not_allowed`), and its GitHub Environment
+   (`403 environment_mismatch`). With several rules, the refusal names the
+   check of the rule that came closest;
+9. the run guard: each OIDC token once (`401 token_replayed`) and each purpose
+   at most `max_grants_per_run` times per workflow run attempt
+   (`429 rate_limited`);
+10. the live installation gate, exactly as for Workspaces, and the
+    one-repository mint (`502 token_unavailable` on any GitHub failure or a
+    response outside the requested scope, which the broker revokes first).
+
+| Status | `error` | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_request` | The body is not exactly one purpose name. |
+| `401` | `token_missing`, `token_malformed`, `token_algorithm_refused`, `token_key_unknown`, `token_signature_invalid`, `token_issuer_mismatch`, `token_audience_mismatch`, `token_expired`, `token_not_yet_valid`, `token_claims_invalid` | The OIDC token does not verify as a GitHub Actions token for this broker. |
+| `401` | `token_replayed` | This OIDC token was already used. |
+| `403` | `repository_not_admitted`, `repository_owner_mismatch`, `purpose_unknown`, `repository_denied`, `runner_not_allowed`, `event_not_allowed`, `ref_not_allowed`, `workflow_not_allowed`, `job_workflow_not_allowed`, `environment_mismatch` | The verified caller is not admitted for this purpose. |
+| `404` | `not_found` | This broker's policy declares no `oidc` purposes, or the adapter is the Node adapter. |
+| `415` | `unsupported_media_type` | The body is not JSON. |
+| `429` | `rate_limited` | The workflow run attempt already received its tokens of this purpose. A rerun is a new attempt. |
+| `502` | `token_unavailable` | GitHub or the run guard failed, the installation drifted from the policy, the mint left its scope, or the body exceeded the size limit. |
+| `503` | `jwks_unavailable` | GitHub's signing keys could not be fetched. |
+
+### Token verification
+
+The Worker verifies the token with [jose](https://github.com/panva/jose): the
+issuer `https://token.actions.githubusercontent.com`, the exact `audience`,
+`RS256` only, a required key id (a token without one would otherwise verify
+against a key set that holds a single key), required `exp` and `iat`, `60`
+seconds of clock tolerance and no `iat` in the future. GitHub's key set comes
+from its JWKS endpoint, cached by jose per Worker isolate for at most ten
+minutes, refetched for an unknown key id at most once per 30-second cooldown,
+each fetch bounded by five seconds. A key set that cannot be fetched is
+`503 jwks_unavailable`, never a refusal of the token. Admission reads only the
+verified claims: ids such as `repository_id` stay GitHub's decimal strings and
+a job without a GitHub Environment has `environment: null`.
+
+### Run guard
+
+One Durable Object per workflow run attempt, named
+`<repository_id>/<run_id>/<run_attempt>` from verified claims, records the
+run's used OIDC token ids (`jti`) and its grant count per purpose. It is
+consulted after admission and before GitHub, and it only refuses: a repeated
+token id, or a purpose that reached `max_grants_per_run`. A rerun of failed
+jobs is a new attempt with its own budget. A token id is kept until it can no
+longer verify; the whole record deletes itself seven days after its first
+grant. If the Durable Object cannot answer, the request fails closed as
+`502 token_unavailable`.
+
+### The rollout purposes and their permissions
+
+Lazurio's rollout runner uses two purposes:
+
+| Purpose | Served by | Repository | Rules | Permission set | Per run |
+| --- | --- | --- | --- | --- | --- |
+| `deployment-apply` | each Organization's own broker | `caller`: the Organization's Deployment Repo | `push` or `workflow_dispatch` on `refs/heads/main` in Environment `production`; `pull_request_target` on `refs/heads/main` without an Environment, `read_only` | `administration: read`, `checks: read`, `contents: write`, `issues: read`, `members: read`, `organization_administration: read`, `pull_requests: read` | 2 |
+| `machines-release` | the broker of the Organization that publishes Machines releases | `{"repository_id": <the Machines repository>}` | the same events, refs and Environments, none `read_only` (the set has no write) | `contents: read` | 4 |
+
+A `pull_request_target` Plan run of `deployment-apply` receives the same set
+with every permission at `read`. The current runner does not ask for it: its
+Plan job asks only for `machines-release`.
+
+Each permission of `deployment-apply` serves the runner's live Permit evidence
+and the Permit consumption push, and the set is the runner's contract:
+
+- `pull_requests: read` reads the merged pull request, its files and reviews;
+- `issues: read` reads the pull request's issue events. GitHub lists that
+  endpoint under both the Issues and the Pull requests permission, and which of
+  them an installation token needs has not been probed yet;
+- `checks: read` reads the check runs of the reviewed head;
+- `administration: read` reads the repository rulesets with their bypass
+  actors. GitHub documents that it returns `bypass_actors` only to a caller
+  with write access to the ruleset; whether `administration: read` is enough
+  must be proven by the live probe before the first apply;
+- `members: read` reads the Organization's Owners;
+- `organization_administration: read` is what the runner contract names for
+  the Organization's plan. GitHub documents the narrower Organization `Plan`
+  permission (`organization_plan: read`) for that field; if the live probe
+  confirms it, the deployment replaces the one with the other in its policy,
+  without a broker change;
+- `contents: write` is the push that consumes the Permit in that one
+  repository (and reads its `CODEOWNERS`). GitHub has no narrower installation
+  permission for pushing a ref.
+
+Repository collaborators, rulesets as such and repository metadata are read
+with GitHub's automatic `metadata: read`.
+
+### Revocation
+
+The token is an ordinary installation token that expires on GitHub's schedule
+(at most one hour). Its holder revokes it earlier with GitHub's
+`DELETE /installation/token`, authenticated with the token itself, as runner
+mode does at the end of every run. The broker keeps no copy and therefore has
+no revocation route. It revokes a token itself only when GitHub returns one
+outside the requested repository or permission set, before refusing the
+request; since `0.13.0` this also applies to Workspace tokens.
+
+### Audit lines
+
+The Worker writes one JSON line per decision of this route to its log stream:
+
+```json
+{"schema_version": "lazurio.github_app_broker.audit.v1", "at": "2026-10-17T12:00:00.000Z", "event": "oidc_token", "decision": "granted", "status": 200, "code": "granted", "purpose": "deployment-apply", "caller": {"repository_id": "3101", "repository_owner_id": "1001", "repository": "example-organization/deployment", "event_name": "push", "ref": "refs/heads/main", "environment": "production", "workflow_ref": "...", "job_workflow_ref": "...", "runner_environment": "github-hosted", "run_id": "9001", "run_attempt": "1", "actor_id": "5001", "actor": "example-user", "sha": "...", "jti": "..."}, "grant": {"repository_id": 3101, "repository": "example-organization/deployment", "access": "write", "permissions": {"...": "..."}, "expires_at": "..."}}
+```
+
+A refusal carries its code, `grant: null` and, for a token that did not
+verify, `caller: null`. A line never contains an installation token, the OIDC
+token or a request header. It does contain the GitHub login of the workflow's
+actor, so the log is the deployment owner's private record; retaining it
+(Workers Logs, Logpush or a tail) is a deployment setting. The Workspace routes
+write no audit lines.
+
+### GitHub request budget
+
+An accepted request costs two GitHub requests (the installation gate and the
+scoped mint) and one Durable Object request; GitHub's key set adds one fetch at
+most every ten minutes per isolate, or on an unknown key id at most once per
+30 seconds. Refusals before the run guard cost no GitHub request.
+
+### Deploying OIDC purposes
+
+Each Organization's private deployment configuration adds, by name (values
+stay in the deployment owner's custody):
+
+1. **App permissions.** `deployment-apply` needs the installation to hold
+   repository `Administration: Read`, `Issues: Read` (an accepted
+   `Read and write` also serves) and Organization `Administration: Read`, or
+   Organization `Plan: Read` once the probe confirms it. The App owner adds the
+   missing ones to the App once; each Organization owner then accepts them.
+   Because the installation gate compares permissions exactly, the policy's
+   `installation_permissions` must declare the whole newly accepted set in the
+   same short window; in between every token request of that Organization,
+   Workspaces included, is `502 token_unavailable`, exactly as with
+   `workflows: write`. `machines-release` needs only `contents: read`, which
+   every installation already holds.
+2. **Policy.** `oidc.audience` (the broker's public origin, exactly as the
+   runner's repository variable names it), `oidc.deployment_repositories`
+   (the Organization's Deployment Repo ids with their owner id; on the broker
+   that serves `machines-release`, every admitted Organization's Deployment
+   Repo) and `oidc.purposes` (`deployment-apply`; on that broker also
+   `machines-release` with the Machines repository id). Run `policy check`
+   before deploying it.
+3. **Worker.** The Durable Object binding `OIDC_RUN_GUARD` to the class
+   `OidcRunGuard` and its migration, from the public `wrangler.jsonc` or added
+   to a deployment-owned one, and retention of the Worker's log stream for the
+   audit lines.
+4. **Installation repositories.** In `selected` mode the Deployment Repo, and
+   on the `machines-release` broker the Machines repository, are installed for
+   the App.
+
+Rollout order:
+
+1. Release `0.13.0` and deploy it unchanged to every broker. A policy without
+   `oidc` keeps exactly its previous behavior and has no new route, so this
+   step needs no Organization's approval of new behavior.
+2. **Ring 0, the reference Organization's broker**, first: accept the App
+   permissions, deploy the policy with `deployment-apply` for its Deployment
+   Repo and prove the refusal matrix and one grant there. Its runs also need
+   `machines-release` from the next step before a Plan or apply can run end to
+   end.
+3. **The broker of the Organization that publishes Machines releases**, which
+   also serves real users: only with its Organization Admin's go, add
+   `machines-release` (allowlisting Ring 0's Deployment Repo first) and its own
+   `deployment-apply`.
+4. **Every other Organization's broker**, each after its owner accepted the
+   App permissions; then add its Deployment Repo to the `machines-release`
+   allowlist.
+
+Rolling a broker back below `0.13.0` removes the route (an older broker ignores
+the `oidc` key), so runners fail closed; a policy with `"workspaces": []` is
+refused by an older broker, so keep a Workspace or do not roll that broker
+back.
 
 ## Container build
 
@@ -787,8 +1134,9 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.12.0` |
+| Adapter | `0.13.0` |
 | Cloudflare Wrangler | `4.127.1` |
+| jose (Worker bundle) | `6.2.12` |
 
 Upstream T3 or `gh` command-envelope drift must pass the exact contract tests
 before deployment. A proven user-only GraphQL query is a separate minimal T3
@@ -810,7 +1158,10 @@ Lazurio for GitHub is licensed under the
 [third-party notices](./THIRD_PARTY_NOTICES.md), including the unmodified MIT
 License for the pinned official GitHub CLI 2.97.0 distribution. Release assets
 repeat the same license bundle alongside checksums, SBOM, provenance and the
-GitHub attestation.
+GitHub attestation. The Worker bundle includes jose 6.2.12, the broker's only
+runtime dependency, under its MIT License
+([`third_party/jose/LICENSE.md`](./third_party/jose/LICENSE.md)); the OCI image
+does not contain it.
 
 ## Security
 
