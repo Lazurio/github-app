@@ -280,6 +280,15 @@ does not name with `caller_not_admitted` before any state or GitHub request.
 Who may read stays a reviewed policy decision of the broker's Organization,
 revocable by removing the caller.
 
+Rollout order: release and deploy broker `0.14.0` before any policy names
+`callers`. A `0.13.0` broker does not know the key and refuses the whole
+policy (the Worker answers every request, Workspaces included, with
+`503 configuration_unavailable`; the Node broker does not start), so it fails
+closed and never serves such a purpose to every listed Deployment Repo. For
+the same reason, remove every purpose that names `callers` before rolling a
+broker back below `0.14.0`: deleting only the key would open the purpose to
+every listed Deployment Repo.
+
 The run guard is the broker's only state. It is one Durable Object per
 workflow run attempt, named from verified claims, holding used token ids and
 grant counts, and it can only refuse; it never allows a request admission
