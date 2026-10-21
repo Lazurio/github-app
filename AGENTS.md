@@ -71,6 +71,10 @@ dependency-light and customer-neutral.
     only state. Purposes are configuration; a new purpose is a reviewed policy
     entry, never a code path for one Organization. Only the Worker adapter
     serves the route.
+    A policy that names `callers` needs broker `0.14.0` released and deployed
+    first; a `0.13.0` broker refuses that policy as a whole (fail closed, 503
+    on every route), and a rollback below `0.14.0` removes every purpose with
+    `callers` first, never just the key.
 11. jose, pinned exactly, is the only runtime dependency. Only `src/oidc.mjs`
     imports it, and only the Worker entry imports that module, so the core and
     the Node adapter in the OCI image stay dependency-free. The Worker entry
