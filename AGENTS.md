@@ -38,13 +38,14 @@ dependency-light and customer-neutral.
    Actions job for one configured purpose, never a browser user. A caller never
    chooses the repository or the permissions of a purpose token.
 7. No customer-specific policy, ids or credentials belong in this public repo.
-   Deployment Repo ids, fixed purpose repositories and audiences live in each
-   Organization's private deployment policy.
+   Deployment Repo ids, purpose callers, fixed purpose repositories and
+   audiences live in each Organization's private deployment policy.
 8. Every behavior change requires focused tests for the positive path and
    cross-Workspace, cross-repository and foreign-owner denial; for the OIDC
    route also an unlisted repository, a changed owner, another Organization's
-   Deployment Repo, every event, ref, workflow, job workflow and Environment
-   outside the rules, a replayed token and an exhausted run budget.
+   Deployment Repo, a listed Deployment Repo that a purpose's `callers` do not
+   name, every event, ref, workflow, job workflow and Environment outside the
+   rules, a replayed token and an exhausted run budget.
 9. Every Workspace is bound to exactly one immutable GitHub Team id, and every
    token issuance verifies live that the Team exists and holds a grant on the
    exact repository, failing closed with `team_grant_missing`. The grant's
@@ -57,8 +58,10 @@ dependency-light and customer-neutral.
    derived mapping are reviewed inputs, never a second ACL.
 10. `POST /v1/oidc/token` admits a GitHub Actions job only from signed claims:
     this broker's origin as the token's only audience, a listed immutable
-    repository id with its listed owner id, the purpose's workflow file on one
-    exact branch as `workflow_ref` (sent on every token; admission keys on it),
+    repository id with its listed owner id, one of the purpose's `callers`
+    when it names them (a list that only narrows the allowlist, never widens
+    it), the purpose's workflow file on one exact branch as `workflow_ref`
+    (sent on every token; admission keys on it),
     a `job_workflow_ref` that is absent or names that same file (GitHub
     documents it only for reusable workflows, so never require it), an
     admitted event, GitHub Environment and runner environment
