@@ -16,7 +16,8 @@ deployment-owned policy binds:
   ceiling; and
 - optionally, the OIDC purposes: this broker's audience, the Deployment Repos
   by immutable repository and owner id, and per purpose its one repository,
-  workflow file, admission rules, exact permission set and per-run budget.
+  optional callers among those Deployment Repos, workflow file, admission
+  rules, exact permission set and per-run budget.
 
 The policy names no repositories and no access tiers. The scope of a
 Workspace is the live GitHub Team grant: the repositories of the policy's
@@ -234,8 +235,9 @@ in this order:
 
 1. the caller's immutable `repository_id` is a listed Deployment Repo and its
    `repository_owner_id` is the owner listed with it;
-2. the purpose is configured, and a purpose for the caller's own repository
-   serves only repositories of the policy's Organization;
+2. the purpose is configured; a purpose that names `callers` admits only
+   those of the listed Deployment Repos, and a purpose for the caller's own
+   repository serves only repositories of the policy's Organization;
 3. the runner environment is admitted (`github-hosted` unless the policy also
    admits `self-hosted`);
 4. one rule of the purpose admits the job's event, its exact branch ref, the
@@ -263,6 +265,20 @@ code keeps the invariants that make any entry safe: immutable ids, one exact
 branch per rule, the reviewed workflow file, read-only rules for events others
 can start, one repository per token, the installation's accepted permissions
 as the ceiling, one use per OIDC token and a per-run budget.
+
+`oidc.deployment_repositories` is one allowlist for the whole broker, so a
+fixed-repository purpose without `callers` is open to every Deployment Repo on
+it. That is right for a release repository every admitted Organization reads,
+and too wide for a repository only some of them may read, such as the
+Deployment Repo that holds the broker Organization's Conglomerate Host Record,
+read by the guest Organizations whose lanes run on that host. Since `0.14.0` a
+purpose can name its `callers`: Deployment Repos written exactly as the
+allowlist lists them, by immutable repository id and owner id. The list only
+narrows the allowlist; the parser refuses a caller the allowlist does not hold
+with that owner id, and admission refuses a listed Deployment Repo the purpose
+does not name with `caller_not_admitted` before any state or GitHub request.
+Who may read stays a reviewed policy decision of the broker's Organization,
+revocable by removing the caller.
 
 The run guard is the broker's only state. It is one Durable Object per
 workflow run attempt, named from verified claims, holding used token ids and
@@ -351,7 +367,11 @@ What remains:
 - An allowlisted Deployment Repo of another Organization can read the one
   fixed release repository on every run, which is the purpose of
   `machines-release`; removing it from the allowlist stops it at the next
-  request.
+  request. A fixed-repository purpose that names `callers` is open only to
+  them, but a named caller holds the purpose's whole permission set on the
+  whole fixed repository for up to an hour, so whoever can merge to the
+  caller's default branch can read all of it, not only the file its runner
+  needs. Removing the caller, or the purpose, stops it at the next request.
 - Audit lines name the workflow's actor and are kept by the deployment owner.
 
 ## What this service does not do
@@ -384,10 +404,14 @@ continue after the browser disconnects.
   its issuance.
 - Rotate the App private key in deployment custody and restart the Node broker
   or publish a new Worker secret version.
-- Remove a Deployment Repo from `oidc.deployment_repositories`, or a purpose
-  from `oidc.purposes`, and deploy the policy to refuse its next OIDC request.
-  A token already issued stays valid until it expires or its holder revokes
-  it; for an emergency, an Organization owner can suspend the App
+- Remove a Deployment Repo from `oidc.deployment_repositories`, a caller from
+  a purpose's `callers`, or a purpose from `oidc.purposes`, and deploy the
+  policy to refuse its next OIDC request. A Deployment Repo that a purpose
+  still names as a caller must leave that `callers` list too, or the policy
+  fails to load. The last caller leaves with its purpose, never by deleting
+  the `callers` key, which would open the purpose to every listed Deployment
+  Repo. A token already issued stays valid until it expires or its holder
+  revokes it; for an emergency, an Organization owner can suspend the App
   installation on GitHub, which blocks the App's access to that
   Organization's resources while it stays suspended.
 - Keep the prior immutable image or Worker version available for source

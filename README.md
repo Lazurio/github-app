@@ -24,7 +24,8 @@ Since `0.13.0` the Cloudflare Worker adapter also serves short-lived GitHub
 Actions runners: a job of an allowlisted Deployment Repo exchanges its GitHub
 Actions OIDC token for one installation token of a configured purpose, limited
 to one repository and to that purpose's exact permission set, with no secret
-stored in GitHub. See
+stored in GitHub. Since `0.14.0` a purpose can also name its `callers`, the
+only allowlisted Deployment Repos that may ask for it. See
 [CI runners: GitHub Actions OIDC purposes](#ci-runners-github-actions-oidc-purposes).
 
 **Provider limitation.** For an installation that accepted the Issues
@@ -124,7 +125,8 @@ Worker adapter only:
 GitHub Actions OIDC token + {"purpose": name}
     -> GitHub's signature, issuer, this broker's exact audience and expiry
     -> listed Deployment Repo (immutable repository id and owner id)
-    -> configured purpose: repository, workflow file on one exact branch, event,
+    -> configured purpose, and one of its callers when it names them
+    -> the purpose's repository, workflow file on one exact branch, event,
        GitHub Environment and runner environment
     -> each OIDC token once, at most N tokens of the purpose per workflow run attempt
     -> live GitHub App installation identity and permissions
@@ -219,7 +221,9 @@ Schema v3 binds each Workspace to its GitHub Team and names no repositories:
   [The `oidc` purpose table](#the-oidc-purpose-table). Absent, the broker has
   no OIDC route. A policy that declares `oidc` may list no Workspace
   (`"workspaces": []`), for a broker that serves only CI runners; every other
-  policy still needs at least one Workspace.
+  policy still needs at least one Workspace. Since `0.14.0` a purpose may name
+  its callers; see
+  [Naming the callers of a purpose](#naming-the-callers-of-a-purpose-callers).
 
 `repositories` and `workspaces[].repository_ids` no longer exist. A v3 policy
 that still contains either key is rejected, so a half-migrated policy fails
@@ -633,6 +637,14 @@ purpose deployment-apply repository=caller workflow=.github/workflows/lazurio-ro
   pull_request_target refs/heads/main environment=- read-only asks for: administration=read checks=read contents=read issues=read members=read organization_administration=read pull_requests=read
 ```
 
+A purpose that names its [callers](#naming-the-callers-of-a-purpose-callers)
+prints them as `<repository id>/<owner id>` pairs; a purpose line without
+`callers=` serves every listed Deployment Repo:
+
+```text
+purpose conglomerate-host-read repository=3101 callers=7101/7001 workflow=.github/workflows/lazurio-rollout.yml per_run=2
+```
+
 `--live` adds nothing for OIDC purposes beyond the installation gate, which
 already compares the permissions they rely on.
 
@@ -785,8 +797,12 @@ is [`examples/policy.oidc.example.json`](./examples/policy.oidc.example.json):
   - `purpose`: the name a caller sends;
   - `repository`: `"caller"`, the calling Deployment Repo itself, which must
     belong to the policy's Organization, or `{"repository_id": N}`, one fixed
-    repository of the policy's Organization that any listed Deployment Repo
-    may read;
+    repository of the policy's Organization that every listed Deployment Repo
+    may read, or only the purpose's `callers` when it names them;
+  - `callers` (optional, since `0.14.0`): the listed Deployment Repos that
+    alone may ask for this purpose, each exactly as `deployment_repositories`
+    lists it. Absent, every listed Deployment Repo may ask, as before; see
+    [Naming the callers of a purpose](#naming-the-callers-of-a-purpose-callers);
   - `workflow`: the one workflow file the job must be defined in;
   - `rules`: each with `events`, one exact branch `ref`, `environment` (a GitHub
     Environment name, or `null` for a job without one) and optional
@@ -813,10 +829,73 @@ Permit-ledger probe ran as a workflow of the Deployment Repo, its read would be:
 
 No deployment enables it with this release.
 
+### Naming the callers of a purpose (`callers`)
+
+`deployment_repositories` is one list for the whole broker, and a purpose
+without `callers` is open to every Deployment Repo on it. That suits
+`machines-release`, which every admitted Organization's runner reads. Since
+`0.14.0` a purpose can instead name the Deployment Repos that alone may ask for
+it, for example when exactly one other Organization's rollout workflow may read
+one fixed repository of the broker's Organization:
+
+```json
+{
+  "purpose": "conglomerate-host-read",
+  "repository": { "repository_id": 3101 },
+  "callers": [
+    { "repository_id": 7101, "repository_owner_id": 7001 }
+  ],
+  "workflow": ".github/workflows/lazurio-rollout.yml",
+  "rules": [
+    { "events": ["push", "workflow_dispatch"], "ref": "refs/heads/main", "environment": "production" },
+    { "events": ["pull_request_target"], "ref": "refs/heads/main", "environment": null }
+  ],
+  "permissions": { "contents": "read" },
+  "max_grants_per_run": 2
+}
+```
+
+Here `3101` stands for the broker Organization's own Deployment Repo, which
+holds its Conglomerate Host Record, and `7101` for the Deployment Repo of a
+guest Organization whose lanes run on that Conglomerate Host. Only `7101`
+receives the token. Every other listed Deployment Repo, `3101` itself
+included, is refused with `403 caller_not_admitted` and keeps every purpose
+that names no callers. The example policy carries the same entry.
+
+- A caller is written exactly as `deployment_repositories` lists it: the
+  immutable `repository_id` and the `repository_owner_id` it must still have.
+  `callers` only narrows that list and never admits a repository that is not
+  on it. The policy fails to load for a caller that `deployment_repositories`
+  does not list or lists with another owner id, for a duplicate, an unknown
+  key, an empty list or `null`.
+- For a purpose with `"repository": "caller"`, every caller must be a
+  Deployment Repo of the policy's Organization, since no other could ever be
+  admitted.
+- Admission checks `callers` right after the purpose lookup, before the runner
+  and the rules. A listed Deployment Repo that is not a caller learns only that
+  it may not ask for this purpose, and its request reaches neither the run
+  guard nor GitHub.
+- A named caller still has to meet every rule of the purpose. It then holds
+  the purpose's whole permission set on the whole fixed repository for up to an
+  hour: with `contents: read` that is every file of the repository, not only
+  the one its runner needs. Whoever can merge to the caller's default branch
+  controls that job, so naming a caller is the reviewed decision to let them
+  read it.
+- To withdraw one caller, remove its entry. To withdraw the last one, remove
+  the purpose, never only the `callers` key: a purpose without `callers` is open
+  to every listed Deployment Repo. The policy fails to load if a Deployment Repo
+  is removed from `deployment_repositories` while a purpose still names it.
+
+Purposes stay reviewed policy, not code: `callers` is one more key of a
+purpose entry, and the broker's source holds no purpose or caller of any
+Organization. This release only makes such an entry possible; the runner that
+asks for a purpose like this and each broker's policy entry are separate,
+reviewed changes.
+
 ### Admission and refusals
 
 Every request passes these gates in order; the first failure is the answer,
-with one concrete code. Nothing before step 10 costs a GitHub API request
+with one concrete code. Nothing before step 11 costs a GitHub API request
 (verifying the token may fetch GitHub's published signing keys, see
 [Token verification](#token-verification)):
 
@@ -829,9 +908,11 @@ with one concrete code. Nothing before step 10 costs a GitHub API request
    caller that is not listed learns nothing else;
 5. `repository_owner_id` is the listed owner (`403 repository_owner_mismatch`);
 6. the purpose is configured (`403 purpose_unknown`);
-7. for `repository: "caller"`, the caller belongs to the policy's Organization
+7. for a purpose that names `callers`, the caller is one of them
+   (`403 caller_not_admitted`);
+8. for `repository: "caller"`, the caller belongs to the policy's Organization
    (`403 repository_denied`);
-8. `runner_environment` is admitted (`403 runner_not_allowed`), and one rule
+9. `runner_environment` is admitted (`403 runner_not_allowed`), and one rule
    admits the job: its `event_name` (`403 event_not_allowed`), its `ref`
    (`403 ref_not_allowed`), `workflow_ref` equal to
    `<repository>/<workflow>@<ref>` (`403 workflow_not_allowed`), which GitHub
@@ -842,10 +923,10 @@ with one concrete code. Nothing before step 10 costs a GitHub API request
    the token (`403 job_workflow_not_allowed`); and its GitHub Environment
    (`403 environment_mismatch`). With several rules, the refusal names the
    check of the rule that came closest;
-9. the run guard: each OIDC token once (`401 token_replayed`) and each purpose
-   at most `max_grants_per_run` times per workflow run attempt
-   (`429 rate_limited`);
-10. the live installation gate, exactly as for Workspaces, and the
+10. the run guard: each OIDC token once (`401 token_replayed`) and each purpose
+    at most `max_grants_per_run` times per workflow run attempt
+    (`429 rate_limited`);
+11. the live installation gate, exactly as for Workspaces, and the
     one-repository mint (`502 token_unavailable` on any GitHub failure or a
     response outside the requested scope, which the broker revokes first).
 
@@ -854,7 +935,7 @@ with one concrete code. Nothing before step 10 costs a GitHub API request
 | `400` | `invalid_request` | The body is not exactly one purpose name. |
 | `401` | `token_missing`, `token_malformed`, `token_algorithm_refused`, `token_key_unknown`, `token_signature_invalid`, `token_issuer_mismatch`, `token_audience_mismatch`, `token_expired`, `token_not_yet_valid`, `token_claims_invalid` | The OIDC token does not verify as a GitHub Actions token for this broker. |
 | `401` | `token_replayed` | This OIDC token was already used. |
-| `403` | `repository_not_admitted`, `repository_owner_mismatch`, `purpose_unknown`, `repository_denied`, `runner_not_allowed`, `event_not_allowed`, `ref_not_allowed`, `workflow_not_allowed`, `job_workflow_not_allowed`, `environment_mismatch` | The verified caller is not admitted for this purpose. |
+| `403` | `repository_not_admitted`, `repository_owner_mismatch`, `purpose_unknown`, `caller_not_admitted`, `repository_denied`, `runner_not_allowed`, `event_not_allowed`, `ref_not_allowed`, `workflow_not_allowed`, `job_workflow_not_allowed`, `environment_mismatch` | The verified caller is not admitted for this purpose. |
 | `404` | `not_found` | This broker's policy declares no `oidc` purposes, or the adapter is the Node adapter. |
 | `415` | `unsupported_media_type` | The body is not JSON. |
 | `429` | `rate_limited` | The workflow run attempt already received its tokens of this purpose. A rerun is a new attempt. |
@@ -1015,6 +1096,16 @@ the `oidc` key), so runners fail closed; a policy with `"workspaces": []` is
 refused by an older broker, so keep a Workspace or do not roll that broker
 back.
 
+A purpose that names `callers` needs broker `0.14.0`. Release and deploy it
+first: a policy without `callers` behaves exactly as on `0.13.0`, so this step
+needs no Organization's approval of new behavior. A `0.13.0` broker refuses
+the unknown key and with it the whole policy: the Worker answers every request,
+Workspaces included, with `503 configuration_unavailable`, and the Node broker
+does not start. It never serves such a purpose to every listed Deployment Repo.
+For the same reason, remove every purpose that names `callers` before rolling a
+broker back below `0.14.0`; deleting only the key would open the purpose to
+every listed Deployment Repo.
+
 ## Container build
 
 The Dockerfile deliberately has no floating base-image default:
@@ -1142,7 +1233,7 @@ REST or GraphQL request.
 | Lazurio T3 Code | `lazurio-pilot-prestable-20260817.1` |
 | GitHub CLI | `2.97.0` |
 | Node.js | `24.19.0` |
-| Adapter | `0.13.0` |
+| Adapter | `0.14.0` |
 | Cloudflare Wrangler | `4.127.1` |
 | jose (Worker bundle) | `6.2.12` |
 
