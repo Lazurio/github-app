@@ -40,6 +40,7 @@ const DEPLOYMENT_PLAN = Object.freeze(
   Object.fromEntries(Object.keys(DEPLOYMENT_APPLY).map((permission) => [permission, "read"])),
 );
 const RELEASE_READ = Object.freeze({ contents: "read" });
+const HOST_READ = Object.freeze({ contents: "read" });
 
 const REPOSITORIES = new Map([
   [3101, { full_name: "example-org/deployment", owner: { id: 1001, login: "example-org" } }],
@@ -101,6 +102,30 @@ function oidcPolicyFixture() {
   };
 }
 
+/**
+ * The OIDC policy plus a purpose that names its callers. `conglomerate-host-read` reads the broker
+ * Organization's own Deployment Repo 3101, which holds its Conglomerate Host Record, and names only
+ * the other Organization's Deployment Repo 7101. A third Organization 8001 has its Deployment Repo
+ * 8101 listed for the broker's other purposes but is no caller; neither is 3101 itself.
+ */
+function callersPolicyFixture() {
+  const policy = oidcPolicyFixture();
+  policy.oidc.deployment_repositories.push({ repository_id: 8101, repository_owner_id: 8001 });
+  policy.oidc.purposes.push({
+    purpose: "conglomerate-host-read",
+    repository: { repository_id: 3101 },
+    callers: [{ repository_id: 7101, repository_owner_id: 7001 }],
+    workflow: WORKFLOW,
+    rules: [
+      { events: ["push", "workflow_dispatch"], ref: "refs/heads/main", environment: "production" },
+      { events: ["pull_request_target"], ref: "refs/heads/main", environment: null },
+    ],
+    permissions: { ...HOST_READ },
+    max_grants_per_run: 2,
+  });
+  return policy;
+}
+
 /** Verified claims as the verifier returns them: a push to main of the Deployment Repo, in production. */
 function claimsFixture(overrides = {}) {
   const repository = overrides.repository ?? "example-org/deployment";
@@ -130,6 +155,8 @@ function claimsFixture(overrides = {}) {
 }
 
 const OTHER_ORG = Object.freeze({ repository: "other-org/deployment", repository_id: "7101", repository_owner_id: "7001" });
+const THIRD_ORG = Object.freeze({ repository: "third-org/deployment", repository_id: "8101", repository_owner_id: "8001" });
+const OWN_DEPLOYMENT = Object.freeze({ repository: "example-org/deployment", repository_id: "3101", repository_owner_id: "1001" });
 const PLAN_RUN = Object.freeze({ event_name: "pull_request_target", environment: null });
 
 function admit(overrides, purpose = "deployment-apply", policy = parsePolicy(oidcPolicyFixture())) {
@@ -237,11 +264,68 @@ test("policy rejects every malformed or widening oidc entry", () => {
   }
 });
 
+test("a purpose may name its callers; a purpose without them parses exactly as before", () => {
+  const policy = parsePolicy(callersPolicyFixture());
+  const [deploymentApply, machinesRelease, hostRead] = policy.oidc.purposes;
+  assert.deepEqual(hostRead.repository, { repository_id: 3101 });
+  assert.deepEqual(hostRead.callers, [{ repository_id: 7101, repository_owner_id: 7001 }]);
+  assert.ok(Object.isFrozen(hostRead.callers));
+  assert.ok(Object.isFrozen(hostRead.callers[0]));
+  // Absent stays absent: no default list is written into the parsed policy.
+  assert.equal("callers" in deploymentApply, false);
+  assert.equal("callers" in machinesRelease, false);
+  assert.deepEqual([deploymentApply, machinesRelease], parsePolicy(oidcPolicyFixture()).oidc.purposes);
+});
+
+test("policy rejects every malformed or widening callers list", () => {
+  const hostRead = (policy) => policy.oidc.purposes[2];
+  const cases = [
+    ["callers as one object", (p) => { hostRead(p).callers = { repository_id: 7101, repository_owner_id: 7001 }; }, /purposes\[2\]\.callers must be a non-empty list/],
+    ["callers as null", (p) => { hostRead(p).callers = null; }, /purposes\[2\]\.callers must be a non-empty list/],
+    ["empty callers", (p) => { hostRead(p).callers = []; }, /callers must be a non-empty list of Deployment Repos; to admit none, remove the purpose/],
+    ["misspelled callers key", (p) => { hostRead(p).caller = hostRead(p).callers; delete hostRead(p).callers; }, /purposes\[2\]\.caller is not a known key/],
+    ["caller by name", (p) => { hostRead(p).callers = ["other-org/deployment"]; }, /callers\[0\] must be an object/],
+    ["caller by bare id", (p) => { hostRead(p).callers = [7101]; }, /callers\[0\] must be an object/],
+    ["caller without owner id", (p) => { delete hostRead(p).callers[0].repository_owner_id; }, /callers\[0\]\.repository_owner_id is required/],
+    ["caller without repository id", (p) => { delete hostRead(p).callers[0].repository_id; }, /callers\[0\]\.repository_id is required/],
+    ["unknown caller key", (p) => { hostRead(p).callers[0].workflow = WORKFLOW; }, /callers\[0\]\.workflow is not a known key/],
+    ["string caller id", (p) => { hostRead(p).callers[0].repository_id = "7101"; }, /callers\[0\]\.repository_id must be a positive integer/],
+    ["zero caller owner id", (p) => { hostRead(p).callers[0].repository_owner_id = 0; }, /callers\[0\]\.repository_owner_id must be a positive integer/],
+    ["duplicate caller", (p) => { hostRead(p).callers.push({ repository_id: 7101, repository_owner_id: 7001 }); }, /purposes\[2\]\.callers must list each repository id once/],
+    [
+      "caller missing from the broker-wide list",
+      (p) => { hostRead(p).callers.push({ repository_id: 9101, repository_owner_id: 9001 }); },
+      /callers\[1\] must be a Deployment Repo listed in oidc\.deployment_repositories/,
+    ],
+    [
+      "caller with another owner than the broker-wide list",
+      (p) => { hostRead(p).callers[0].repository_owner_id = 1001; },
+      /callers\[0\]\.repository_owner_id must be the owner id oidc\.deployment_repositories lists for it/,
+    ],
+    [
+      "Deployment Repo removed from the broker-wide list while it is still a caller",
+      (p) => { p.oidc.deployment_repositories = p.oidc.deployment_repositories.filter(({ repository_id }) => repository_id !== 7101); },
+      /callers\[0\] must be a Deployment Repo listed in oidc\.deployment_repositories/,
+    ],
+    [
+      "another Organization as a caller of a purpose for the caller's repository",
+      (p) => { p.oidc.purposes[0].callers = [{ repository_id: 7101, repository_owner_id: 7001 }]; },
+      /purposes\[0\]\.callers\[0\] must be a Deployment Repo of the policy's Organization/,
+    ],
+  ];
+  for (const [label, mutate, expected] of cases) {
+    const policy = callersPolicyFixture();
+    mutate(policy);
+    assert.throws(() => parsePolicy(policy), expected, label);
+  }
+});
+
 test("both published example policies parse", () => {
   const examples = new URL("../examples/", import.meta.url);
   assert.equal(parsePolicy(readFileSync(new URL("policy.example.json", examples), "utf8")).oidc, undefined);
   const oidc = parsePolicy(readFileSync(new URL("policy.oidc.example.json", examples), "utf8")).oidc;
-  assert.deepEqual(oidc.purposes.map(({ purpose }) => purpose), ["deployment-apply", "machines-release"]);
+  assert.deepEqual(oidc.purposes.map(({ purpose }) => purpose), ["deployment-apply", "machines-release", "conglomerate-host-read"]);
+  assert.deepEqual(oidc.purposes.map(({ callers }) => callers), [undefined, undefined, [{ repository_id: 7101, repository_owner_id: 7001 }]]);
 });
 
 test("a broker with oidc purposes may hold no Workspace; without them a Workspace stays required", () => {
@@ -414,6 +498,72 @@ test("machines-release admits any allowlisted Deployment Repo for the fixed repo
       max_grants_per_run: 4,
     }, JSON.stringify(overrides));
   }
+});
+
+test("a purpose with callers admits a named caller for its fixed repository with exactly its permission set", () => {
+  const policy = parsePolicy(callersPolicyFixture());
+  for (const overrides of [OTHER_ORG, { ...OTHER_ORG, ...PLAN_RUN }, { ...OTHER_ORG, event_name: "workflow_dispatch" }]) {
+    assert.deepEqual(admit(overrides, "conglomerate-host-read", policy), {
+      purpose: "conglomerate-host-read",
+      repository_id: 3101,
+      permissions: HOST_READ,
+      access: "read",
+      max_grants_per_run: 2,
+    }, JSON.stringify(overrides));
+  }
+});
+
+test("a purpose with callers refuses every listed Deployment Repo it does not name, its own Organization's included", () => {
+  const policy = parsePolicy(callersPolicyFixture());
+  for (const overrides of [THIRD_ORG, { ...THIRD_ORG, ...PLAN_RUN }, OWN_DEPLOYMENT, { ...OWN_DEPLOYMENT, ...PLAN_RUN }]) {
+    assert.equal(refusalOf(() => admit(overrides, "conglomerate-host-read", policy)), "caller_not_admitted", JSON.stringify(overrides));
+  }
+  // The refusal comes before the runner and the rules, so a non-caller learns nothing about them.
+  assert.equal(
+    refusalOf(() => admit({ ...THIRD_ORG, ref: "refs/heads/feature", runner_environment: "self-hosted" }, "conglomerate-host-read", policy)),
+    "caller_not_admitted",
+  );
+  // The same Deployment Repos keep every purpose that names no callers, exactly as before.
+  assert.equal(admit(THIRD_ORG, "machines-release", policy).repository_id, 3201);
+  assert.equal(admit(OWN_DEPLOYMENT, "machines-release", policy).repository_id, 3201);
+  assert.deepEqual(admit(OWN_DEPLOYMENT, "deployment-apply", policy).permissions, DEPLOYMENT_APPLY);
+  assert.equal(refusalOf(() => admit(THIRD_ORG, "deployment-apply", policy)), "repository_denied");
+});
+
+test("callers never widen the allowlist: a stranger or a changed owner is refused first, a named caller still meets every rule", () => {
+  const policy = parsePolicy(callersPolicyFixture());
+  assert.equal(
+    refusalOf(() => admit({ repository_id: "3999", repository: "example-org/scratch" }, "conglomerate-host-read", policy)),
+    "repository_not_admitted",
+  );
+  // The named caller's repository id under another owner, for example after a transfer.
+  assert.equal(refusalOf(() => admit({ ...OTHER_ORG, repository_owner_id: "8001" }, "conglomerate-host-read", policy)), "repository_owner_mismatch");
+  for (const [overrides, code] of [
+    [{ runner_environment: "self-hosted" }, "runner_not_allowed"],
+    [{ event_name: "pull_request" }, "event_not_allowed"],
+    [{ ref: "refs/heads/feature" }, "ref_not_allowed"],
+    [{ workflow_ref: `other-org/deployment/.github/workflows/other.yml@refs/heads/main` }, "workflow_not_allowed"],
+    [{ job_workflow_ref: "other-org/shared/.github/workflows/apply.yml@refs/heads/main" }, "job_workflow_not_allowed"],
+    [{ environment: "staging" }, "environment_mismatch"],
+  ]) {
+    assert.equal(refusalOf(() => admit({ ...OTHER_ORG, ...overrides }, "conglomerate-host-read", policy)), code, JSON.stringify(overrides));
+  }
+});
+
+test("a purpose for the caller's repository may name callers of the policy's Organization only", () => {
+  const policy = oidcPolicyFixture();
+  policy.oidc.deployment_repositories.push({ repository_id: 3102, repository_owner_id: 1001 });
+  policy.oidc.purposes[0].callers = [{ repository_id: 3101, repository_owner_id: 1001 }];
+  const parsed = parsePolicy(policy);
+  assert.deepEqual(admit(OWN_DEPLOYMENT, "deployment-apply", parsed).permissions, DEPLOYMENT_APPLY);
+  assert.equal(admit(OWN_DEPLOYMENT, "deployment-apply", parsed).repository_id, 3101);
+  const sibling = { repository: "example-org/deployment-two", repository_id: "3102", repository_owner_id: "1001" };
+  assert.equal(refusalOf(() => admit(sibling, "deployment-apply", parsed)), "caller_not_admitted");
+  assert.equal(refusalOf(() => admit(OTHER_ORG, "deployment-apply", parsed)), "caller_not_admitted");
+  // Without callers the sibling is admitted for its own repository, as before.
+  const open = oidcPolicyFixture();
+  open.oidc.deployment_repositories.push({ repository_id: 3102, repository_owner_id: 1001 });
+  assert.equal(admit(sibling, "deployment-apply", parsePolicy(open)).repository_id, 3102);
 });
 
 test("a later purpose is one more policy entry, not code", () => {
@@ -920,6 +1070,38 @@ test("admission refusals reach neither the run guard nor GitHub", async () => {
   }
 });
 
+test("a listed Deployment Repo that is not a caller of the purpose reaches neither the run guard nor GitHub", async () => {
+  const policy = parsePolicy(callersPolicyFixture());
+  assert.equal(OIDC_REFUSALS.caller_not_admitted, 403);
+  for (const identity of [THIRD_ORG, OWN_DEPLOYMENT]) {
+    const claims = claimsFixture(identity);
+    const { handle, mints, records, guard } = oidcHandler({ claims, policy });
+    assert.deepEqual(await oidcCall(handle, { body: { purpose: "conglomerate-host-read" } }), {
+      status: 403,
+      body: { error: "caller_not_admitted" },
+    });
+    assert.equal(guard.calls.length, 0);
+    assert.equal(mints.length, 0);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].decision, "refused");
+    assert.equal(records[0].code, "caller_not_admitted");
+    assert.equal(records[0].purpose, "conglomerate-host-read");
+    assert.equal(records[0].caller.repository_id, identity.repository_id);
+    assert.equal(records[0].grant, null);
+  }
+
+  const { handle, mints, guard } = oidcHandler({ claims: claimsFixture(OTHER_ORG), policy });
+  const granted = await oidcCall(handle, { body: { purpose: "conglomerate-host-read" } });
+  assert.equal(granted.status, 200);
+  assert.equal(granted.body.repository_id, 3101);
+  assert.equal(granted.body.access, "read");
+  assert.deepEqual(granted.body.permissions, HOST_READ);
+  assert.deepEqual(mints, [{ repositoryId: 3101, permissions: HOST_READ }]);
+  assert.deepEqual(guard.calls.map(({ key, purpose, limit }) => ({ key, purpose, limit })), [
+    { key: "7101/9001/1", purpose: "conglomerate-host-read", limit: 2 },
+  ]);
+});
+
 test("the run guard decides before GitHub: a replay is 401, an exhausted budget 429, a guard outage 502", async () => {
   for (const [decision, status, code] of [
     ["replayed", 401, "token_replayed"],
@@ -1266,6 +1448,44 @@ test("Worker end to end: a Plan run reads, and a Deployment Repo of another Orga
   );
 });
 
+test("Worker end to end: only a named caller reads the fixed repository of a purpose with callers", async () => {
+  const { worker, env, github, records } = workerFixture({ policy: callersPolicyFixture() });
+  const tokenOf = (identity) => signedToken({
+    ...identity,
+    repository_owner: identity.repository.split("/")[0],
+    workflow_ref: `${identity.repository}/${WORKFLOW}@refs/heads/main`,
+    job_workflow_ref: `${identity.repository}/${WORKFLOW}@refs/heads/main`,
+  });
+
+  const named = await worker.fetch(oidcRequest(await tokenOf(OTHER_ORG), "conglomerate-host-read"), env);
+  assert.equal(named.status, 200);
+  const body = await named.json();
+  assert.equal(body.repository_id, 3101);
+  assert.equal(body.repository, "example-org/deployment");
+  assert.equal(body.access, "read");
+  assert.deepEqual(body.permissions, HOST_READ);
+  assert.deepEqual(github.calls.map(({ method, path }) => `${method} ${path}`), [
+    "GET /app/installations/2001",
+    "POST /app/installations/2001/access_tokens",
+  ]);
+  assert.deepEqual(github.calls[1].body, { repository_ids: [3101], permissions: HOST_READ });
+
+  const before = github.calls.length;
+  for (const identity of [THIRD_ORG, OWN_DEPLOYMENT]) {
+    const refused = await worker.fetch(oidcRequest(await tokenOf(identity), "conglomerate-host-read"), env);
+    assert.equal(refused.status, 403);
+    assert.deepEqual(await refused.json(), { error: "caller_not_admitted" });
+  }
+  assert.equal(github.calls.length, before, "a refused caller costs no GitHub request");
+
+  // The Deployment Repo that is no caller keeps the purposes that name no callers.
+  const release = await worker.fetch(oidcRequest(await tokenOf(THIRD_ORG), "machines-release"), env);
+  assert.equal(release.status, 200);
+  assert.deepEqual((await release.json()).permissions, RELEASE_READ);
+  assert.deepEqual(records.map(({ code }) => code), ["granted", "caller_not_admitted", "caller_not_admitted", "granted"]);
+  assert.equal(JSON.stringify(records).includes(body.token), false);
+});
+
 test("Worker end to end: installation drift and GitHub's key set outages fail closed and mint nothing", async () => {
   const drifted = workerFixture({ installationPermissions: { ...oidcPolicyFixture().installation_permissions, administration: "write" } });
   const response = await drifted.worker.fetch(oidcRequest(await signedToken()), drifted.env);
@@ -1327,6 +1547,29 @@ test("policy check prints each purpose with the exact permission set every rule 
       "  push,workflow_dispatch refs/heads/main environment=production asks for: administration=read checks=read contents=write issues=read members=read organization_administration=read pull_requests=read",
       "  pull_request_target refs/heads/main environment=- read-only asks for: administration=read checks=read contents=read issues=read members=read organization_administration=read pull_requests=read",
       `purpose machines-release repository=3201 workflow=${WORKFLOW} per_run=4`,
+      "  push,workflow_dispatch refs/heads/main environment=production asks for: contents=read",
+      "  pull_request_target refs/heads/main environment=- asks for: contents=read",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("policy check prints the callers of a purpose that names them and nothing for one that does not", () => {
+  const policy = callersPolicyFixture();
+  policy.workspaces = [];
+  assert.equal(
+    formatPolicySummary(parsePolicy(policy)),
+    [
+      "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
+      "no Workspaces",
+      `oidc audience=${AUDIENCE} runners=github-hosted deployment_repositories=3101/1001,7101/7001,8101/8001`,
+      `purpose deployment-apply repository=caller workflow=${WORKFLOW} per_run=2`,
+      "  push,workflow_dispatch refs/heads/main environment=production asks for: administration=read checks=read contents=write issues=read members=read organization_administration=read pull_requests=read",
+      "  pull_request_target refs/heads/main environment=- read-only asks for: administration=read checks=read contents=read issues=read members=read organization_administration=read pull_requests=read",
+      `purpose machines-release repository=3201 workflow=${WORKFLOW} per_run=4`,
+      "  push,workflow_dispatch refs/heads/main environment=production asks for: contents=read",
+      "  pull_request_target refs/heads/main environment=- asks for: contents=read",
+      `purpose conglomerate-host-read repository=3101 callers=7101/7001 workflow=${WORKFLOW} per_run=2`,
       "  push,workflow_dispatch refs/heads/main environment=production asks for: contents=read",
       "  pull_request_target refs/heads/main environment=- asks for: contents=read",
       "",

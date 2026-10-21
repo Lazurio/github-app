@@ -8,7 +8,7 @@ const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
 const V3_MIGRATION =
   "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.13.0";
+const USER_AGENT = "lazurio-github-app-broker/0.14.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
@@ -157,6 +157,7 @@ export const OIDC_REFUSALS = Object.freeze({
   repository_not_admitted: 403,
   repository_owner_mismatch: 403,
   purpose_unknown: 403,
+  caller_not_admitted: 403,
   repository_denied: 403,
   runner_not_allowed: 403,
   event_not_allowed: 403,
@@ -373,11 +374,44 @@ function parseOidcRule(rule, label, purposePermissions) {
   });
 }
 
-function parseOidcPurpose(purpose, index, installationPermissions) {
+/**
+ * The optional `callers` of a purpose: the Deployment Repos that may ask for it, each written
+ * exactly as `oidc.deployment_repositories` lists it (immutable repository id and owner id). The
+ * list only narrows that allowlist, so it never admits a repository the allowlist does not. A
+ * purpose for the caller's own repository can name only Deployment Repos of the policy's
+ * Organization; any other caller could never be admitted, so the entry is refused here.
+ */
+function parseOidcCallers(value, label, deploymentRepositories, callerRepository, ownerId) {
+  // An empty list is refused rather than read as "nobody": a purpose no one may use is removed.
+  if (!Array.isArray(value) || value.length === 0) {
+    fail(`${label} must be a non-empty list of Deployment Repos; to admit none, remove the purpose`);
+  }
+  const callers = value.map((entry, index) => {
+    const entryLabel = `${label}[${index}]`;
+    exactKeys(entry, ["repository_id", "repository_owner_id"], ["repository_id", "repository_owner_id"], entryLabel);
+    const repositoryId = positiveInteger(entry.repository_id, `${entryLabel}.repository_id`);
+    const repositoryOwnerId = positiveInteger(entry.repository_owner_id, `${entryLabel}.repository_owner_id`);
+    const listed = deploymentRepositories.find(({ repository_id }) => repository_id === repositoryId);
+    if (!listed) fail(`${entryLabel} must be a Deployment Repo listed in oidc.deployment_repositories`);
+    if (listed.repository_owner_id !== repositoryOwnerId) {
+      fail(`${entryLabel}.repository_owner_id must be the owner id oidc.deployment_repositories lists for it`);
+    }
+    if (callerRepository && repositoryOwnerId !== ownerId) {
+      fail(`${entryLabel} must be a Deployment Repo of the policy's Organization, as its purpose is for the caller's repository`);
+    }
+    return Object.freeze({ repository_id: repositoryId, repository_owner_id: repositoryOwnerId });
+  });
+  if (new Set(callers.map(({ repository_id }) => repository_id)).size !== callers.length) {
+    fail(`${label} must list each repository id once`);
+  }
+  return Object.freeze(callers);
+}
+
+function parseOidcPurpose(purpose, index, installationPermissions, deploymentRepositories, ownerId) {
   const label = `oidc.purposes[${index}]`;
   exactKeys(
     purpose,
-    ["purpose", "repository", "workflow", "rules", "permissions", "max_grants_per_run"],
+    ["purpose", "repository", "callers", "workflow", "rules", "permissions", "max_grants_per_run"],
     ["purpose", "repository", "workflow", "rules", "permissions", "max_grants_per_run"],
     label,
   );
@@ -393,6 +427,11 @@ function parseOidcPurpose(purpose, index, installationPermissions) {
       repository_id: positiveInteger(purpose.repository.repository_id, `${label}.repository.repository_id`),
     });
   }
+  // Optional and absent by default: without it every listed Deployment Repo may ask, as before 0.14.0.
+  const callers =
+    purpose.callers === undefined
+      ? undefined
+      : parseOidcCallers(purpose.callers, `${label}.callers`, deploymentRepositories, repository === "caller", ownerId);
   if (typeof purpose.workflow !== "string" || !WORKFLOW_PATH_PATTERN.test(purpose.workflow)) {
     fail(`${label}.workflow must be a workflow file below .github/workflows/`);
   }
@@ -415,6 +454,7 @@ function parseOidcPurpose(purpose, index, installationPermissions) {
   return Object.freeze({
     purpose: purpose.purpose,
     repository,
+    ...(callers === undefined ? {} : { callers }),
     workflow: purpose.workflow,
     rules: Object.freeze(rules),
     permissions: Object.freeze({ ...permissions }),
@@ -425,7 +465,8 @@ function parseOidcPurpose(purpose, index, installationPermissions) {
 /**
  * The optional `oidc` section: the purposes for which GitHub Actions workflows of the listed
  * Deployment Repos may exchange an OIDC token for one installation token. Absent, the broker has no
- * OIDC route. Every purpose is configuration: a new purpose is one more reviewed entry.
+ * OIDC route. Every purpose is configuration: a new purpose is one more reviewed entry, and so is
+ * the list of listed Deployment Repos that alone may ask for it (`callers`).
  */
 function parseOidc(input, installationPermissions, ownerId) {
   exactKeys(
@@ -459,7 +500,9 @@ function parseOidc(input, installationPermissions, ownerId) {
     fail("oidc.deployment_repositories must list each repository id once");
   }
   if (!Array.isArray(input.purposes) || input.purposes.length === 0) fail("oidc.purposes must be a non-empty list");
-  const purposes = input.purposes.map((purpose, index) => parseOidcPurpose(purpose, index, installationPermissions));
+  const purposes = input.purposes.map((purpose, index) =>
+    parseOidcPurpose(purpose, index, installationPermissions, deploymentRepositories, ownerId),
+  );
   if (new Set(purposes.map(({ purpose }) => purpose)).size !== purposes.length) {
     fail("oidc.purposes must name each purpose once");
   }
@@ -637,7 +680,8 @@ function oidcRuleRefusal(purpose, rule, claims) {
  * Pure admission of one verified GitHub Actions OIDC caller for one purpose. Throws OidcRefusal with
  * the first failed check. The order reveals as little as possible to a caller that is not admitted:
  * any GitHub workflow can obtain a token for this audience, so the Deployment Repo allowlist comes
- * first. Returns the one repository to mint for, the exact permission set and the access it implies.
+ * first; a purpose's `callers` only narrow that allowlist, so they come after it. Returns the one
+ * repository to mint for, the exact permission set and the access it implies.
  */
 export function admitOidcRequest(policy, claims, purposeName) {
   const oidc = policy?.oidc;
@@ -651,6 +695,13 @@ export function admitOidcRequest(policy, claims, purposeName) {
   if (listed.repository_owner_id !== ownerId) refuseOidc("repository_owner_mismatch");
   const purpose = oidc.purposes.find((entry) => entry.purpose === purposeName);
   if (!purpose) refuseOidc("purpose_unknown");
+  // A purpose that names its callers serves only them; without the list, every listed Deployment Repo.
+  if (
+    purpose.callers !== undefined &&
+    !purpose.callers.some((caller) => caller.repository_id === repositoryId && caller.repository_owner_id === ownerId)
+  ) {
+    refuseOidc("caller_not_admitted");
+  }
   if (purpose.repository === "caller" && ownerId !== policy.github_owner.id) refuseOidc("repository_denied");
   if (!oidc.runner_environments.includes(claims.runner_environment)) refuseOidc("runner_not_allowed");
 

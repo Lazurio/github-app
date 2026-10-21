@@ -61,6 +61,22 @@
           "contents": "read"
         },
         "max_grants_per_run": 4
+      },
+      {
+        "purpose": "conglomerate-host-read",
+        "repository": { "repository_id": 3101 },
+        "callers": [
+          { "repository_id": 7101, "repository_owner_id": 7001 }
+        ],
+        "workflow": ".github/workflows/lazurio-rollout.yml",
+        "rules": [
+          { "events": ["push", "workflow_dispatch"], "ref": "refs/heads/main", "environment": "production" },
+          { "events": ["pull_request_target"], "ref": "refs/heads/main", "environment": null }
+        ],
+        "permissions": {
+          "contents": "read"
+        },
+        "max_grants_per_run": 2
       }
     ]
   }
