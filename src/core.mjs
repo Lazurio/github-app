@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+  HOST_GRANTS_PER_HOUR,
+  HOST_REFUSALS,
+  HOST_MAX_DOCUMENT_BYTES,
+  HOST_READS_PER_HOUR,
+  HOST_ROUTE,
+  HOST_TOKEN_PERMISSIONS,
+  HostRefusal,
+  decodeHostAssertion,
+  hostKeyDocumentPath,
+  parseConglomerateHosts,
+  parseHostKeyDocument,
+} from "./host.mjs";
+
 export const MAX_BODY_BYTES = 1024;
 
 const POLICY_SCHEMA = "lazurio.github_app_broker.policy.v3";
@@ -8,7 +22,7 @@ const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
 const V3_MIGRATION =
   "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.14.0";
+const USER_AGENT = "lazurio-github-app-broker/0.15.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
@@ -585,10 +599,20 @@ export function parsePolicy(raw) {
 
   // Optional and absent by default: without it the broker serves Workspaces only and has no OIDC route.
   const oidc = input.oidc === undefined ? undefined : parseOidc(input.oidc, installationPermissions, ownerId);
+  // Optional and absent by default: without it the broker has no Conglomerate Host route.
+  const conglomerateHosts =
+    input.conglomerate_hosts === undefined
+      ? undefined
+      : parseConglomerateHosts(input.conglomerate_hosts, installationPermissions);
 
-  // A broker that only serves OIDC purposes may hold no Workspace; otherwise at least one is required.
-  if (!Array.isArray(input.workspaces) || (input.workspaces.length === 0 && oidc === undefined)) {
-    fail("workspaces must be a non-empty array (or an empty array when the policy declares oidc purposes)");
+  // A broker that only serves OIDC purposes or hosts may hold no Workspace; otherwise at least one is required.
+  if (
+    !Array.isArray(input.workspaces) ||
+    (input.workspaces.length === 0 && oidc === undefined && conglomerateHosts === undefined)
+  ) {
+    fail(
+      "workspaces must be a non-empty array (or an empty array when the policy declares oidc purposes or conglomerate_hosts)",
+    );
   }
   const workspaces = input.workspaces.map((workspace, index) => {
     if (workspace && typeof workspace === "object" && Object.hasOwn(workspace, "repository_ids")) {
@@ -642,6 +666,7 @@ export function parsePolicy(raw) {
     installation_permissions: Object.freeze({ ...installationPermissions }),
     workspaces: Object.freeze(workspaces),
     ...(oidc === undefined ? {} : { oidc }),
+    ...(conglomerateHosts === undefined ? {} : { conglomerate_hosts: conglomerateHosts }),
   });
 }
 
@@ -1137,6 +1162,49 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     };
   }
 
+  /**
+   * Reads one Conglomerate Host key document from the policy's `conglomerate_hosts` repository and
+   * ref, with a `contents: read` token for exactly that repository of the policy's Organization,
+   * revoked before returning. Returns the raw text, or undefined when the document does not exist.
+   * Nothing is cached: removing the document stops the next mint.
+   */
+  async function readHostKeyDocument(policy, path) {
+    const hosts = policy.conglomerate_hosts;
+    if (hosts === undefined) fail("the policy declares no conglomerate_hosts");
+    if (typeof path !== "string" || !path.startsWith(`${hosts.directory}/`) || path.includes("..")) {
+      fail("host key document path is outside the policy's directory");
+    }
+    const minted = await mintScopedToken(
+      policy,
+      hosts.repository_id,
+      Object.freeze({ contents: "read" }),
+      (repository) => repository?.owner?.id === policy.github_owner.id,
+    );
+    const authorization = `Bearer ${minted.token}`;
+    try {
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      const response = await fetchImpl(
+        `https://api.github.com/repositories/${hosts.repository_id}/contents/${encodedPath}?ref=${encodeURIComponent(hosts.ref)}`,
+        {
+          method: "GET",
+          headers: {
+            Accept: "application/vnd.github.raw+json",
+            Authorization: authorization,
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            "User-Agent": USER_AGENT,
+          },
+        },
+      );
+      if (response.status === 404) return undefined;
+      if (!response.ok) throw new Error(`GitHub request failed with HTTP ${response.status}`);
+      const text = await response.text();
+      // An oversized document is refused by its parser; keep only enough for it to tell.
+      return text.length > HOST_MAX_DOCUMENT_BYTES ? text.slice(0, HOST_MAX_DOCUMENT_BYTES + 1) : text;
+    } finally {
+      await request("/installation/token", { method: "DELETE", authorization }).catch(() => {});
+    }
+  }
+
   return Object.freeze({
     verifyPolicy,
     verifyTeamGrant,
@@ -1144,6 +1212,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     readWorkspaceTeamGrants,
     mintToken,
     mintPurposeToken,
+    readHostKeyDocument,
   });
 }
 
@@ -1250,7 +1319,21 @@ function oidcAuditRecord({ at, status, code, purpose, claims, grant }) {
  * one line per decision and `now()` is the clock. Without them, or without an `oidc` policy section,
  * `POST /v1/oidc/token` does not exist (404).
  */
-export function createBrokerHandler({ policy, github, credentials, secretMatches, oidc }) {
+/** One audit line per Conglomerate Host decision; never a token, an assertion or a key document. */
+function hostAuditRecord({ at, status, code, host, organizationId, grant }) {
+  return Object.freeze({
+    schema_version: AUDIT_SCHEMA,
+    at,
+    route: "host",
+    status,
+    decision: code,
+    ...(host === undefined ? {} : { host }),
+    organization_id: organizationId,
+    ...(grant === undefined ? {} : { grant }),
+  });
+}
+
+export function createBrokerHandler({ policy, github, credentials, secretMatches, oidc, hosts }) {
   if (!(credentials instanceof Map)) fail("Workspace credentials must be a Map");
   if (typeof secretMatches !== "function") fail("secret matcher is missing");
   if (
@@ -1270,6 +1353,18 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       typeof github.mintPurposeToken !== "function")
   ) {
     fail("OIDC purposes need a verifier, a run guard, an audit sink, a clock and a purpose mint");
+  }
+  const hostsEnabled = policy.conglomerate_hosts !== undefined && hosts !== undefined;
+  if (
+    hostsEnabled &&
+    (typeof hosts.verify !== "function" ||
+      typeof hosts.guard?.admit !== "function" ||
+      typeof hosts.audit !== "function" ||
+      typeof hosts.now !== "function" ||
+      typeof github.readHostKeyDocument !== "function" ||
+      typeof github.mintPurposeToken !== "function")
+  ) {
+    fail("Conglomerate Hosts need a verifier, a guard, an audit sink, a clock, a key reader and a purpose mint");
   }
   const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
   const ownerKey = policy.github_owner.login.toLowerCase();
@@ -1439,6 +1534,128 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     }
   }
 
+  /**
+   * `POST /v1/host/token`: a Conglomerate Host's compact EdDSA JWS as the bearer and `{}` as the
+   * body in, one installation token for the policy's `conglomerate_hosts` repository with exactly
+   * `contents: read` and `members: read` out. Gates, in order: the assertion without a key (header,
+   * claims, audience, lifetime, time), the body, the broker's hourly read budget (deny-only, before
+   * any GitHub request), the host's key document read live from the Deployment Repo, its signature,
+   * the host's replay and hourly grant budget, then (in the adapter) the live installation gate and
+   * the scoped mint. The caller chooses nothing. Every outcome writes one audit line.
+   */
+  async function hostToken({ contentType, authorization, readBody }) {
+    const config = policy.conglomerate_hosts;
+    let host;
+    const audit = (status, code, grant) => {
+      try {
+        hosts.audit(
+          hostAuditRecord({
+            at: new Date(hosts.now()).toISOString(),
+            status,
+            code,
+            host,
+            organizationId: policy.github_owner.id,
+            grant,
+          }),
+        );
+      } catch {
+        // An audit sink failure never changes the decision.
+      }
+    };
+    const refused = (code) => {
+      const status = HOST_REFUSALS[code];
+      audit(status, code);
+      return result(status, { error: code });
+    };
+    if (!contentType.toLowerCase().startsWith("application/json")) return refused("unsupported_media_type");
+    try {
+      const now = hosts.now();
+      const assertion = decodeHostAssertion(authorization.startsWith("Bearer ") ? authorization.slice(7) : "", {
+        audience: config.audience,
+        now,
+      });
+      host = assertion.host;
+
+      if (typeof readBody !== "function") fail("request body reader is missing");
+      const bodyText = await readBody();
+      if (typeof bodyText !== "string") fail("request body reader returned an invalid value");
+      if (new TextEncoder().encode(bodyText).byteLength > MAX_BODY_BYTES) fail("request body is too large");
+      let body;
+      try {
+        body = JSON.parse(bodyText);
+      } catch {
+        return refused(INVALID_REQUEST);
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
+        return refused(INVALID_REQUEST);
+      }
+
+      // Before any GitHub request: a deny-only budget of key document reads per broker and hour.
+      const read = await hosts.guard.admit({
+        key: `host-reads/${Math.floor(now / 3_600_000)}`,
+        jti: assertion.jti,
+        expires_at: assertion.exp,
+        purpose: "host-key-read",
+        limit: HOST_READS_PER_HOUR,
+      });
+      if (read === "replayed") return refused("assertion_replayed");
+      if (read === "rate_limited") return refused("rate_limited");
+      if (read !== "admitted") fail("host guard returned an invalid decision");
+
+      const document = await github.readHostKeyDocument(policy, hostKeyDocumentPath(config, assertion.host));
+      if (document === undefined) return refused("host_unknown");
+      const publicKey = parseHostKeyDocument(document, {
+        host: assertion.host,
+        organizationId: policy.github_owner.id,
+      });
+      if (!(await hosts.verify(publicKey, assertion.signing_input, assertion.signature))) {
+        return refused("assertion_signature_invalid");
+      }
+
+      // Keyed by the signed `iat`, so the same assertion always meets its own record.
+      const grantDecision = await hosts.guard.admit({
+        key: `host/${assertion.host}/${Math.floor(assertion.iat / 3600)}`,
+        jti: assertion.jti,
+        expires_at: assertion.exp,
+        purpose: "host-token",
+        limit: HOST_GRANTS_PER_HOUR,
+      });
+      if (grantDecision === "replayed") return refused("assertion_replayed");
+      if (grantDecision === "rate_limited") return refused("rate_limited");
+      if (grantDecision !== "admitted") fail("host guard returned an invalid decision");
+
+      const minted = await github.mintPurposeToken(policy, config.repository_id, HOST_TOKEN_PERMISSIONS);
+      const repository = parseRepositoryCoordinate(minted?.repository);
+      if (
+        typeof minted?.token !== "string" ||
+        minted.repository_id !== config.repository_id ||
+        !repository ||
+        canonicalObject(minted.permissions) !== canonicalObject(HOST_TOKEN_PERMISSIONS)
+      ) {
+        fail("minted host token is outside the configured repository or permission set");
+      }
+      const grant = Object.freeze({
+        repository_id: config.repository_id,
+        repository: repository.full_name,
+        access: READ_ACCESS,
+        permissions: HOST_TOKEN_PERMISSIONS,
+        expires_at: minted.expires_at,
+      });
+      audit(200, "granted", grant);
+      return result(200, {
+        token: minted.token,
+        expires_at: minted.expires_at,
+        repository_id: config.repository_id,
+        repository: repository.full_name,
+        access: READ_ACCESS,
+        permissions: HOST_TOKEN_PERMISSIONS,
+      });
+    } catch (error) {
+      if (error instanceof HostRefusal) return refused(error.code);
+      return refused("token_unavailable");
+    }
+  }
+
   return async ({
     method,
     path,
@@ -1452,6 +1669,9 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
     }
     if (method === "POST" && path === "/v1/oidc/token" && oidcEnabled) {
       return oidcToken({ contentType, authorization, readBody });
+    }
+    if (method === "POST" && path === HOST_ROUTE && hostsEnabled) {
+      return hostToken({ contentType, authorization, readBody });
     }
     if (method !== "POST" || (path !== "/v1/token" && path !== "/v1/workspace")) {
       return result(404, { error: "not_found" });

@@ -6,8 +6,10 @@
   "workers_dev": true,
   "preview_urls": false,
   "send_metrics": false,
-  // The per-run OIDC replay and grant record (src/worker.mjs OidcRunGuard). Required only when
-  // the deployment's policy declares OIDC purposes; SQLite-backed, so it needs no paid plan.
+  // The per-run OIDC replay and grant record (src/worker.mjs OidcRunGuard), and since 0.15.0 the
+  // Conglomerate Host replay and hourly budgets under their own names. Required only when the
+  // deployment's policy declares OIDC purposes or conglomerate_hosts; SQLite-backed, so it needs
+  // no paid plan.
   "durable_objects": {
     "bindings": [{ "name": "OIDC_RUN_GUARD", "class_name": "OidcRunGuard" }]
   },
