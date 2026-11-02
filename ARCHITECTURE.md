@@ -306,6 +306,57 @@ an Organization's private network. The Node adapter parses the same policy,
 lists its purposes in `policy check` and answers `404` on the route, so jose
 and the run guard never enter the OCI image.
 
+## Conglomerate Host callers
+
+A Conglomerate Host runs the Headscale of one or more Organizations and, since
+root decision 0224 of Lazurio, an access service that derives SSH and network
+accesses from facts: Organization membership, Teams and Owner roles, and the
+Environment assignments and host keys in each Organization's Deployment Repo.
+It reads them about once a minute, for each Organization it serves, through
+that Organization's broker. Since `0.15.0`, `POST /v1/host/token` serves it.
+
+The host is no GitHub Actions job and holds no Workspace credential, GitHub
+token or App key. It generates an Ed25519 key pair once and never lets the
+private part go. The broker does not keep that key in its policy either: the
+policy names once, under `conglomerate_hosts`, where its Organization's own
+Deployment Repo keeps host key documents (repository id, ref, directory), and
+the Organization's own tooling writes one document per host there, next to the
+reviewed fact that the Organization runs on that host. Joining an Organization
+to a host and rebuilding a host therefore change no broker policy and need no
+deploy.
+
+The host sends a compact JWS as the bearer and `{}` as the body. The broker
+decides, in this order:
+
+1. without any key or GitHub request: exactly `alg: EdDSA`, a `kid` that is a
+   host id and an optional `typ: JWT` in the header; exactly `aud` (this
+   broker's origin), `iss` (the `kid`), `iat`, `exp` (at most 60 s after `iat`)
+   and `jti` in the claims; the time within 30 s of tolerance; the body `{}`;
+2. a deny-only budget of key document reads per broker and hour, which also
+   refuses a `jti` it saw that hour;
+3. the key document `<directory>/<kid>.json` at the policy's ref, read live
+   with a `contents: read` token for exactly that repository of the policy's
+   Organization and revoked at once; a missing document is `host_unknown`;
+4. the document names exactly that host and this broker's Organization id and
+   holds one Ed25519 public key (`ed25519:<base64url>`);
+5. the Ed25519 signature over the presented header and claims (WebCrypto);
+6. the host's `jti` once, and its hourly grant budget, keyed by the signed
+   `iat` so one assertion always meets its own record;
+7. the live installation gate, unchanged, and one token for the policy's
+   repository with exactly `contents: read` and `members: read`.
+
+The caller chooses nothing: neither the repository nor the permissions. One
+token never reads another Organization, because an installation token is bound
+to its installation. Every decision writes one audit line with the host, the
+Organization id and, for a grant, the repository, permissions and expiry,
+never a token, an assertion or a key document.
+
+The run guard's Durable Object binding holds both budgets under their own
+names (`host-reads/<hour>`, `host/<kid>/<hour of iat>`), so a policy with
+`conglomerate_hosts` needs that binding as one with OIDC purposes does; no
+new class or migration. Only the Worker adapter serves the route; the Node
+adapter parses the key, lists it in `policy check` and answers `404`.
+
 ## Threat model
 
 The broker is a small boundary around a powerful secret: the App private key
@@ -356,6 +407,22 @@ broker's audience. The rules above bound what that reach can achieve:
   Organization.
 - The App private key, the App JWT and the Workspace credentials never leave
   the Worker and are not used to answer anything but GitHub itself.
+
+**Host route.** The route is public, and the key it verifies against lives in
+a Deployment Repo:
+
+- Without a well-formed assertion for this broker's audience and the current
+  time, a request fails before any GitHub request. Other requests can spend
+  only the broker's hourly read budget, which is deny-only: exhausting it
+  fails the host route closed (`rate_limited`) and never touches Workspace or
+  OIDC issuance.
+- A key document is trusted as far as the Organization's Deployment Repo is:
+  whoever can push to the configured ref can name a key and so obtain a read
+  token for that repository and the Organization's membership, which a writer
+  of that repository can read already. The document never widens the token.
+- A stolen host key mints read tokens, at most the hourly grant budget, until
+  the document is removed; an intercepted assertion is useless after its
+  60 s and after its first use.
 
 What remains:
 
@@ -423,6 +490,9 @@ continue after the browser disconnects.
   revokes it; for an emergency, an Organization owner can suspend the App
   installation on GitHub, which blocks the App's access to that
   Organization's resources while it stays suspended.
+- Remove a host's key document from the Deployment Repo to refuse its next
+  host token request; remove `conglomerate_hosts` from the policy and deploy
+  to refuse every host. A host token already issued lives out its hour.
 - Keep the prior immutable image or Worker version available for source
   rollback, but never roll back a revoked credential or repository grant.
 

@@ -34,9 +34,11 @@ dependency-light and customer-neutral.
    are never logged, committed, stored in Git configuration or persisted by
    this service. Audit lines carry decisions and verified claims, never a
    token or a request header.
-6. The broker authorizes a Workspace and repository, or an admitted GitHub
-   Actions job for one configured purpose, never a browser user. A caller never
-   chooses the repository or the permissions of a purpose token.
+6. The broker authorizes a Workspace and repository, an admitted GitHub
+   Actions job for one configured purpose, or a Conglomerate Host whose key
+   its own Organization's Deployment Repo lists, never a browser user. A
+   caller never chooses the repository or the permissions of a purpose or host
+   token.
 7. No customer-specific policy, ids or credentials belong in this public repo.
    Deployment Repo ids, purpose callers, fixed purpose repositories and
    audiences live in each Organization's private deployment policy.
@@ -45,7 +47,11 @@ dependency-light and customer-neutral.
    route also an unlisted repository, a changed owner, another Organization's
    Deployment Repo, a listed Deployment Repo that a purpose's `callers` do not
    name, every event, ref, workflow, job workflow and Environment outside the
-   rules, a replayed token and an exhausted run budget.
+   rules, a replayed token and an exhausted run budget; for the host route
+   also an unknown host, another host's or another Organization's key
+   document, a signature by another key or over other claims, every header,
+   audience, lifetime and time outside the rules, a replayed assertion and an
+   exhausted read or grant budget.
 9. Every Workspace is bound to exactly one immutable GitHub Team id, and every
    token issuance verifies live that the Team exists and holds a grant on the
    exact repository, failing closed with `team_grant_missing`. The grant's
@@ -78,9 +84,24 @@ dependency-light and customer-neutral.
     purpose with `callers` first, never just the key.
 11. jose, pinned exactly, is the only runtime dependency. Only `src/oidc.mjs`
     imports it, and only the Worker entry imports that module, so the core and
-    the Node adapter in the OCI image stay dependency-free. The Worker entry
+    the Node adapter in the OCI image stay dependency-free. The host route
+    verifies Ed25519 with WebCrypto in `src/host.mjs`, which imports nothing. The Worker entry
     module exports only functions and classes: workerd refuses to start a
     Worker whose entry module exports a plain value.
+
+12. `POST /v1/host/token` (since `0.15.0`, Worker only) admits a Conglomerate
+    Host only by a compact JWS with exactly `alg: EdDSA` and a `kid` host id,
+    whose claims are exactly `aud` (this broker's origin), `iss` (the `kid`),
+    `iat`, `exp` at most 60 s later and a random `jti`. The host's public key
+    is never policy: the broker reads `<directory>/<kid>.json` from the
+    policy's `conglomerate_hosts` repository (one of its own Organization) at
+    its ref, live on every request and never cached, with a `contents: read`
+    token for exactly that repository that it revokes at once. The document
+    must name that host and this broker's Organization id. The token is that
+    repository with exactly `contents: read` and `members: read`. Before any
+    GitHub request a deny-only hourly read budget per broker applies; after
+    the signature, the `jti` is accepted once and a host has an hourly grant
+    budget, both in the run guard's Durable Object under their own names.
 
 `actions: write` is GitHub's smallest installation-token permission that can
 rerun a workflow. GitHub does not provide a rerun-only token capability, so
