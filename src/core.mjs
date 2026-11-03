@@ -10,6 +10,7 @@ import {
   HostRefusal,
   decodeHostAssertion,
   hostAssertionExpired,
+  rulesetProtectsKeyRef,
   hostKeyDocumentPath,
   parseConglomerateHosts,
   parseHostKeyDocument,
@@ -1214,7 +1215,12 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
         },
       );
       if (response.status === 404) {
-        return Object.freeze({ document: undefined, unapproved_writers: 0, write_deploy_keys: 0 });
+        return Object.freeze({
+          document: undefined,
+          unapproved_writers: 0,
+          write_deploy_keys: 0,
+          key_ref_protected: false,
+        });
       }
       if (!response.ok) throw new Error(`GitHub request failed with HTTP ${response.status}`);
       const text = await response.text();
@@ -1231,10 +1237,34 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       const approved = new Set([...owners, ...hosts.approved_writers.map(({ id }) => id)]);
       // A deploy key that can write is a writer outside every account list: none is admitted.
       const writeKeys = await pages(`/repositories/${hosts.repository_id}/keys?`, (key) => key?.read_only !== true);
+      let keyRefProtected = hosts.key_ref_protection === "none";
+      if (hosts.key_ref_protection === "ruleset") {
+        const listed = [];
+        for (let page = 1; ; page += 1) {
+          if (page > MAX_HOST_ADMISSION_PAGES) fail("GitHub list exceeds the host admission bound");
+          const answer = await request(
+            `/repositories/${hosts.repository_id}/rulesets?includes_parents=true&per_page=100&page=${page}`,
+            { authorization },
+          );
+          if (!Array.isArray(answer)) fail("GitHub returned an invalid list");
+          listed.push(...answer);
+          if (answer.length < 100) break;
+        }
+        for (const entry of listed) {
+          if (!Number.isSafeInteger(entry?.id) || entry.enforcement !== "active" || entry.target !== "branch") continue;
+          // The single-ruleset answer carries the conditions, rules and bypass actors.
+          const ruleset = await request(`/repositories/${hosts.repository_id}/rulesets/${entry.id}`, { authorization });
+          if (rulesetProtectsKeyRef(ruleset, { ref: hosts.ref, appId: policy.github_app.id })) {
+            keyRefProtected = true;
+            break;
+          }
+        }
+      }
       return Object.freeze({
         document,
         unapproved_writers: writers.filter((id) => !approved.has(id)).length,
         write_deploy_keys: writeKeys.length,
+        key_ref_protected: keyRefProtected,
       });
     };
     let admission;
@@ -1671,6 +1701,7 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       }
       if (admission.unapproved_writers > 0) return refused("deployment_repository_writer_not_approved");
       if (admission.write_deploy_keys > 0) return refused("deployment_repository_write_key");
+      if (admission.key_ref_protected !== true) return refused("key_ref_unprotected");
 
       // Again after the GitHub reads, which may have taken long.
       if (hostAssertionExpired(assertion, hosts.now())) return refused("assertion_expired");

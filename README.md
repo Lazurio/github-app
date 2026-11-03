@@ -1131,7 +1131,8 @@ Optional. A policy with it may declare no Workspace and no OIDC purpose.
   "repository_id": 3101,
   "ref": "machines-evidence-v1",
   "directory": "access/conglomerate-hosts",
-  "approved_writers": [{ "id": 5001, "login": "example-reviewer" }]
+  "approved_writers": [{ "id": 5001, "login": "example-reviewer" }],
+  "key_ref_protection": "ruleset"
 }
 ```
 
@@ -1145,6 +1146,14 @@ Optional. A policy with it may declare no Workspace and no OIDC purpose.
   immutable id; the login is for review), at most 20, possibly empty. Whoever
   can write the key document can obtain `members: read` through it, so this
   list is the Organization's decision who may.
+- `key_ref_protection`: `"ruleset"` on a paid plan: the broker verifies live
+  that an active ruleset on the ref carries `update`, `deletion` and
+  `non_fast_forward` and lets only this App and the Organization's Owners
+  bypass it (an `Integration` bypass actor with this App's id and the
+  `OrganizationAdmin` role), which shuts every other GitHub App and deploy
+  key out of the key documents. `"none"` on a plan without rulesets for
+  private repositories, where the Organization accepts that other Apps with
+  `contents: write` could write the ref.
 
 The token's permission set is fixed: `contents: read` and `members: read`
 (GitHub adds `metadata: read`). It is not configurable.
@@ -1204,7 +1213,7 @@ Refusals, each `{"error": "<code>"}`:
 | --- | --- |
 | 400 | `invalid_request` (the body is not `{}`) |
 | 401 | `assertion_missing`, `assertion_malformed`, `assertion_algorithm_refused`, `assertion_audience_mismatch`, `assertion_claims_invalid`, `assertion_lifetime_too_long`, `assertion_not_yet_valid`, `assertion_expired`, `assertion_signature_invalid`, `assertion_replayed` |
-| 403 | `host_unknown` (no key document), `host_key_invalid`, `organization_mismatch`, `deployment_repository_writer_not_approved` (a writer of the repository is neither an Owner nor an approved writer), `deployment_repository_write_key` (a deploy key can write the repository); both checked after the signature |
+| 403 | `host_unknown` (no key document), `host_key_invalid`, `organization_mismatch`, `deployment_repository_writer_not_approved` (a writer of the repository is neither an Owner nor an approved writer), `deployment_repository_write_key` (a deploy key can write the repository), `key_ref_unprotected` (no ruleset protects the key ref as `key_ref_protection: "ruleset"` requires); all checked after the signature |
 | 415 | `unsupported_media_type` |
 | 429 | `rate_limited`: the broker's 60 key document reads per hour, before any assertion is verified, or a host's 12 tokens per hour |
 | 502 | `token_unavailable` |
@@ -1219,15 +1228,15 @@ Whoever can write the key document's ref can obtain `members: read` through
 it, so the route assumes that every account with write access to the
 configured repository is an Owner of the Organization or an account its
 `approved_writers` names, that no deploy key can write it, and that no GitHub
-App other than Lazurio for GitHub has `contents: write` on it. The broker
-checks the first two live and refuses otherwise
-(`deployment_repository_writer_not_approved`, `deployment_repository_write_key`;
-the installation must accept `administration: read`); it cannot see other App
-installations without `organization_administration: read`, so the third is the
-Organization's precondition, not a checked fact. The repository's Git
-history records who changed a key document. On a paid plan, a ruleset on the
-ref refusing deletion and non-fast-forward updates keeps that history; a free
-plan offers no rulesets for private repositories. An Owner-confirmed key
+App other than Lazurio for GitHub can write the key ref. The broker checks the
+first two live and refuses otherwise (`deployment_repository_writer_not_approved`,
+`deployment_repository_write_key`; the installation must accept
+`administration: read`). The third it checks through the ruleset that
+`key_ref_protection: "ruleset"` requires on a paid plan
+(`key_ref_unprotected`); on a plan without rulesets for private repositories
+(`"none"`) it is the Organization's accepted precondition. The repository's Git
+history records who changed a key document; the ruleset also keeps that
+history from deletion and rewrite. An Owner-confirmed key
 fingerprint is a possible later step, not part of `0.15.0`
 ([#32](https://github.com/Lazurio/github-app/issues/32)).
 

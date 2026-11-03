@@ -57,6 +57,7 @@ function hostsPolicyFixture(overrides = {}) {
       ref: REF,
       directory: DIRECTORY,
       approved_writers: [{ id: 5001, login: "example-reviewer" }],
+      key_ref_protection: "ruleset",
       ...overrides,
     },
   };
@@ -155,6 +156,7 @@ function syntheticGithub({
   read,
   unapprovedWriters = 0,
   writeDeployKeys = 0,
+  keyRefProtected = true,
 } = {}) {
   const reads = [];
   const mints = [];
@@ -175,7 +177,12 @@ function syntheticGithub({
       async readHostAdmission(_policy, path) {
         reads.push(path);
         if (read) return read(path);
-        return { document: documents[path], unapproved_writers: unapprovedWriters, write_deploy_keys: writeDeployKeys };
+        return {
+          document: documents[path],
+          unapproved_writers: unapprovedWriters,
+          write_deploy_keys: writeDeployKeys,
+          key_ref_protected: keyRefProtected,
+        };
       },
       async mintPurposeToken(_policy, repositoryId, permissions) {
         mints.push({ repositoryId, permissions });
@@ -224,13 +231,14 @@ test("conglomerate_hosts is optional; with it a policy may hold no Workspace, an
     ref: REF,
     directory: DIRECTORY,
     approved_writers: [{ id: 5001, login: "example-reviewer" }],
+    key_ref_protection: "ruleset",
     permissions: HOST_TOKEN_PERMISSIONS,
   });
   assert.deepEqual(parsePolicy(hostsPolicyFixture({ approved_writers: [] })).conglomerate_hosts.approved_writers, []);
   assert.deepEqual(HOST_TOKEN_PERMISSIONS, { contents: "read", members: "read" });
   const { conglomerate_hosts: _hosts, ...without } = hostsPolicyFixture();
   assert.throws(() => parsePolicy(without), /workspaces must be a non-empty array/);
-  assert.match(formatPolicySummary(policy), /conglomerate_hosts audience=https:\/\/github-broker\.example\.com repository=3101 ref=machines-evidence-v1 directory=access\/conglomerate-hosts approved_writers=5001 asks for: contents=read members=read/);
+  assert.match(formatPolicySummary(policy), /conglomerate_hosts audience=https:\/\/github-broker\.example\.com repository=3101 ref=machines-evidence-v1 directory=access\/conglomerate-hosts approved_writers=5001 key_ref_protection=ruleset asks for: contents=read members=read/);
 });
 
 test("conglomerate_hosts refuses anything but exact keys, a canonical origin, one branch and a plain relative directory", () => {
@@ -251,6 +259,8 @@ test("conglomerate_hosts refuses anything but exact keys, a canonical origin, on
     { directory: "Access/Hosts" },
     { directory: "." },
     { approved_writers: undefined },
+    { key_ref_protection: undefined },
+    { key_ref_protection: "branch-protection" },
     { approved_writers: [{ id: 5001 }] },
     { approved_writers: [{ id: "5001", login: "example-reviewer" }] },
     { approved_writers: [{ id: 5001, login: "-bad" }] },
@@ -262,7 +272,7 @@ test("conglomerate_hosts refuses anything but exact keys, a canonical origin, on
   }
   const missing = hostsPolicyFixture();
   delete missing.conglomerate_hosts.ref;
-  assert.throws(() => parsePolicy(missing), /exactly audience, repository_id, ref, directory and approved_writers/);
+  assert.throws(() => parsePolicy(missing), /exactly audience, repository_id, ref, directory, approved_writers and key_ref_protection/);
 });
 
 // ---------------------------------------------------------------------------- the assertion ---
@@ -465,6 +475,47 @@ test("a deploy key that can write the Deployment Repo stops the route after the 
   assert.deepEqual(forged.body, { error: "assertion_signature_invalid" });
 });
 
+test("on a paid plan the key ref must be protected by a ruleset only this App and the Owners bypass; on \"none\" nothing is read (review)", async () => {
+  const policy = parsePolicy(hostsPolicyFixture());
+  const verdict = async (rulesets) =>
+    (await fakeGithubApi({ rulesets }).client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).key_ref_protected;
+  assert.equal(await verdict([protectingRuleset()]), true);
+  assert.equal(await verdict([protectingRuleset({ conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/main"] } } })]), true);
+  assert.equal(await verdict([]), false);
+  for (const overrides of [
+    { enforcement: "evaluate" },
+    { enforcement: "disabled" },
+    { target: "tag" },
+    { conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } } },
+    { conditions: { ref_name: { include: ["~ALL"], exclude: [`refs/heads/${REF}`] } } },
+    { conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/machines-*"] } } },
+    { conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] }, repository_name: { include: ["~ALL"] } } },
+    { rules: [{ type: "deletion" }, { type: "non_fast_forward" }] },
+    { rules: [{ type: "update" }, { type: "non_fast_forward" }] },
+    { bypass_actors: [{ actor_id: 99, actor_type: "Integration", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 7, actor_type: "Team", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 8, actor_type: "DeployKey", bypass_mode: "always" }] },
+    { bypass_actors: undefined },
+  ]) {
+    assert.equal(await verdict([protectingRuleset(overrides)]), false, JSON.stringify(overrides));
+  }
+  // A plan without rulesets: the policy says so explicitly, and no ruleset is read.
+  const free = fakeGithubApi({ rulesets: [] });
+  const admission = await free.client.readHostAdmission(
+    parsePolicy(hostsPolicyFixture({ key_ref_protection: "none" })),
+    `${DIRECTORY}/${HOST}.json`,
+  );
+  assert.equal(admission.key_ref_protected, true);
+  assert.equal(free.calls.some((call) => call.path.includes("/rulesets")), false);
+  // Through the handler: an unprotected ref mints nothing, after the signature.
+  const github = syntheticGithub({ keyRefProtected: false });
+  const { handle } = hostHandler({ github });
+  assert.deepEqual((await hostCall(handle, assertion())).body, { error: "key_ref_unprotected" });
+  assert.equal(github.mints.length, 0);
+  assert.deepEqual((await hostCall(handle, assertion({ key: OTHER_KEY }))).body, { error: "assertion_signature_invalid" });
+});
+
 test("conglomerate_hosts needs the installation to accept administration: read for the deploy key check", () => {
   const policy = hostsPolicyFixture();
   delete policy.installation_permissions.administration;
@@ -550,11 +601,28 @@ test("without conglomerate_hosts, or without the host dependencies (the Node ada
 
 // ------------------------------------------------------------------- the real GitHub client ---
 
+/** A ruleset that protects the key ref as the policy requires. */
+function protectingRuleset(overrides = {}) {
+  return {
+    id: 777,
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] } },
+    rules: [{ type: "update" }, { type: "deletion" }, { type: "non_fast_forward" }],
+    bypass_actors: [
+      { actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "always" },
+      { actor_id: 42, actor_type: "Integration", bypass_mode: "always" },
+    ],
+    ...overrides,
+  };
+}
+
 function fakeGithubApi({
   document = keyDocument(),
   status = 200,
   revokeStatus = 204,
   deployKeys = [{ id: 9001, read_only: true }],
+  rulesets = [protectingRuleset()],
   owner = 1001,
   owners = [{ id: 6001, login: "example-owner" }],
   collaborators = [
@@ -585,6 +653,11 @@ function fakeGithubApi({
     if (pathname === "/organizations/1001/members") return Response.json(owners);
     if (pathname === "/repositories/3101/collaborators") return Response.json(collaborators);
     if (pathname === "/repositories/3101/keys") return Response.json(deployKeys);
+    if (pathname === "/repositories/3101/rulesets") {
+      return Response.json(rulesets.map(({ id, enforcement, target }) => ({ id, enforcement, target })));
+    }
+    const single = /^\/repositories\/3101\/rulesets\/(\d+)$/.exec(pathname);
+    if (single) return Response.json(rulesets.find((ruleset) => ruleset.id === Number(single[1])) ?? {}, { status: 200 });
     if (pathname === "/installation/token") return new Response(null, { status: revokeStatus });
     return new Response("{}", { status: 404 });
   };
@@ -598,8 +671,11 @@ test("the GitHub client reads the key document raw at the policy's ref and the w
     document: keyDocument(),
     unapproved_writers: 0,
     write_deploy_keys: 0,
+    key_ref_protected: true,
   });
-  const [mint, read, owners, collaborators, keys, revoke] = api.calls;
+  const [mint, read, owners, collaborators, keys, rulesetList, rulesetOne, revoke] = api.calls;
+  assert.equal(rulesetList.path, "/repositories/3101/rulesets?includes_parents=true&per_page=100&page=1");
+  assert.equal(rulesetOne.path, "/repositories/3101/rulesets/777");
   assert.deepEqual(JSON.parse(mint.body), {
     repository_ids: [3101],
     permissions: { administration: "read", contents: "read", members: "read" },
@@ -686,7 +762,7 @@ test("an assertion that expires while its body or the GitHub reads are pending i
     const github = syntheticGithub({
       read: () => {
         now = NOW + 91_000;
-        return { document: keyDocument(), unapproved_writers: 0, write_deploy_keys: 0 };
+        return { document: keyDocument(), unapproved_writers: 0, write_deploy_keys: 0, key_ref_protected: true };
       },
     });
     const { handle } = hostHandler({ github, now: () => now, guard: memoryGuard(() => now) });

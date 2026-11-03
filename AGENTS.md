@@ -108,10 +108,13 @@ dependency-light and customer-neutral.
     immutable id), read live, or the request is refused
     (`deployment_repository_writer_not_approved`), and no deploy key may
     write it (`deployment_repository_write_key`; the policy needs the
-    installation's `administration: read`). Another GitHub App with
-    `contents: write` on that repository is a write path the broker cannot
-    see without `organization_administration: read`: it is a stated
-    precondition, never described as checked. The token is that
+    installation's `administration: read`). With `key_ref_protection:
+    "ruleset"` an active ruleset must also let only this App and the
+    Organization's Owners update the ref and refuse its deletion and
+    non-fast-forward updates (`key_ref_unprotected`); that is what keeps any
+    other GitHub App with `contents: write` off the key. With `"none"`, for a
+    plan without rulesets on private repositories, such Apps remain an
+    accepted, stated precondition, never described as checked. The token is that
     repository with exactly `contents: read` and `members: read`. Before any
     GitHub request a deny-only hourly read budget per broker applies; after
     the signature, the `jti` is accepted once and a host has an hourly grant

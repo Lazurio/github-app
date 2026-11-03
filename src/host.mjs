@@ -50,6 +50,7 @@ export const HOST_REFUSALS = Object.freeze({
   organization_mismatch: 403,
   deployment_repository_writer_not_approved: 403,
   deployment_repository_write_key: 403,
+  key_ref_unprotected: 403,
   unsupported_media_type: 415,
   rate_limited: 429,
   token_unavailable: 502,
@@ -75,6 +76,9 @@ function fail(message) {
 }
 
 // A Machines machine id: lowercase DNS label.
+export const KEY_REF_PROTECTIONS = Object.freeze(["ruleset", "none"]);
+/** The rules a ruleset on the key ref must carry. */
+export const KEY_REF_RULES = Object.freeze(["update", "deletion", "non_fast_forward"]);
 const LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const HOST_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const JTI_PATTERN = /^[A-Za-z0-9_-]{22,128}$/;
@@ -142,8 +146,18 @@ function validDirectory(value) {
  * permission set is fixed, never configured, and must lie within the accepted installation.
  */
 export function parseConglomerateHosts(input, installationPermissions) {
-  if (!exactKeys(input, ["audience", "repository_id", "ref", "directory", "approved_writers"])) {
-    fail("conglomerate_hosts must have exactly audience, repository_id, ref, directory and approved_writers");
+  if (
+    !exactKeys(input, ["audience", "repository_id", "ref", "directory", "approved_writers", "key_ref_protection"])
+  ) {
+    fail(
+      "conglomerate_hosts must have exactly audience, repository_id, ref, directory, approved_writers and key_ref_protection",
+    );
+  }
+  // "ruleset" (a paid plan): the broker verifies live that a ruleset lets only this App and the
+  // Organization's Owners update the ref, and refuses its deletion and non-fast-forward updates.
+  // "none": a plan without rulesets for private repositories; the Organization accepts the rest.
+  if (!KEY_REF_PROTECTIONS.includes(input.key_ref_protection)) {
+    fail(`conglomerate_hosts.key_ref_protection must be one of ${KEY_REF_PROTECTIONS.join(", ")}`);
   }
   const audience = canonicalHttpsOrigin(input.audience);
   if (audience === undefined) fail("conglomerate_hosts.audience must be the broker's canonical https origin");
@@ -181,6 +195,7 @@ export function parseConglomerateHosts(input, installationPermissions) {
     ref: input.ref,
     directory: input.directory,
     approved_writers: Object.freeze(approvedWriters),
+    key_ref_protection: input.key_ref_protection,
     permissions: HOST_TOKEN_PERMISSIONS,
   });
 }
@@ -262,6 +277,33 @@ export function decodeHostAssertion(compact, { audience, now }) {
 /** Whether a decoded assertion has expired by `now`, with the same tolerance as decoding. */
 export function hostAssertionExpired(assertion, now) {
   return assertion.exp + HOST_CLOCK_TOLERANCE_SECONDS < Math.floor(now / 1000);
+}
+
+/**
+ * Whether one ruleset (as GitHub's single-ruleset answer returns it) protects `ref` as the policy
+ * requires: active, on branches, naming the ref exactly or `~ALL` with no exclusion that could match
+ * it, carrying `update`, `deletion` and `non_fast_forward`, and letting only this App (`appId`) and
+ * the Organization's Owners bypass it.
+ */
+export function rulesetProtectsKeyRef(ruleset, { ref, appId }) {
+  if (!plainObject(ruleset) || ruleset.enforcement !== "active" || ruleset.target !== "branch") return false;
+  const names = ruleset.conditions?.ref_name;
+  const include = Array.isArray(names?.include) ? names.include : [];
+  const exclude = Array.isArray(names?.exclude) ? names.exclude : [];
+  const fullRef = `refs/heads/${ref}`;
+  if (!include.some((entry) => entry === fullRef || entry === "~ALL")) return false;
+  // A pattern could exclude the ref; only exact names of other refs are tolerated.
+  if (exclude.some((entry) => typeof entry !== "string" || entry === fullRef || /[*?[\]~]/.test(entry))) return false;
+  // Only ref name conditions: a repository condition would need its own evaluation.
+  if (Object.keys(ruleset.conditions ?? {}).some((key) => key !== "ref_name")) return false;
+  const types = new Set((Array.isArray(ruleset.rules) ? ruleset.rules : []).map((rule) => rule?.type));
+  if (!KEY_REF_RULES.every((type) => types.has(type))) return false;
+  const bypass = Array.isArray(ruleset.bypass_actors) ? ruleset.bypass_actors : undefined;
+  if (bypass === undefined) return false;
+  return bypass.every(
+    (actor) =>
+      actor?.actor_type === "OrganizationAdmin" || (actor?.actor_type === "Integration" && actor?.actor_id === appId),
+  );
 }
 
 /** The repository path of a host's key document. */

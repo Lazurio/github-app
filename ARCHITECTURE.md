@@ -348,8 +348,11 @@ decides, in this order:
 5. the Ed25519 signature over the presented header and claims (WebCrypto);
 6. every account with write access to that repository (collaborators of any
    affiliation with push, maintain or admin) is an Owner of the Organization
-   or one of the policy's `approved_writers`, and no deploy key may write it,
-   both read live with the same token;
+   or one of the policy's `approved_writers`, no deploy key may write it,
+   and, with `key_ref_protection: "ruleset"`, one active ruleset on the ref
+   carries `update`, `deletion` and `non_fast_forward` with only this App and
+   the Organization's Owners as bypass actors, all read live with the same
+   token;
    checked only after the signature, so a stranger learns nothing about the
    writers; the assertion's time is checked again by a fresh clock after the
    body is read and again here, so an assertion that expired while a request
@@ -436,11 +439,12 @@ a Deployment Repo:
   which repository access alone does not grant. The broker therefore admits
   the route only while every writer of that repository is an Owner or an
   account the policy names in `approved_writers` and no deploy key can write
-  it, checked live on every request; another GitHub App installation with
-  `contents: write` on the repository would be a further writer the broker
-  cannot see without the Organization permission
-  `organization_administration: read`, so it is a precondition the
-  Organization keeps, not a checked fact; an Organization accepts that those accounts can read its
+  it, checked live on every request. Other GitHub App installations with
+  `contents: write` are further writers the broker cannot list without
+  `organization_administration: read`; on a paid plan the required ruleset
+  shuts them out of the key ref, and on a plan without rulesets
+  (`key_ref_protection: "none"`) they remain a precondition the Organization
+  accepts, not a checked fact; an Organization accepts that those accounts can read its
   membership this way. On a paid plan, a ruleset refusing deletion and
   non-fast-forward updates of the ref keeps every key change in history.
   The document never widens the token.

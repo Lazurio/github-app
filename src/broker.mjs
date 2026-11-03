@@ -195,7 +195,7 @@ function formatOidcSummary(oidc) {
 function formatHostsSummary(hosts) {
   if (hosts === undefined) return [];
   return [
-    `conglomerate_hosts audience=${hosts.audience} repository=${hosts.repository_id} ref=${hosts.ref} directory=${hosts.directory} approved_writers=${hosts.approved_writers.map(({ id }) => id).join(",") || "-"} asks for: ${formatPermissions(hosts.permissions)}`,
+    `conglomerate_hosts audience=${hosts.audience} repository=${hosts.repository_id} ref=${hosts.ref} directory=${hosts.directory} approved_writers=${hosts.approved_writers.map(({ id }) => id).join(",") || "-"} key_ref_protection=${hosts.key_ref_protection} asks for: ${formatPermissions(hosts.permissions)}`,
   ];
 }
 
