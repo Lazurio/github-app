@@ -124,8 +124,11 @@ dependency-light and customer-neutral.
     that outlives its own token or grant; the product owner accepted that on
     2026-11-03 with its boundary: the broker never asks who wrote a document,
     so a document mints until it is removed or replaced (the Organization's
-    next lane apply rewrites it with the host's own key) and Git history shows
-    who wrote it. Never describe the route as checking provenance. The token is that
+    next lane apply rewrites it with the host's own key), and Git history
+    keeps every change of it. Commit metadata is the writer's own and every
+    App-mediated write appears as this App, so history proves what changed and
+    when, not who pushed it. Never describe the route as checking provenance
+    or history as attributing a writer. The token is that
     repository with exactly `contents: read` and `members: read`. Before any
     GitHub request a deny-only hourly read budget per broker applies; after
     the signature, the `jti` is accepted once and a host has an hourly grant

@@ -204,8 +204,9 @@ export function parseConglomerateHosts(input, installationPermissions) {
 
 /**
  * Every token this App mints that can write the host key repository must already carry
- * `members: read`, so writing a key document and calling the host route grants that App-mediated
- * writer nothing it did not hold. A Workspace's write tier always carries it; this refuses a policy
+ * `members: read`, so an App-mediated writer holds that read while its token lasts anyway. A key
+ * document it writes still keeps minting after the token or grant ends (accepted durable access,
+ * see ARCHITECTURE.md). A Workspace's write tier always carries it; this refuses a policy
  * with an OIDC purpose that can mint `contents: write` on that repository without it. A purpose can
  * reach the repository when it names it, or serves the caller's own repository and that repository
  * is a listed Deployment Repo of the policy's Organization that the purpose admits.

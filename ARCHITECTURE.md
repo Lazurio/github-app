@@ -460,8 +460,10 @@ a Deployment Repo:
   with its revocation boundary: the document mints until it is removed or
   replaced, and the Organization's tooling rewrites it with the host's own
   key on every lane apply, so a foreign key lasts at most until that
-  Organization's next apply or an Owner's removal; Git history shows who wrote
-  it. An Owner-confirmed key is the possible later step
+  Organization's next apply or an Owner's removal. Git history keeps every
+  change of the document; it records what changed and when, but not who
+  pushed it: commit metadata is supplied by the writer, and every write
+  through this App appears as this App. An Owner-confirmed key is the possible later step
   ([#32](https://github.com/Lazurio/github-app/issues/32)).
   The document never widens the token.
 - A stolen host key mints read tokens, at most the hourly grant budget, until

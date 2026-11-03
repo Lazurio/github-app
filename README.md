@@ -1241,10 +1241,11 @@ refuses an OIDC purpose that could write it without). A key document such a
 token wrote keeps minting after the token or grant ends: the broker checks the
 current writers, never who wrote a document. That durable access is accepted
 with its boundary: the document mints until it is removed or replaced, which
-the Organization's next lane apply does with the host's own key, and Git
-history shows who wrote it. The repository's Git
-history records who changed a key document; the ruleset nobody bypasses keeps
-that history from deletion and rewrite. An Owner-confirmed key
+the Organization's next lane apply does with the host's own key. The
+repository's Git history keeps every change of a key document, and the ruleset
+nobody bypasses keeps that history from deletion and rewrite; it shows what
+changed and when, not who pushed it (commit metadata is the writer's own, and
+every write through this App appears as this App). An Owner-confirmed key
 fingerprint is a possible later step, not part of `0.15.0`
 ([#32](https://github.com/Lazurio/github-app/issues/32)).
 
