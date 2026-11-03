@@ -246,7 +246,7 @@ export function decodeHostAssertion(compact, { audience, now }) {
   if (claims.exp - claims.iat > HOST_ASSERTION_MAX_LIFETIME_SECONDS) refuse("assertion_lifetime_too_long");
   const nowSeconds = Math.floor(now / 1000);
   if (claims.iat > nowSeconds + HOST_CLOCK_TOLERANCE_SECONDS) refuse("assertion_not_yet_valid");
-  if (claims.exp + HOST_CLOCK_TOLERANCE_SECONDS < nowSeconds) refuse("assertion_expired");
+  if (hostAssertionExpired(claims, now)) refuse("assertion_expired");
   return Object.freeze({
     host: header.kid,
     jti: claims.jti,
@@ -255,6 +255,11 @@ export function decodeHostAssertion(compact, { audience, now }) {
     signing_input: `${parts[0]}.${parts[1]}`,
     signature,
   });
+}
+
+/** Whether a decoded assertion has expired by `now`, with the same tolerance as decoding. */
+export function hostAssertionExpired(assertion, now) {
+  return assertion.exp + HOST_CLOCK_TOLERANCE_SECONDS < Math.floor(now / 1000);
 }
 
 /** The repository path of a host's key document. */

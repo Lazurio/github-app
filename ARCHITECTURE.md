@@ -335,8 +335,13 @@ decides, in this order:
 2. a deny-only budget of key document reads per broker and hour, which also
    refuses a `jti` it saw that hour;
 3. the key document `<directory>/<kid>.json` at the policy's ref, read live
-   with a `contents: read` token for exactly that repository of the policy's
-   Organization and revoked at once; a missing document is `host_unknown`;
+   with an internal `contents: read` + `members: read` token for exactly that
+   repository of the policy's Organization, which also reads the Owners and
+   the writers (step 6) and is revoked before the request goes on; a failed
+   revocation fails the request (`token_unavailable`), so no host token is
+   minted while it may still be valid, and it then expires on GitHub's
+   schedule, at most an hour, without leaving the broker; a missing document
+   is `host_unknown`;
 4. the document names exactly that host and this broker's Organization id and
    holds one Ed25519 public key (`ed25519:<base64url>`);
 5. the Ed25519 signature over the presented header and claims (WebCrypto);
@@ -344,7 +349,9 @@ decides, in this order:
    affiliation with push, maintain or admin) is an Owner of the Organization
    or one of the policy's `approved_writers`, read live with the same token;
    checked only after the signature, so a stranger learns nothing about the
-   writers;
+   writers; the assertion's time is checked again by a fresh clock after the
+   body is read and again here, so an assertion that expired while a request
+   was pending never meets a guard whose replay record is gone;
 7. the host's `jti` once, and its hourly grant budget, keyed by the signed
    `iat` so one assertion always meets its own record;
 8. the live installation gate, unchanged, and one token for the policy's

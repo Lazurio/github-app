@@ -9,6 +9,7 @@ import {
   HOST_TOKEN_PERMISSIONS,
   HostRefusal,
   decodeHostAssertion,
+  hostAssertionExpired,
   hostKeyDocumentPath,
   parseConglomerateHosts,
   parseHostKeyDocument,
@@ -1198,7 +1199,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
         if (answer.length < 100) return values;
       }
     };
-    try {
+    const read = async () => {
       const encodedPath = path.split("/").map(encodeURIComponent).join("/");
       const response = await fetchImpl(
         `https://api.github.com/repositories/${hosts.repository_id}/contents/${encodedPath}?ref=${encodeURIComponent(hosts.ref)}`,
@@ -1227,9 +1228,19 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       }
       const approved = new Set([...owners, ...hosts.approved_writers.map(({ id }) => id)]);
       return Object.freeze({ document, unapproved_writers: writers.filter((id) => !approved.has(id)).length });
-    } finally {
+    };
+    let admission;
+    try {
+      admission = await read();
+    } catch (error) {
+      // The read's failure is the outcome; a failed revocation must not disguise it.
       await request("/installation/token", { method: "DELETE", authorization }).catch(() => {});
+      throw error;
     }
+    // A failed revocation fails the request, so no host token is minted while the internal token
+    // may still be valid; it then expires on GitHub's schedule (at most an hour) inside the broker.
+    await request("/installation/token", { method: "DELETE", authorization });
+    return admission;
   }
 
   return Object.freeze({
@@ -1616,6 +1627,9 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       if (body === null || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
         return refused(INVALID_REQUEST);
       }
+      // The body may arrive late: the assertion must still be valid by a fresh clock, before any
+      // guard (whose replay records outlive an assertion only by their retention) admits it.
+      if (hostAssertionExpired(assertion, hosts.now())) return refused("assertion_expired");
 
       // Before any GitHub request: a deny-only budget of key document reads per broker and hour.
       const read = await hosts.guard.admit({
@@ -1644,6 +1658,8 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       }
       if (admission.unapproved_writers > 0) return refused("deployment_repository_writer_not_approved");
 
+      // Again after the GitHub reads, which may have taken long.
+      if (hostAssertionExpired(assertion, hosts.now())) return refused("assertion_expired");
       // Keyed by the signed `iat`, so the same assertion always meets its own record.
       const grantDecision = await hosts.guard.admit({
         key: `host/${assertion.host}/${Math.floor(assertion.iat / 3600)}`,

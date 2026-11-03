@@ -534,6 +534,7 @@ test("without conglomerate_hosts, or without the host dependencies (the Node ada
 function fakeGithubApi({
   document = keyDocument(),
   status = 200,
+  revokeStatus = 204,
   owner = 1001,
   owners = [{ id: 6001, login: "example-owner" }],
   collaborators = [
@@ -563,7 +564,7 @@ function fakeGithubApi({
     }
     if (pathname === "/organizations/1001/members") return Response.json(owners);
     if (pathname === "/repositories/3101/collaborators") return Response.json(collaborators);
-    if (pathname === "/installation/token") return new Response(null, { status: 204 });
+    if (pathname === "/installation/token") return new Response(null, { status: revokeStatus });
     return new Response("{}", { status: 404 });
   };
   return { calls, client: createGithubClient({ appId: 42, signJwt: async () => "c2lnbmF0dXJl", fetchImpl }) };
@@ -613,6 +614,57 @@ test("the GitHub client answers a missing document as unknown, refuses another o
   await assert.rejects(api.client.readHostAdmission(policy, "secrets/key.json"), /outside the policy's directory/);
   await assert.rejects(api.client.readHostAdmission(policy, `${DIRECTORY}/../x.json`), /outside the policy's directory/);
   assert.equal(api.calls.length, 0);
+});
+
+test("a failed revocation of the internal token fails the request: nothing is returned and no host token is minted", async () => {
+  const policy = parsePolicy(hostsPolicyFixture());
+  const api = fakeGithubApi({ revokeStatus: 500 });
+  await assert.rejects(api.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), /HTTP 500/);
+  assert.equal(api.calls.at(-1).method, "DELETE");
+  // Through the handler: token_unavailable, and the mint is never reached.
+  const github = syntheticGithub({
+    read: (path) => api.client.readHostAdmission(policy, path),
+  });
+  const { handle } = hostHandler({ github });
+  assert.deepEqual((await hostCall(handle, assertion())).body, { error: "token_unavailable" });
+  assert.equal(github.mints.length, 0);
+});
+
+test("an assertion that expires while its body or the GitHub reads are pending is refused by a fresh clock and never mints (Greptile review)", async () => {
+  // A late body: the clock passes exp + 30 s while the body is read.
+  {
+    let now = NOW;
+    const github = syntheticGithub();
+    const { handle } = hostHandler({ github, now: () => now, guard: memoryGuard(() => now) });
+    const token = assertion();
+    const response = await handle({
+      method: "POST",
+      path: "/v1/host/token",
+      contentType: "application/json",
+      authorization: `Bearer ${token}`,
+      readBody: async () => {
+        now = NOW + 91_000;
+        return "{}";
+      },
+    });
+    assert.deepEqual([response.status, response.body], [401, { error: "assertion_expired" }]);
+    assert.equal(github.reads.length, 0);
+    assert.equal(github.mints.length, 0);
+  }
+  // Slow GitHub reads: the clock passes exp + 30 s before the grant.
+  {
+    let now = NOW;
+    const github = syntheticGithub({
+      read: () => {
+        now = NOW + 91_000;
+        return { document: keyDocument(), unapproved_writers: 0 };
+      },
+    });
+    const { handle } = hostHandler({ github, now: () => now, guard: memoryGuard(() => now) });
+    const response = await hostCall(handle, assertion());
+    assert.deepEqual([response.status, response.body], [401, { error: "assertion_expired" }]);
+    assert.equal(github.mints.length, 0);
+  }
 });
 
 // ------------------------------------------------------------------------------- the Worker ---

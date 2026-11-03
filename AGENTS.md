@@ -95,8 +95,12 @@ dependency-light and customer-neutral.
     `iat`, `exp` at most 60 s later and a random `jti`. The host's public key
     is never policy: the broker reads `<directory>/<kid>.json` from the
     policy's `conglomerate_hosts` repository (one of its own Organization) at
-    its ref, live on every request and never cached, with a `contents: read`
-    token for exactly that repository that it revokes at once. The document
+    its ref, live on every request and never cached, with an internal
+    `contents: read` + `members: read` token for exactly that repository that
+    it revokes before going on; a failed revocation fails the request, and
+    that token then expires on GitHub's schedule inside the broker. The
+    assertion's time is checked again by a fresh clock after the body and
+    before the grant. The document
     must name that host and this broker's Organization id. After the
     signature, every account with write access to that repository must be an
     Owner of the Organization or one of the policy's `approved_writers` (by

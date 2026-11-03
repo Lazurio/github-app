@@ -1184,7 +1184,8 @@ The JWS header is exactly `{"alg": "EdDSA", "kid": "<host id>"}` (an optional
 `"typ": "JWT"` is accepted); its claims are exactly `aud` (this broker's
 origin), `iss` (the host id), `iat`, `exp` (at most 60 s after `iat`) and
 `jti` (22 to 128 base64url characters, random per request). Times are checked
-with 30 s of tolerance. The answer has the shape of the OIDC route's:
+with 30 s of tolerance, and again by a fresh clock after the body is read and
+before the grant. The answer has the shape of the OIDC route's:
 
 ```json
 {
@@ -1211,6 +1212,19 @@ Refusals, each `{"error": "<code>"}`:
 Every decision writes one audit line (`route: "host"`, the host id, the
 Organization id and, for a grant, repository, permissions and expiry); never a
 token, an assertion or a key document.
+
+### Precondition: who writes the Deployment Repo
+
+Whoever can write the key document's ref can obtain `members: read` through
+it, so the route assumes that every account with write access to the
+configured repository is an Owner of the Organization or an account its
+`approved_writers` names. The broker refuses the route otherwise
+(`deployment_repository_writer_not_approved`), and the repository's Git
+history records who changed a key document. On a paid plan, a ruleset on the
+ref refusing deletion and non-fast-forward updates keeps that history; a free
+plan offers no rulesets for private repositories. An Owner-confirmed key
+fingerprint is a possible later step, not part of `0.15.0`
+([#32](https://github.com/Lazurio/github-app/issues/32)).
 
 ### Deploying
 
