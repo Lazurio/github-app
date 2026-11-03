@@ -12,7 +12,14 @@ import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import test from "node:test";
 
 import { formatPolicySummary } from "../src/broker.mjs";
-import { admitRunGrant, createBrokerHandler, createGithubClient, parsePolicy } from "../src/core.mjs";
+import {
+  WRITE_ACCESS,
+  admitRunGrant,
+  createBrokerHandler,
+  createGithubClient,
+  parsePolicy,
+  tokenPermissions,
+} from "../src/core.mjs";
 import {
   HOST_GRANTS_PER_HOUR,
   HOST_KEY_DOCUMENT_SCHEMA,
@@ -273,6 +280,61 @@ test("conglomerate_hosts refuses anything but exact keys, a canonical origin, on
   const missing = hostsPolicyFixture();
   delete missing.conglomerate_hosts.ref;
   assert.throws(() => parsePolicy(missing), /exactly audience, repository_id, ref, directory, approved_writers and key_ref_protection/);
+});
+
+test("every App token that can write the host key repository already carries members: read; a policy with an OIDC purpose that would not is refused (review)", () => {
+  const purpose = (overrides = {}) => ({
+    purpose: "deployment-apply",
+    repository: "caller",
+    workflow: ".github/workflows/lazurio-rollout.yml",
+    rules: [{ events: ["push", "workflow_dispatch"], ref: "refs/heads/main", environment: "production" }],
+    permissions: { contents: "write", members: "read" },
+    max_grants_per_run: 2,
+    ...overrides,
+  });
+  const withOidc = (purposes, deployment = [{ repository_id: 3101, repository_owner_id: 1001 }]) => ({
+    ...hostsPolicyFixture(),
+    oidc: { audience: AUDIENCE, deployment_repositories: deployment, purposes },
+  });
+  // Accepted: the write carries members: read; a read-only rule; another repository; a caller list without it.
+  assert.ok(parsePolicy(withOidc([purpose()])).conglomerate_hosts);
+  assert.ok(
+    parsePolicy(
+      withOidc([
+        purpose({
+          permissions: { contents: "write" },
+          rules: [{ events: ["pull_request_target"], ref: "refs/heads/main", environment: null, read_only: true }],
+        }),
+      ]),
+    ),
+  );
+  assert.ok(parsePolicy(withOidc([purpose({ repository: { repository_id: 3201 }, permissions: { contents: "write" } })])));
+  assert.ok(
+    parsePolicy(
+      withOidc(
+        [purpose({ permissions: { contents: "write" }, callers: [{ repository_id: 3102, repository_owner_id: 1001 }] })],
+        [
+          { repository_id: 3101, repository_owner_id: 1001 },
+          { repository_id: 3102, repository_owner_id: 1001 },
+        ],
+      ),
+    ),
+  );
+  // Refused: a write of the key repository without members: read, as the caller's own or as a named repository.
+  assert.throws(
+    () => parsePolicy(withOidc([purpose({ permissions: { contents: "write" } })])),
+    /deployment-apply can write the host key repository without members: read/,
+  );
+  assert.throws(
+    () => parsePolicy(withOidc([purpose({ purpose: "key-writer", repository: { repository_id: 3101 }, permissions: { contents: "write" } })])),
+    /key-writer can write the host key repository without members: read/,
+  );
+  // A Workspace's write tier always carries members: read.
+  const workspacePolicy = parsePolicy({
+    ...hostsPolicyFixture(),
+    workspaces: [{ id: "alpha-team", github_team_id: 4001, credential_file: "/run/secrets/workspace-alpha" }],
+  });
+  assert.equal(tokenPermissions(workspacePolicy, WRITE_ACCESS, workspacePolicy.workspaces[0]).members, "read");
 });
 
 // ---------------------------------------------------------------------------- the assertion ---

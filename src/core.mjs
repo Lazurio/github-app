@@ -12,6 +12,7 @@ import {
   hostAssertionExpired,
   rulesetProtectsKeyRef,
   hostKeyDocumentPath,
+  assertHostKeyWritersCarryMembers,
   parseConglomerateHosts,
   parseHostKeyDocument,
 } from "./host.mjs";
@@ -607,6 +608,7 @@ export function parsePolicy(raw) {
     input.conglomerate_hosts === undefined
       ? undefined
       : parseConglomerateHosts(input.conglomerate_hosts, installationPermissions);
+  assertHostKeyWritersCarryMembers(oidc, conglomerateHosts, ownerId);
 
   // A broker that only serves OIDC purposes or hosts may hold no Workspace; otherwise at least one is required.
   if (

@@ -447,6 +447,12 @@ a Deployment Repo:
   accepts, not a checked fact; an Organization accepts that those accounts can read its
   membership this way. On a paid plan, a ruleset refusing deletion and
   non-fast-forward updates of the ref keeps every key change in history.
+  This App itself is a bypass actor of that ruleset, so every token it
+  mints that can write the repository is a writer too: the Workspace write
+  tier always carries `members: read`, and the parser refuses a policy with
+  an OIDC purpose that could mint `contents: write` on the key repository
+  without `members: read`. Such a writer therefore holds nothing new after
+  writing a key document.
   The document never widens the token.
 - A stolen host key mints read tokens, at most the hourly grant budget, until
   the document is removed; an intercepted assertion is useless after its

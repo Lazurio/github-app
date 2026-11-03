@@ -114,7 +114,11 @@ dependency-light and customer-neutral.
     non-fast-forward updates (`key_ref_unprotected`); that is what keeps any
     other GitHub App with `contents: write` off the key. With `"none"`, for a
     plan without rulesets on private repositories, such Apps remain an
-    accepted, stated precondition, never described as checked. The token is that
+    accepted, stated precondition, never described as checked. This App's
+    own tokens that can write that repository must already carry
+    `members: read`: the Workspace write tier always does, and the parser
+    refuses a policy whose OIDC purpose could mint `contents: write` on it
+    without `members: read`, so the App-mediated write path gains nothing. The token is that
     repository with exactly `contents: read` and `members: read`. Before any
     GitHub request a deny-only hourly read budget per broker applies; after
     the signature, the `jti` is accepted once and a host has an hourly grant

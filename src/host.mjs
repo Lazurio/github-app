@@ -200,6 +200,36 @@ export function parseConglomerateHosts(input, installationPermissions) {
   });
 }
 
+/**
+ * Every token this App mints that can write the host key repository must already carry
+ * `members: read`, so writing a key document and calling the host route grants that App-mediated
+ * writer nothing it did not hold. A Workspace's write tier always carries it; this refuses a policy
+ * with an OIDC purpose that can mint `contents: write` on that repository without it. A purpose can
+ * reach the repository when it names it, or serves the caller's own repository and that repository
+ * is a listed Deployment Repo of the policy's Organization that the purpose admits.
+ */
+export function assertHostKeyWritersCarryMembers(oidc, hosts, ownerId) {
+  if (oidc === undefined || hosts === undefined) return;
+  for (const purpose of oidc.purposes) {
+    const reaches =
+      purpose.repository === "caller"
+        ? oidc.deployment_repositories.some(
+            (entry) =>
+              entry.repository_id === hosts.repository_id &&
+              entry.repository_owner_id === ownerId &&
+              (purpose.callers === undefined ||
+                purpose.callers.some((caller) => caller.repository_id === hosts.repository_id)),
+          )
+        : purpose.repository.repository_id === hosts.repository_id;
+    const writes = purpose.permissions.contents === "write" && purpose.rules.some((rule) => !rule.read_only);
+    if (reaches && writes && purpose.permissions.members !== "read" && purpose.permissions.members !== "write") {
+      fail(
+        `conglomerate_hosts: OIDC purpose ${purpose.purpose} can write the host key repository without members: read; whoever holds it could obtain members: read through a host key`,
+      );
+    }
+  }
+}
+
 /** Unpadded base64url to bytes; undefined for anything else. */
 export function base64urlBytes(text) {
   if (typeof text !== "string" || !BASE64URL_PATTERN.test(text) || text.length % 4 === 1) return undefined;
