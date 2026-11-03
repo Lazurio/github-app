@@ -553,13 +553,27 @@ test("a deploy key that can write the Deployment Repo stops the route after the 
   assert.deepEqual(forged.body, { error: "assertion_signature_invalid" });
 });
 
-test("on a paid plan the key ref must be protected by a ruleset only this App and the Owners bypass; on \"none\" nothing is read (review)", async () => {
+test("on a paid plan the key ref needs an update ruleset only this App and the Owners bypass and a history ruleset nobody bypasses; on \"none\" nothing is read (review)", async () => {
   const policy = parsePolicy(hostsPolicyFixture());
   const verdict = async (rulesets) =>
     (await fakeGithubApi({ rulesets }).client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).key_ref_protected;
-  assert.equal(await verdict([protectingRuleset()]), true);
-  assert.equal(await verdict([protectingRuleset({ conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/main"] } } })]), true);
+  assert.equal(await verdict([updateRuleset(), historyRuleset()]), true);
+  assert.equal(
+    await verdict([
+      updateRuleset({ conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/main"] } } }),
+      historyRuleset({ conditions: { ref_name: { include: ["~ALL"], exclude: [] } } }),
+    ]),
+    true,
+  );
+  // One ruleset with every rule and the App and Owners as bypass actors is not enough: its bypass
+  // also covers deletion and history rewrite.
+  assert.equal(
+    await verdict([updateRuleset({ rules: [{ type: "update" }, { type: "deletion" }, { type: "non_fast_forward" }] })]),
+    false,
+  );
   assert.equal(await verdict([]), false);
+  assert.equal(await verdict([updateRuleset()]), false);
+  assert.equal(await verdict([historyRuleset()]), false);
   for (const overrides of [
     { enforcement: "evaluate" },
     { enforcement: "disabled" },
@@ -569,14 +583,23 @@ test("on a paid plan the key ref must be protected by a ruleset only this App an
     { conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/machines-*"] } } },
     { conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] }, repository_name: { include: ["~ALL"] } } },
     { rules: [{ type: "deletion" }, { type: "non_fast_forward" }] },
-    { rules: [{ type: "update" }, { type: "non_fast_forward" }] },
     { bypass_actors: [{ actor_id: 99, actor_type: "Integration", bypass_mode: "always" }] },
     { bypass_actors: [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }] },
     { bypass_actors: [{ actor_id: 7, actor_type: "Team", bypass_mode: "always" }] },
     { bypass_actors: [{ actor_id: 8, actor_type: "DeployKey", bypass_mode: "always" }] },
     { bypass_actors: undefined },
   ]) {
-    assert.equal(await verdict([protectingRuleset(overrides)]), false, JSON.stringify(overrides));
+    assert.equal(await verdict([updateRuleset(overrides), historyRuleset()]), false, `update ${JSON.stringify(overrides)}`);
+  }
+  for (const overrides of [
+    { enforcement: "evaluate" },
+    { rules: [{ type: "deletion" }] },
+    { rules: [{ type: "non_fast_forward" }] },
+    { bypass_actors: [{ actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 42, actor_type: "Integration", bypass_mode: "always" }] },
+    { conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } } },
+  ]) {
+    assert.equal(await verdict([updateRuleset(), historyRuleset(overrides)]), false, `history ${JSON.stringify(overrides)}`);
   }
   // A plan without rulesets: the policy says so explicitly, and no ruleset is read.
   const free = fakeGithubApi({ rulesets: [] });
@@ -679,18 +702,31 @@ test("without conglomerate_hosts, or without the host dependencies (the Node ada
 
 // ------------------------------------------------------------------- the real GitHub client ---
 
-/** A ruleset that protects the key ref as the policy requires. */
-function protectingRuleset(overrides = {}) {
+/** The ruleset that keeps updates of the key ref to this App and the Owners. */
+function updateRuleset(overrides = {}) {
   return {
     id: 777,
     enforcement: "active",
     target: "branch",
     conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] } },
-    rules: [{ type: "update" }, { type: "deletion" }, { type: "non_fast_forward" }],
+    rules: [{ type: "update" }],
     bypass_actors: [
       { actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "always" },
       { actor_id: 42, actor_type: "Integration", bypass_mode: "always" },
     ],
+    ...overrides,
+  };
+}
+
+/** The ruleset nobody bypasses: no deletion, no history rewrite of the key ref. */
+function historyRuleset(overrides = {}) {
+  return {
+    id: 778,
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] } },
+    rules: [{ type: "deletion" }, { type: "non_fast_forward" }],
+    bypass_actors: [],
     ...overrides,
   };
 }
@@ -700,7 +736,7 @@ function fakeGithubApi({
   status = 200,
   revokeStatus = 204,
   deployKeys = [{ id: 9001, read_only: true }],
-  rulesets = [protectingRuleset()],
+  rulesets = [updateRuleset(), historyRuleset()],
   owner = 1001,
   owners = [{ id: 6001, login: "example-owner" }],
   collaborators = [
@@ -751,9 +787,10 @@ test("the GitHub client reads the key document raw at the policy's ref and the w
     write_deploy_keys: 0,
     key_ref_protected: true,
   });
-  const [mint, read, owners, collaborators, keys, rulesetList, rulesetOne, revoke] = api.calls;
+  const [mint, read, owners, collaborators, keys, rulesetList, rulesetUpdate, rulesetHistory, revoke] = api.calls;
   assert.equal(rulesetList.path, "/repositories/3101/rulesets?includes_parents=true&per_page=100&page=1");
-  assert.equal(rulesetOne.path, "/repositories/3101/rulesets/777");
+  assert.equal(rulesetUpdate.path, "/repositories/3101/rulesets/777");
+  assert.equal(rulesetHistory.path, "/repositories/3101/rulesets/778");
   assert.deepEqual(JSON.parse(mint.body), {
     repository_ids: [3101],
     permissions: { administration: "read", contents: "read", members: "read" },

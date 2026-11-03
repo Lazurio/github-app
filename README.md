@@ -1147,11 +1147,12 @@ Optional. A policy with it may declare no Workspace and no OIDC purpose.
   can write the key document can obtain `members: read` through it, so this
   list is the Organization's decision who may.
 - `key_ref_protection`: `"ruleset"` on a paid plan: the broker verifies live
-  that an active ruleset on the ref carries `update`, `deletion` and
-  `non_fast_forward` and lets only this App and the Organization's Owners
-  bypass it (an `Integration` bypass actor with this App's id and the
-  `OrganizationAdmin` role), which shuts every other GitHub App and deploy
-  key out of the key documents. `"none"` on a plan without rulesets for
+  that two active rulesets apply to the ref: one with `update` that only this
+  App and the Organization's Owners bypass (an `Integration` bypass actor with
+  this App's id and the `OrganizationAdmin` role), which shuts every other
+  GitHub App and deploy key out of the key documents, and one with
+  `deletion` and `non_fast_forward` without any bypass actor, since GitHub
+  applies a ruleset's bypass to all of its rules. `"none"` on a plan without rulesets for
   private repositories, where the Organization accepts that other Apps with
   `contents: write` could write the ref.
 
@@ -1242,8 +1243,8 @@ current writers, never who wrote a document. That durable access is accepted
 with its boundary: the document mints until it is removed or replaced, which
 the Organization's next lane apply does with the host's own key, and Git
 history shows who wrote it. The repository's Git
-history records who changed a key document; the ruleset also keeps that
-history from deletion and rewrite. An Owner-confirmed key
+history records who changed a key document; the ruleset nobody bypasses keeps
+that history from deletion and rewrite. An Owner-confirmed key
 fingerprint is a possible later step, not part of `0.15.0`
 ([#32](https://github.com/Lazurio/github-app/issues/32)).
 

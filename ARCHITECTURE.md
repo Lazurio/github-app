@@ -349,10 +349,11 @@ decides, in this order:
 6. every account with write access to that repository (collaborators of any
    affiliation with push, maintain or admin) is an Owner of the Organization
    or one of the policy's `approved_writers`, no deploy key may write it,
-   and, with `key_ref_protection: "ruleset"`, one active ruleset on the ref
-   carries `update`, `deletion` and `non_fast_forward` with only this App and
-   the Organization's Owners as bypass actors, all read live with the same
-   token;
+   and, with `key_ref_protection: "ruleset"`, two active rulesets apply to
+   the ref: one with `update` whose only bypass actors are this App and the
+   Organization's Owners, and one with `deletion` and `non_fast_forward` and
+   no bypass actor at all (a bypass covers every rule of its ruleset, so one
+   ruleset cannot do both), all read live with the same token;
    checked only after the signature, so a stranger learns nothing about the
    writers; the assertion's time is checked again by a fresh clock after the
    body is read and again here, so an assertion that expired while a request
@@ -445,9 +446,10 @@ a Deployment Repo:
   shuts them out of the key ref, and on a plan without rulesets
   (`key_ref_protection: "none"`) they remain a precondition the Organization
   accepts, not a checked fact; an Organization accepts that those accounts can read its
-  membership this way. On a paid plan, a ruleset refusing deletion and
-  non-fast-forward updates of the ref keeps every key change in history.
-  This App itself is a bypass actor of that ruleset, so every token it
+  membership this way. On a paid plan, the second ruleset, which nobody
+  bypasses, refuses deletion and non-fast-forward updates of the ref, so
+  every key change stays in history, also against an Owner or this App.
+  This App itself is a bypass actor of the update ruleset, so every token it
   mints that can write the repository is a writer too: the Workspace write
   tier always carries `members: read`, and the parser refuses a policy with
   an OIDC purpose that could mint `contents: write` on the key repository

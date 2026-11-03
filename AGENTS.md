@@ -109,10 +109,12 @@ dependency-light and customer-neutral.
     (`deployment_repository_writer_not_approved`), and no deploy key may
     write it (`deployment_repository_write_key`; the policy needs the
     installation's `administration: read`). With `key_ref_protection:
-    "ruleset"` an active ruleset must also let only this App and the
-    Organization's Owners update the ref and refuse its deletion and
-    non-fast-forward updates (`key_ref_unprotected`); that is what keeps any
-    other GitHub App with `contents: write` off the key. With `"none"`, for a
+    "ruleset"` two active rulesets must also apply to the ref: one with
+    `update` that only this App and the Organization's Owners bypass, and one
+    with `deletion` and `non_fast_forward` that nobody bypasses, since a
+    bypass covers every rule of its ruleset (`key_ref_unprotected`); that is
+    what keeps any other GitHub App with `contents: write` off the key and
+    every key change in history. With `"none"`, for a
     plan without rulesets on private repositories, such Apps remain an
     accepted, stated precondition, never described as checked. This App's
     own tokens that can write that repository must already carry

@@ -10,7 +10,7 @@ import {
   HostRefusal,
   decodeHostAssertion,
   hostAssertionExpired,
-  rulesetProtectsKeyRef,
+  keyRefProtection,
   hostKeyDocumentPath,
   assertHostKeyWritersCarryMembers,
   parseConglomerateHosts,
@@ -1252,15 +1252,18 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
           listed.push(...answer);
           if (answer.length < 100) break;
         }
+        let update = false;
+        let history = false;
         for (const entry of listed) {
+          if (update && history) break;
           if (!Number.isSafeInteger(entry?.id) || entry.enforcement !== "active" || entry.target !== "branch") continue;
           // The single-ruleset answer carries the conditions, rules and bypass actors.
           const ruleset = await request(`/repositories/${hosts.repository_id}/rulesets/${entry.id}`, { authorization });
-          if (rulesetProtectsKeyRef(ruleset, { ref: hosts.ref, appId: policy.github_app.id })) {
-            keyRefProtected = true;
-            break;
-          }
+          const found = keyRefProtection(ruleset, { ref: hosts.ref, appId: policy.github_app.id });
+          update ||= found.update;
+          history ||= found.history;
         }
+        keyRefProtected = update && history;
       }
       return Object.freeze({
         document,

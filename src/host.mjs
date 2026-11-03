@@ -77,8 +77,10 @@ function fail(message) {
 
 // A Machines machine id: lowercase DNS label.
 export const KEY_REF_PROTECTIONS = Object.freeze(["ruleset", "none"]);
-/** The rules a ruleset on the key ref must carry. */
-export const KEY_REF_RULES = Object.freeze(["update", "deletion", "non_fast_forward"]);
+/** The rule only this App and the Owners may bypass. */
+export const KEY_REF_UPDATE_RULES = Object.freeze(["update"]);
+/** The rules nobody may bypass, so no change of a key document leaves the ref's history. */
+export const KEY_REF_HISTORY_RULES = Object.freeze(["deletion", "non_fast_forward"]);
 const LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const HOST_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const JTI_PATTERN = /^[A-Za-z0-9_-]{22,128}$/;
@@ -310,30 +312,36 @@ export function hostAssertionExpired(assertion, now) {
 }
 
 /**
- * Whether one ruleset (as GitHub's single-ruleset answer returns it) protects `ref` as the policy
- * requires: active, on branches, naming the ref exactly or `~ALL` with no exclusion that could match
- * it, carrying `update`, `deletion` and `non_fast_forward`, and letting only this App (`appId`) and
- * the Organization's Owners bypass it.
+ * What one ruleset (as GitHub's single-ruleset answer returns it) contributes to the key ref's
+ * protection: `update` when it is active on that ref, carries `update` and lets only this App
+ * (`appId`) and the Organization's Owners bypass it; `history` when it is active on that ref, carries
+ * `deletion` and `non_fast_forward` and has no bypass actor at all, since a bypass covers every rule
+ * of its ruleset. It applies to the ref when it names it exactly or `~ALL` with no exclusion that
+ * could match it, and has no condition other than ref names.
  */
-export function rulesetProtectsKeyRef(ruleset, { ref, appId }) {
-  if (!plainObject(ruleset) || ruleset.enforcement !== "active" || ruleset.target !== "branch") return false;
+export function keyRefProtection(ruleset, { ref, appId }) {
+  const none = Object.freeze({ update: false, history: false });
+  if (!plainObject(ruleset) || ruleset.enforcement !== "active" || ruleset.target !== "branch") return none;
   const names = ruleset.conditions?.ref_name;
   const include = Array.isArray(names?.include) ? names.include : [];
   const exclude = Array.isArray(names?.exclude) ? names.exclude : [];
   const fullRef = `refs/heads/${ref}`;
-  if (!include.some((entry) => entry === fullRef || entry === "~ALL")) return false;
+  if (!include.some((entry) => entry === fullRef || entry === "~ALL")) return none;
   // A pattern could exclude the ref; only exact names of other refs are tolerated.
-  if (exclude.some((entry) => typeof entry !== "string" || entry === fullRef || /[*?[\]~]/.test(entry))) return false;
+  if (exclude.some((entry) => typeof entry !== "string" || entry === fullRef || /[*?[\]~]/.test(entry))) return none;
   // Only ref name conditions: a repository condition would need its own evaluation.
-  if (Object.keys(ruleset.conditions ?? {}).some((key) => key !== "ref_name")) return false;
+  if (Object.keys(ruleset.conditions ?? {}).some((key) => key !== "ref_name")) return none;
   const types = new Set((Array.isArray(ruleset.rules) ? ruleset.rules : []).map((rule) => rule?.type));
-  if (!KEY_REF_RULES.every((type) => types.has(type))) return false;
   const bypass = Array.isArray(ruleset.bypass_actors) ? ruleset.bypass_actors : undefined;
-  if (bypass === undefined) return false;
-  return bypass.every(
+  if (bypass === undefined) return none;
+  const onlyAppAndOwners = bypass.every(
     (actor) =>
       actor?.actor_type === "OrganizationAdmin" || (actor?.actor_type === "Integration" && actor?.actor_id === appId),
   );
+  return Object.freeze({
+    update: KEY_REF_UPDATE_RULES.every((type) => types.has(type)) && onlyAppAndOwners,
+    history: KEY_REF_HISTORY_RULES.every((type) => types.has(type)) && bypass.length === 0,
+  });
 }
 
 /** The repository path of a host's key document. */
