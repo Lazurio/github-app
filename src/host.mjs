@@ -49,6 +49,7 @@ export const HOST_REFUSALS = Object.freeze({
   host_key_invalid: 403,
   organization_mismatch: 403,
   deployment_repository_writer_not_approved: 403,
+  deployment_repository_write_key: 403,
   unsupported_media_type: 415,
   rate_limited: 429,
   token_unavailable: 502,
@@ -168,7 +169,8 @@ export function parseConglomerateHosts(input, installationPermissions) {
   if (new Set(approvedWriters.map(({ id }) => id)).size !== approvedWriters.length) {
     fail("conglomerate_hosts.approved_writers must list each account once");
   }
-  for (const [permission, level] of Object.entries(HOST_TOKEN_PERMISSIONS)) {
+  // The token's permissions, and administration: read for the live deploy key check.
+  for (const [permission, level] of Object.entries({ ...HOST_TOKEN_PERMISSIONS, administration: "read" })) {
     if (installationPermissions?.[permission] !== "read" && installationPermissions?.[permission] !== "write") {
       fail(`conglomerate_hosts needs the installation to accept ${permission}: ${level}`);
     }

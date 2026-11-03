@@ -1185,7 +1185,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     const minted = await mintScopedToken(
       policy,
       hosts.repository_id,
-      Object.freeze({ contents: "read", members: "read" }),
+      Object.freeze({ administration: "read", contents: "read", members: "read" }),
       (repository) => repository?.owner?.id === policy.github_owner.id,
     );
     const authorization = `Bearer ${minted.token}`;
@@ -1213,7 +1213,9 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
           },
         },
       );
-      if (response.status === 404) return Object.freeze({ document: undefined, unapproved_writers: 0 });
+      if (response.status === 404) {
+        return Object.freeze({ document: undefined, unapproved_writers: 0, write_deploy_keys: 0 });
+      }
       if (!response.ok) throw new Error(`GitHub request failed with HTTP ${response.status}`);
       const text = await response.text();
       // An oversized document is refused by its parser; keep only enough for it to tell.
@@ -1227,7 +1229,13 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
         fail("GitHub returned an account without an id");
       }
       const approved = new Set([...owners, ...hosts.approved_writers.map(({ id }) => id)]);
-      return Object.freeze({ document, unapproved_writers: writers.filter((id) => !approved.has(id)).length });
+      // A deploy key that can write is a writer outside every account list: none is admitted.
+      const writeKeys = await pages(`/repositories/${hosts.repository_id}/keys?`, (key) => key?.read_only !== true);
+      return Object.freeze({
+        document,
+        unapproved_writers: writers.filter((id) => !approved.has(id)).length,
+        write_deploy_keys: writeKeys.length,
+      });
     };
     let admission;
     try {
@@ -1653,10 +1661,16 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
         return refused("assertion_signature_invalid");
       }
       // Only after the signature, so an unauthenticated caller learns nothing about the writers.
-      if (!Number.isSafeInteger(admission.unapproved_writers) || admission.unapproved_writers < 0) {
+      if (
+        !Number.isSafeInteger(admission.unapproved_writers) ||
+        admission.unapproved_writers < 0 ||
+        !Number.isSafeInteger(admission.write_deploy_keys) ||
+        admission.write_deploy_keys < 0
+      ) {
         fail("host admission returned an invalid writer count");
       }
       if (admission.unapproved_writers > 0) return refused("deployment_repository_writer_not_approved");
+      if (admission.write_deploy_keys > 0) return refused("deployment_repository_write_key");
 
       // Again after the GitHub reads, which may have taken long.
       if (hostAssertionExpired(assertion, hosts.now())) return refused("assertion_expired");

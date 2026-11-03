@@ -1204,7 +1204,7 @@ Refusals, each `{"error": "<code>"}`:
 | --- | --- |
 | 400 | `invalid_request` (the body is not `{}`) |
 | 401 | `assertion_missing`, `assertion_malformed`, `assertion_algorithm_refused`, `assertion_audience_mismatch`, `assertion_claims_invalid`, `assertion_lifetime_too_long`, `assertion_not_yet_valid`, `assertion_expired`, `assertion_signature_invalid`, `assertion_replayed` |
-| 403 | `host_unknown` (no key document), `host_key_invalid`, `organization_mismatch`, `deployment_repository_writer_not_approved` (a writer of the repository is neither an Owner nor an approved writer; checked after the signature) |
+| 403 | `host_unknown` (no key document), `host_key_invalid`, `organization_mismatch`, `deployment_repository_writer_not_approved` (a writer of the repository is neither an Owner nor an approved writer), `deployment_repository_write_key` (a deploy key can write the repository); both checked after the signature |
 | 415 | `unsupported_media_type` |
 | 429 | `rate_limited`: the broker's 60 key document reads per hour, before any assertion is verified, or a host's 12 tokens per hour |
 | 502 | `token_unavailable` |
@@ -1218,8 +1218,13 @@ token, an assertion or a key document.
 Whoever can write the key document's ref can obtain `members: read` through
 it, so the route assumes that every account with write access to the
 configured repository is an Owner of the Organization or an account its
-`approved_writers` names. The broker refuses the route otherwise
-(`deployment_repository_writer_not_approved`), and the repository's Git
+`approved_writers` names, that no deploy key can write it, and that no GitHub
+App other than Lazurio for GitHub has `contents: write` on it. The broker
+checks the first two live and refuses otherwise
+(`deployment_repository_writer_not_approved`, `deployment_repository_write_key`;
+the installation must accept `administration: read`); it cannot see other App
+installations without `organization_administration: read`, so the third is the
+Organization's precondition, not a checked fact. The repository's Git
 history records who changed a key document. On a paid plan, a ruleset on the
 ref refusing deletion and non-fast-forward updates keeps that history; a free
 plan offers no rulesets for private repositories. An Owner-confirmed key

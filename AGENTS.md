@@ -96,7 +96,8 @@ dependency-light and customer-neutral.
     is never policy: the broker reads `<directory>/<kid>.json` from the
     policy's `conglomerate_hosts` repository (one of its own Organization) at
     its ref, live on every request and never cached, with an internal
-    `contents: read` + `members: read` token for exactly that repository that
+    `administration: read` + `contents: read` + `members: read` token for
+    exactly that repository that
     it revokes before going on; a failed revocation fails the request, and
     that token then expires on GitHub's schedule inside the broker. The
     assertion's time is checked again by a fresh clock after the body and
@@ -105,7 +106,12 @@ dependency-light and customer-neutral.
     signature, every account with write access to that repository must be an
     Owner of the Organization or one of the policy's `approved_writers` (by
     immutable id), read live, or the request is refused
-    (`deployment_repository_writer_not_approved`). The token is that
+    (`deployment_repository_writer_not_approved`), and no deploy key may
+    write it (`deployment_repository_write_key`; the policy needs the
+    installation's `administration: read`). Another GitHub App with
+    `contents: write` on that repository is a write path the broker cannot
+    see without `organization_administration: read`: it is a stated
+    precondition, never described as checked. The token is that
     repository with exactly `contents: read` and `members: read`. Before any
     GitHub request a deny-only hourly read budget per broker applies; after
     the signature, the `jti` is accepted once and a host has an hourly grant

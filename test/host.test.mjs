@@ -43,6 +43,7 @@ function hostsPolicyFixture(overrides = {}) {
     installation_repository_selection: "all",
     installation_permissions: {
       actions: "write",
+      administration: "read",
       checks: "read",
       contents: "write",
       members: "read",
@@ -153,6 +154,7 @@ function syntheticGithub({
   mint,
   read,
   unapprovedWriters = 0,
+  writeDeployKeys = 0,
 } = {}) {
   const reads = [];
   const mints = [];
@@ -173,7 +175,7 @@ function syntheticGithub({
       async readHostAdmission(_policy, path) {
         reads.push(path);
         if (read) return read(path);
-        return { document: documents[path], unapproved_writers: unapprovedWriters };
+        return { document: documents[path], unapproved_writers: unapprovedWriters, write_deploy_keys: writeDeployKeys };
       },
       async mintPurposeToken(_policy, repositoryId, permissions) {
         mints.push({ repositoryId, permissions });
@@ -452,6 +454,23 @@ test("a Deployment Repo with a writer who is neither an Owner nor an approved wr
   assert.deepEqual(forged.body, { error: "assertion_signature_invalid" });
 });
 
+test("a deploy key that can write the Deployment Repo stops the route after the signature, whatever the account lists say (review)", async () => {
+  const github = syntheticGithub({ writeDeployKeys: 1 });
+  const { handle, records } = hostHandler({ github });
+  const refused = await hostCall(handle, assertion());
+  assert.deepEqual([refused.status, refused.body], [403, { error: "deployment_repository_write_key" }]);
+  assert.equal(github.mints.length, 0);
+  assert.equal(records.at(-1).decision, "deployment_repository_write_key");
+  const forged = await hostCall(handle, assertion({ key: OTHER_KEY }));
+  assert.deepEqual(forged.body, { error: "assertion_signature_invalid" });
+});
+
+test("conglomerate_hosts needs the installation to accept administration: read for the deploy key check", () => {
+  const policy = hostsPolicyFixture();
+  delete policy.installation_permissions.administration;
+  assert.throws(() => parsePolicy(policy), /conglomerate_hosts needs the installation to accept administration: read/);
+});
+
 test("the broker's hourly read budget refuses before GitHub, and a host's hourly grant budget before the mint", async () => {
   // Reads: unauthenticated callers can only spend this deny-only budget, never the installation's.
   {
@@ -535,6 +554,7 @@ function fakeGithubApi({
   document = keyDocument(),
   status = 200,
   revokeStatus = 204,
+  deployKeys = [{ id: 9001, read_only: true }],
   owner = 1001,
   owners = [{ id: 6001, login: "example-owner" }],
   collaborators = [
@@ -564,6 +584,7 @@ function fakeGithubApi({
     }
     if (pathname === "/organizations/1001/members") return Response.json(owners);
     if (pathname === "/repositories/3101/collaborators") return Response.json(collaborators);
+    if (pathname === "/repositories/3101/keys") return Response.json(deployKeys);
     if (pathname === "/installation/token") return new Response(null, { status: revokeStatus });
     return new Response("{}", { status: 404 });
   };
@@ -576,9 +597,14 @@ test("the GitHub client reads the key document raw at the policy's ref and the w
   assert.deepEqual(await api.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), {
     document: keyDocument(),
     unapproved_writers: 0,
+    write_deploy_keys: 0,
   });
-  const [mint, read, owners, collaborators, revoke] = api.calls;
-  assert.deepEqual(JSON.parse(mint.body), { repository_ids: [3101], permissions: { contents: "read", members: "read" } });
+  const [mint, read, owners, collaborators, keys, revoke] = api.calls;
+  assert.deepEqual(JSON.parse(mint.body), {
+    repository_ids: [3101],
+    permissions: { administration: "read", contents: "read", members: "read" },
+  });
+  assert.equal(keys.path, "/repositories/3101/keys?per_page=100&page=1");
   assert.equal(read.path, `/repositories/3101/contents/access/conglomerate-hosts/${HOST}.json?ref=machines-evidence-v1`);
   assert.equal(read.accept, "application/vnd.github.raw+json");
   assert.equal(read.authorization, "Bearer ghs_internal_read_token_value");
@@ -594,6 +620,9 @@ test("the GitHub client reads the key document raw at the policy's ref and the w
     ],
   });
   assert.equal((await extra.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).unapproved_writers, 1);
+  // A deploy key that can write counts; a read-only one does not.
+  const keyed = fakeGithubApi({ deployKeys: [{ id: 9001, read_only: true }, { id: 9002, read_only: false }, { id: 9003 }] });
+  assert.equal((await keyed.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).write_deploy_keys, 2);
   // Without approved writers, the reviewer persona counts too.
   const strict = parsePolicy(hostsPolicyFixture({ approved_writers: [] }));
   assert.equal((await fakeGithubApi().client.readHostAdmission(strict, `${DIRECTORY}/${HOST}.json`)).unapproved_writers, 1);
@@ -657,7 +686,7 @@ test("an assertion that expires while its body or the GitHub reads are pending i
     const github = syntheticGithub({
       read: () => {
         now = NOW + 91_000;
-        return { document: keyDocument(), unapproved_writers: 0 };
+        return { document: keyDocument(), unapproved_writers: 0, write_deploy_keys: 0 };
       },
     });
     const { handle } = hostHandler({ github, now: () => now, guard: memoryGuard(() => now) });
