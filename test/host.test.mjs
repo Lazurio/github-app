@@ -50,7 +50,14 @@ function hostsPolicyFixture(overrides = {}) {
       pull_requests: "write",
     },
     workspaces: [],
-    conglomerate_hosts: { audience: AUDIENCE, repository_id: 3101, ref: REF, directory: DIRECTORY, ...overrides },
+    conglomerate_hosts: {
+      audience: AUDIENCE,
+      repository_id: 3101,
+      ref: REF,
+      directory: DIRECTORY,
+      approved_writers: [{ id: 5001, login: "example-reviewer" }],
+      ...overrides,
+    },
   };
 }
 
@@ -141,7 +148,12 @@ function memoryGuard(now = () => NOW) {
 }
 
 /** A GitHub client double: the key documents by path, and a record of every read and mint. */
-function syntheticGithub({ documents = { [`${DIRECTORY}/${HOST}.json`]: keyDocument() }, mint, read } = {}) {
+function syntheticGithub({
+  documents = { [`${DIRECTORY}/${HOST}.json`]: keyDocument() },
+  mint,
+  read,
+  unapprovedWriters = 0,
+} = {}) {
   const reads = [];
   const mints = [];
   return {
@@ -158,10 +170,10 @@ function syntheticGithub({ documents = { [`${DIRECTORY}/${HOST}.json`]: keyDocum
       async mintToken() {
         throw new Error("no Workspace in this test");
       },
-      async readHostKeyDocument(_policy, path) {
+      async readHostAdmission(_policy, path) {
         reads.push(path);
         if (read) return read(path);
-        return documents[path];
+        return { document: documents[path], unapproved_writers: unapprovedWriters };
       },
       async mintPurposeToken(_policy, repositoryId, permissions) {
         mints.push({ repositoryId, permissions });
@@ -209,12 +221,14 @@ test("conglomerate_hosts is optional; with it a policy may hold no Workspace, an
     repository_id: 3101,
     ref: REF,
     directory: DIRECTORY,
+    approved_writers: [{ id: 5001, login: "example-reviewer" }],
     permissions: HOST_TOKEN_PERMISSIONS,
   });
+  assert.deepEqual(parsePolicy(hostsPolicyFixture({ approved_writers: [] })).conglomerate_hosts.approved_writers, []);
   assert.deepEqual(HOST_TOKEN_PERMISSIONS, { contents: "read", members: "read" });
   const { conglomerate_hosts: _hosts, ...without } = hostsPolicyFixture();
   assert.throws(() => parsePolicy(without), /workspaces must be a non-empty array/);
-  assert.match(formatPolicySummary(policy), /conglomerate_hosts audience=https:\/\/github-broker\.example\.com repository=3101 ref=machines-evidence-v1 directory=access\/conglomerate-hosts asks for: contents=read members=read/);
+  assert.match(formatPolicySummary(policy), /conglomerate_hosts audience=https:\/\/github-broker\.example\.com repository=3101 ref=machines-evidence-v1 directory=access\/conglomerate-hosts approved_writers=5001 asks for: contents=read members=read/);
 });
 
 test("conglomerate_hosts refuses anything but exact keys, a canonical origin, one branch and a plain relative directory", () => {
@@ -234,13 +248,19 @@ test("conglomerate_hosts refuses anything but exact keys, a canonical origin, on
     { directory: "access//hosts" },
     { directory: "Access/Hosts" },
     { directory: "." },
+    { approved_writers: undefined },
+    { approved_writers: [{ id: 5001 }] },
+    { approved_writers: [{ id: "5001", login: "example-reviewer" }] },
+    { approved_writers: [{ id: 5001, login: "-bad" }] },
+    { approved_writers: [{ id: 5001, login: "a" }, { id: 5001, login: "b" }] },
+    { approved_writers: Array.from({ length: 21 }, (_, index) => ({ id: index + 1, login: `writer-${index}` })) },
   ];
   for (const overrides of invalid) {
     assert.throws(() => parsePolicy(hostsPolicyFixture(overrides)), Error, JSON.stringify(overrides));
   }
   const missing = hostsPolicyFixture();
   delete missing.conglomerate_hosts.ref;
-  assert.throws(() => parsePolicy(missing), /exactly audience, repository_id, ref and directory/);
+  assert.throws(() => parsePolicy(missing), /exactly audience, repository_id, ref, directory and approved_writers/);
 });
 
 // ---------------------------------------------------------------------------- the assertion ---
@@ -420,6 +440,18 @@ test("a replayed assertion is refused before the key document is read again, and
   assert.equal(github.mints.length, 1);
 });
 
+test("a Deployment Repo with a writer who is neither an Owner nor an approved writer stops the route, but only after the signature", async () => {
+  const github = syntheticGithub({ unapprovedWriters: 1 });
+  const { handle, records } = hostHandler({ github });
+  const refused = await hostCall(handle, assertion());
+  assert.deepEqual([refused.status, refused.body], [403, { error: "deployment_repository_writer_not_approved" }]);
+  assert.equal(github.mints.length, 0);
+  assert.equal(records.at(-1).decision, "deployment_repository_writer_not_approved");
+  // An unauthenticated caller learns nothing about the writers: its signature fails first.
+  const forged = await hostCall(handle, assertion({ key: OTHER_KEY }));
+  assert.deepEqual(forged.body, { error: "assertion_signature_invalid" });
+});
+
 test("the broker's hourly read budget refuses before GitHub, and a host's hourly grant budget before the mint", async () => {
   // Reads: unauthenticated callers can only spend this deny-only budget, never the installation's.
   {
@@ -499,7 +531,17 @@ test("without conglomerate_hosts, or without the host dependencies (the Node ada
 
 // ------------------------------------------------------------------- the real GitHub client ---
 
-function fakeGithubApi({ document = keyDocument(), status = 200, owner = 1001 } = {}) {
+function fakeGithubApi({
+  document = keyDocument(),
+  status = 200,
+  owner = 1001,
+  owners = [{ id: 6001, login: "example-owner" }],
+  collaborators = [
+    { id: 6001, login: "example-owner", permissions: { admin: true, maintain: true, push: true, pull: true } },
+    { id: 5001, login: "example-reviewer", permissions: { admin: false, maintain: false, push: true, pull: true } },
+    { id: 5002, login: "example-reader", permissions: { admin: false, maintain: false, push: false, pull: true } },
+  ],
+} = {}) {
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     const { pathname, search } = new URL(url);
@@ -519,38 +561,57 @@ function fakeGithubApi({ document = keyDocument(), status = 200, owner = 1001 } 
     if (pathname.startsWith("/repositories/3101/contents/")) {
       return status === 200 ? new Response(document, { status: 200 }) : new Response("", { status });
     }
+    if (pathname === "/organizations/1001/members") return Response.json(owners);
+    if (pathname === "/repositories/3101/collaborators") return Response.json(collaborators);
     if (pathname === "/installation/token") return new Response(null, { status: 204 });
     return new Response("{}", { status: 404 });
   };
   return { calls, client: createGithubClient({ appId: 42, signJwt: async () => "c2lnbmF0dXJl", fetchImpl }) };
 }
 
-test("the GitHub client reads a key document raw at the policy's ref with a contents-read token for exactly that repository, and revokes it", async () => {
+test("the GitHub client reads the key document raw at the policy's ref and the writers live, with one token for exactly that repository, and revokes it", async () => {
   const policy = parsePolicy(hostsPolicyFixture());
   const api = fakeGithubApi();
-  assert.equal(await api.client.readHostKeyDocument(policy, `${DIRECTORY}/${HOST}.json`), keyDocument());
-  const [mint, read, revoke] = api.calls;
-  assert.deepEqual(JSON.parse(mint.body), { repository_ids: [3101], permissions: { contents: "read" } });
+  assert.deepEqual(await api.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), {
+    document: keyDocument(),
+    unapproved_writers: 0,
+  });
+  const [mint, read, owners, collaborators, revoke] = api.calls;
+  assert.deepEqual(JSON.parse(mint.body), { repository_ids: [3101], permissions: { contents: "read", members: "read" } });
   assert.equal(read.path, `/repositories/3101/contents/access/conglomerate-hosts/${HOST}.json?ref=machines-evidence-v1`);
   assert.equal(read.accept, "application/vnd.github.raw+json");
   assert.equal(read.authorization, "Bearer ghs_internal_read_token_value");
+  assert.equal(owners.path, "/organizations/1001/members?role=admin&per_page=100&page=1");
+  assert.equal(collaborators.path, "/repositories/3101/collaborators?affiliation=all&per_page=100&page=1");
   assert.deepEqual([revoke.method, revoke.path, revoke.authorization], ["DELETE", "/installation/token", "Bearer ghs_internal_read_token_value"]);
+  // A writer who is neither an Owner nor approved is counted; a reader is not.
+  const extra = fakeGithubApi({
+    collaborators: [
+      { id: 6001, permissions: { push: true } },
+      { id: 5003, permissions: { maintain: true } },
+      { id: 5004, permissions: { pull: true } },
+    ],
+  });
+  assert.equal((await extra.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).unapproved_writers, 1);
+  // Without approved writers, the reviewer persona counts too.
+  const strict = parsePolicy(hostsPolicyFixture({ approved_writers: [] }));
+  assert.equal((await fakeGithubApi().client.readHostAdmission(strict, `${DIRECTORY}/${HOST}.json`)).unapproved_writers, 1);
 });
 
 test("the GitHub client answers a missing document as unknown, refuses another owner and paths outside the directory, and always revokes", async () => {
   const policy = parsePolicy(hostsPolicyFixture());
   const missing = fakeGithubApi({ status: 404 });
-  assert.equal(await missing.client.readHostKeyDocument(policy, `${DIRECTORY}/${HOST}.json`), undefined);
+  assert.equal((await missing.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).document, undefined);
   assert.equal(missing.calls.at(-1).method, "DELETE");
   const failing = fakeGithubApi({ status: 500 });
-  await assert.rejects(failing.client.readHostKeyDocument(policy, `${DIRECTORY}/${HOST}.json`), /HTTP 500/);
+  await assert.rejects(failing.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), /HTTP 500/);
   assert.equal(failing.calls.at(-1).method, "DELETE");
   const foreign = fakeGithubApi({ owner: 7001 });
-  await assert.rejects(foreign.client.readHostKeyDocument(policy, `${DIRECTORY}/${HOST}.json`), /outside the requested repository/);
+  await assert.rejects(foreign.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), /outside the requested repository/);
   assert.equal(foreign.calls.some((call) => call.path.startsWith("/repositories/")), false);
   const api = fakeGithubApi();
-  await assert.rejects(api.client.readHostKeyDocument(policy, "secrets/key.json"), /outside the policy's directory/);
-  await assert.rejects(api.client.readHostKeyDocument(policy, `${DIRECTORY}/../x.json`), /outside the policy's directory/);
+  await assert.rejects(api.client.readHostAdmission(policy, "secrets/key.json"), /outside the policy's directory/);
+  await assert.rejects(api.client.readHostAdmission(policy, `${DIRECTORY}/../x.json`), /outside the policy's directory/);
   assert.equal(api.calls.length, 0);
 });
 
@@ -585,9 +646,9 @@ test("Worker end to end: WebCrypto Ed25519, the Durable Object guard and the liv
     async verifyPolicy() {
       order.push("verifyPolicy");
     },
-    async readHostKeyDocument(policy, path) {
+    async readHostAdmission(policy, path) {
       order.push("read");
-      return github.client.readHostKeyDocument(policy, path);
+      return github.client.readHostAdmission(policy, path);
     },
     async mintPurposeToken(policy, repositoryId, permissions) {
       order.push("mint");
@@ -621,7 +682,7 @@ test("Worker end to end: WebCrypto Ed25519, the Durable Object guard and the liv
 
 test("Worker: a policy naming conglomerate_hosts without the guard binding, or a client without a key reader, is unavailable configuration", async () => {
   const github = syntheticGithub();
-  const { readHostKeyDocument: _read, ...withoutReader } = github.client;
+  const { readHostAdmission: _read, ...withoutReader } = github.client;
   for (const [client, withGuard] of [
     [github.client, false],
     [withoutReader, true],

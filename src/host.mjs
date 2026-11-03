@@ -48,6 +48,7 @@ export const HOST_REFUSALS = Object.freeze({
   host_unknown: 403,
   host_key_invalid: 403,
   organization_mismatch: 403,
+  deployment_repository_writer_not_approved: 403,
   unsupported_media_type: 415,
   rate_limited: 429,
   token_unavailable: 502,
@@ -73,6 +74,7 @@ function fail(message) {
 }
 
 // A Machines machine id: lowercase DNS label.
+const LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const HOST_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const JTI_PATTERN = /^[A-Za-z0-9_-]{22,128}$/;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -139,14 +141,33 @@ function validDirectory(value) {
  * permission set is fixed, never configured, and must lie within the accepted installation.
  */
 export function parseConglomerateHosts(input, installationPermissions) {
-  if (!exactKeys(input, ["audience", "repository_id", "ref", "directory"])) {
-    fail("conglomerate_hosts must have exactly audience, repository_id, ref and directory");
+  if (!exactKeys(input, ["audience", "repository_id", "ref", "directory", "approved_writers"])) {
+    fail("conglomerate_hosts must have exactly audience, repository_id, ref, directory and approved_writers");
   }
   const audience = canonicalHttpsOrigin(input.audience);
   if (audience === undefined) fail("conglomerate_hosts.audience must be the broker's canonical https origin");
   if (!positiveInteger(input.repository_id)) fail("conglomerate_hosts.repository_id must be a positive integer");
   if (!validRef(input.ref)) fail("conglomerate_hosts.ref must name one branch");
   if (!validDirectory(input.directory)) fail("conglomerate_hosts.directory must be a relative path of plain segments");
+  // Besides the Organization's Owners, the only accounts that may write the Deployment Repo: an
+  // explicit, possibly empty list, by immutable id (the login is for review only).
+  if (!Array.isArray(input.approved_writers) || input.approved_writers.length > 20) {
+    fail("conglomerate_hosts.approved_writers must be a list of at most 20 accounts");
+  }
+  const approvedWriters = input.approved_writers.map((writer, index) => {
+    if (
+      !exactKeys(writer, ["id", "login"]) ||
+      !positiveInteger(writer.id) ||
+      typeof writer.login !== "string" ||
+      !LOGIN_PATTERN.test(writer.login)
+    ) {
+      fail(`conglomerate_hosts.approved_writers[${index}] must have exactly a positive id and a login`);
+    }
+    return Object.freeze({ id: writer.id, login: writer.login });
+  });
+  if (new Set(approvedWriters.map(({ id }) => id)).size !== approvedWriters.length) {
+    fail("conglomerate_hosts.approved_writers must list each account once");
+  }
   for (const [permission, level] of Object.entries(HOST_TOKEN_PERMISSIONS)) {
     if (installationPermissions?.[permission] !== "read" && installationPermissions?.[permission] !== "write") {
       fail(`conglomerate_hosts needs the installation to accept ${permission}: ${level}`);
@@ -157,6 +178,7 @@ export function parseConglomerateHosts(input, installationPermissions) {
     repository_id: input.repository_id,
     ref: input.ref,
     directory: input.directory,
+    approved_writers: Object.freeze(approvedWriters),
     permissions: HOST_TOKEN_PERMISSIONS,
   });
 }

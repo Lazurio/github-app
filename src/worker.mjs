@@ -242,7 +242,7 @@ export function createWorkerEntrypoint({
           typeof github.mintToken !== "function" ||
           (policy.oidc !== undefined && typeof github.mintPurposeToken !== "function") ||
           (policy.conglomerate_hosts !== undefined &&
-            (typeof github.mintPurposeToken !== "function" || typeof github.readHostKeyDocument !== "function"))
+            (typeof github.mintPurposeToken !== "function" || typeof github.readHostAdmission !== "function"))
         ) {
           fail("GitHub client is invalid");
         }
@@ -287,9 +287,9 @@ export function createWorkerEntrypoint({
           await github.verifyPolicy(activePolicy);
           return github.mintPurposeToken(activePolicy, repositoryId, permissions);
         },
-        async readHostKeyDocument(activePolicy, path) {
+        async readHostAdmission(activePolicy, path) {
           await github.verifyPolicy(activePolicy);
-          return github.readHostKeyDocument(activePolicy, path);
+          return github.readHostAdmission(activePolicy, path);
         },
       });
       const handle = createBrokerHandler({

@@ -340,9 +340,14 @@ decides, in this order:
 4. the document names exactly that host and this broker's Organization id and
    holds one Ed25519 public key (`ed25519:<base64url>`);
 5. the Ed25519 signature over the presented header and claims (WebCrypto);
-6. the host's `jti` once, and its hourly grant budget, keyed by the signed
+6. every account with write access to that repository (collaborators of any
+   affiliation with push, maintain or admin) is an Owner of the Organization
+   or one of the policy's `approved_writers`, read live with the same token;
+   checked only after the signature, so a stranger learns nothing about the
+   writers;
+7. the host's `jti` once, and its hourly grant budget, keyed by the signed
    `iat` so one assertion always meets its own record;
-7. the live installation gate, unchanged, and one token for the policy's
+8. the live installation gate, unchanged, and one token for the policy's
    repository with exactly `contents: read` and `members: read`.
 
 The caller chooses nothing: neither the repository nor the permissions. One
@@ -418,8 +423,14 @@ a Deployment Repo:
   OIDC issuance.
 - A key document is trusted as far as the Organization's Deployment Repo is:
   whoever can push to the configured ref can name a key and so obtain a read
-  token for that repository and the Organization's membership, which a writer
-  of that repository can read already. The document never widens the token.
+  token for that repository and also the Organization's membership and Teams,
+  which repository access alone does not grant. The broker therefore admits
+  the route only while every writer of that repository is an Owner or an
+  account the policy names in `approved_writers`, checked live on every
+  request; an Organization accepts that those accounts can read its
+  membership this way. On a paid plan, a ruleset refusing deletion and
+  non-fast-forward updates of the ref keeps every key change in history.
+  The document never widens the token.
 - A stolen host key mints read tokens, at most the hourly grant budget, until
   the document is removed; an intercepted assertion is useless after its
   60 s and after its first use.

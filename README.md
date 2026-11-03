@@ -1130,7 +1130,8 @@ Optional. A policy with it may declare no Workspace and no OIDC purpose.
   "audience": "https://github-broker.example.com",
   "repository_id": 3101,
   "ref": "machines-evidence-v1",
-  "directory": "access/conglomerate-hosts"
+  "directory": "access/conglomerate-hosts",
+  "approved_writers": [{ "id": 5001, "login": "example-reviewer" }]
 }
 ```
 
@@ -1139,6 +1140,11 @@ Optional. A policy with it may declare no Workspace and no OIDC purpose.
   live that it belongs to the policy's Organization.
 - `ref`: the branch the key documents live on, written as its short name.
 - `directory`: a relative path of plain lowercase segments.
+- `approved_writers`: besides the Organization's Owners, the only accounts
+  that may have write access to that repository while the route serves (by
+  immutable id; the login is for review), at most 20, possibly empty. Whoever
+  can write the key document can obtain `members: read` through it, so this
+  list is the Organization's decision who may.
 
 The token's permission set is fixed: `contents: read` and `members: read`
 (GitHub adds `metadata: read`). It is not configurable.
@@ -1197,7 +1203,7 @@ Refusals, each `{"error": "<code>"}`:
 | --- | --- |
 | 400 | `invalid_request` (the body is not `{}`) |
 | 401 | `assertion_missing`, `assertion_malformed`, `assertion_algorithm_refused`, `assertion_audience_mismatch`, `assertion_claims_invalid`, `assertion_lifetime_too_long`, `assertion_not_yet_valid`, `assertion_expired`, `assertion_signature_invalid`, `assertion_replayed` |
-| 403 | `host_unknown` (no key document), `host_key_invalid`, `organization_mismatch` |
+| 403 | `host_unknown` (no key document), `host_key_invalid`, `organization_mismatch`, `deployment_repository_writer_not_approved` (a writer of the repository is neither an Owner nor an approved writer; checked after the signature) |
 | 415 | `unsupported_media_type` |
 | 429 | `rate_limited`: the broker's 60 key document reads per hour, before any assertion is verified, or a host's 12 tokens per hour |
 | 502 | `token_unavailable` |

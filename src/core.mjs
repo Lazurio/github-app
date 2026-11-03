@@ -25,6 +25,7 @@ const GITHUB_API_VERSION = "2026-03-10";
 const USER_AGENT = "lazurio-github-app-broker/0.15.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
+const MAX_HOST_ADMISSION_PAGES = 10;
 const DUMMY_WORKSPACE_CREDENTIAL = "0".repeat(64);
 
 /**
@@ -1163,12 +1164,18 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
   }
 
   /**
-   * Reads one Conglomerate Host key document from the policy's `conglomerate_hosts` repository and
-   * ref, with a `contents: read` token for exactly that repository of the policy's Organization,
-   * revoked before returning. Returns the raw text, or undefined when the document does not exist.
-   * Nothing is cached: removing the document stops the next mint.
+   * The live admission facts of one Conglomerate Host request, read with one token for exactly the
+   * policy's `conglomerate_hosts` repository of the policy's Organization (`contents: read` and
+   * `members: read`), revoked before returning:
+   *
+   * - `document`: the raw key document at the policy's ref, or undefined when it does not exist;
+   * - `unapproved_writers`: how many accounts with write access to that repository (collaborators
+   *   of any affiliation with push, maintain or admin) are neither an Owner of the Organization nor
+   *   an approved writer the policy names, by immutable account id.
+   *
+   * Nothing is cached: removing the document or adding a writer stops the next mint.
    */
-  async function readHostKeyDocument(policy, path) {
+  async function readHostAdmission(policy, path) {
     const hosts = policy.conglomerate_hosts;
     if (hosts === undefined) fail("the policy declares no conglomerate_hosts");
     if (typeof path !== "string" || !path.startsWith(`${hosts.directory}/`) || path.includes("..")) {
@@ -1177,10 +1184,20 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     const minted = await mintScopedToken(
       policy,
       hosts.repository_id,
-      Object.freeze({ contents: "read" }),
+      Object.freeze({ contents: "read", members: "read" }),
       (repository) => repository?.owner?.id === policy.github_owner.id,
     );
     const authorization = `Bearer ${minted.token}`;
+    const pages = async (base, select) => {
+      const values = [];
+      for (let page = 1; ; page += 1) {
+        if (page > MAX_HOST_ADMISSION_PAGES) fail("GitHub list exceeds the host admission bound");
+        const answer = await request(`${base}per_page=100&page=${page}`, { authorization });
+        if (!Array.isArray(answer)) fail("GitHub returned an invalid list");
+        values.push(...answer.filter(select).map((entry) => entry?.id));
+        if (answer.length < 100) return values;
+      }
+    };
     try {
       const encodedPath = path.split("/").map(encodeURIComponent).join("/");
       const response = await fetchImpl(
@@ -1195,11 +1212,21 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
           },
         },
       );
-      if (response.status === 404) return undefined;
+      if (response.status === 404) return Object.freeze({ document: undefined, unapproved_writers: 0 });
       if (!response.ok) throw new Error(`GitHub request failed with HTTP ${response.status}`);
       const text = await response.text();
       // An oversized document is refused by its parser; keep only enough for it to tell.
-      return text.length > HOST_MAX_DOCUMENT_BYTES ? text.slice(0, HOST_MAX_DOCUMENT_BYTES + 1) : text;
+      const document = text.length > HOST_MAX_DOCUMENT_BYTES ? text.slice(0, HOST_MAX_DOCUMENT_BYTES + 1) : text;
+      const owners = await pages(`/organizations/${policy.github_owner.id}/members?role=admin&`, () => true);
+      const writers = await pages(
+        `/repositories/${hosts.repository_id}/collaborators?affiliation=all&`,
+        (entry) => entry?.permissions?.push === true || entry?.permissions?.maintain === true || entry?.permissions?.admin === true,
+      );
+      if ([...owners, ...writers].some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+        fail("GitHub returned an account without an id");
+      }
+      const approved = new Set([...owners, ...hosts.approved_writers.map(({ id }) => id)]);
+      return Object.freeze({ document, unapproved_writers: writers.filter((id) => !approved.has(id)).length });
     } finally {
       await request("/installation/token", { method: "DELETE", authorization }).catch(() => {});
     }
@@ -1212,7 +1239,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
     readWorkspaceTeamGrants,
     mintToken,
     mintPurposeToken,
-    readHostKeyDocument,
+    readHostAdmission,
   });
 }
 
@@ -1361,10 +1388,10 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       typeof hosts.guard?.admit !== "function" ||
       typeof hosts.audit !== "function" ||
       typeof hosts.now !== "function" ||
-      typeof github.readHostKeyDocument !== "function" ||
+      typeof github.readHostAdmission !== "function" ||
       typeof github.mintPurposeToken !== "function")
   ) {
-    fail("Conglomerate Hosts need a verifier, a guard, an audit sink, a clock, a key reader and a purpose mint");
+    fail("Conglomerate Hosts need a verifier, a guard, an audit sink, a clock, an admission reader and a purpose mint");
   }
   const workspaces = new Map(policy.workspaces.map((workspace) => [workspace.id, workspace]));
   const ownerKey = policy.github_owner.login.toLowerCase();
@@ -1602,15 +1629,20 @@ export function createBrokerHandler({ policy, github, credentials, secretMatches
       if (read === "rate_limited") return refused("rate_limited");
       if (read !== "admitted") fail("host guard returned an invalid decision");
 
-      const document = await github.readHostKeyDocument(policy, hostKeyDocumentPath(config, assertion.host));
-      if (document === undefined) return refused("host_unknown");
-      const publicKey = parseHostKeyDocument(document, {
+      const admission = await github.readHostAdmission(policy, hostKeyDocumentPath(config, assertion.host));
+      if (admission?.document === undefined) return refused("host_unknown");
+      const publicKey = parseHostKeyDocument(admission.document, {
         host: assertion.host,
         organizationId: policy.github_owner.id,
       });
       if (!(await hosts.verify(publicKey, assertion.signing_input, assertion.signature))) {
         return refused("assertion_signature_invalid");
       }
+      // Only after the signature, so an unauthenticated caller learns nothing about the writers.
+      if (!Number.isSafeInteger(admission.unapproved_writers) || admission.unapproved_writers < 0) {
+        fail("host admission returned an invalid writer count");
+      }
+      if (admission.unapproved_writers > 0) return refused("deployment_repository_writer_not_approved");
 
       // Keyed by the signed `iat`, so the same assertion always meets its own record.
       const grantDecision = await hosts.guard.admit({

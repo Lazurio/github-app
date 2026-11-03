@@ -97,7 +97,11 @@ dependency-light and customer-neutral.
     policy's `conglomerate_hosts` repository (one of its own Organization) at
     its ref, live on every request and never cached, with a `contents: read`
     token for exactly that repository that it revokes at once. The document
-    must name that host and this broker's Organization id. The token is that
+    must name that host and this broker's Organization id. After the
+    signature, every account with write access to that repository must be an
+    Owner of the Organization or one of the policy's `approved_writers` (by
+    immutable id), read live, or the request is refused
+    (`deployment_repository_writer_not_approved`). The token is that
     repository with exactly `contents: read` and `members: read`. Before any
     GitHub request a deny-only hourly read budget per broker applies; after
     the signature, the `jti` is accepted once and a host has an hourly grant
