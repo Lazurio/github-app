@@ -118,7 +118,12 @@ dependency-light and customer-neutral.
     own tokens that can write that repository must already carry
     `members: read`: the Workspace write tier always does, and the parser
     refuses a policy whose OIDC purpose could mint `contents: write` on it
-    without `members: read`, so the App-mediated write path gains nothing. The token is that
+    without `members: read`. Such a writer can still leave a key document
+    that outlives its own token or grant; the product owner accepted that on
+    2026-11-03 with its boundary: the broker never asks who wrote a document,
+    so a document mints until it is removed or replaced (the Organization's
+    next lane apply rewrites it with the host's own key) and Git history shows
+    who wrote it. Never describe the route as checking provenance. The token is that
     repository with exactly `contents: read` and `members: read`. Before any
     GitHub request a deny-only hourly read budget per broker applies; after
     the signature, the `jti` is accepted once and a host has an hourly grant

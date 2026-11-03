@@ -451,8 +451,16 @@ a Deployment Repo:
   mints that can write the repository is a writer too: the Workspace write
   tier always carries `members: read`, and the parser refuses a policy with
   an OIDC purpose that could mint `contents: write` on the key repository
-  without `members: read`. Such a writer therefore holds nothing new after
-  writing a key document.
+  without `members: read`. Such a writer holds `members: read` already, but
+  only while its token or grant lasts: a key document it wrote keeps minting
+  after that, because the broker checks the current writers, never who wrote
+  a document. The product owner accepted this durable access on 2026-11-03
+  with its revocation boundary: the document mints until it is removed or
+  replaced, and the Organization's tooling rewrites it with the host's own
+  key on every lane apply, so a foreign key lasts at most until that
+  Organization's next apply or an Owner's removal; Git history shows who wrote
+  it. An Owner-confirmed key is the possible later step
+  ([#32](https://github.com/Lazurio/github-app/issues/32)).
   The document never widens the token.
 - A stolen host key mints read tokens, at most the hourly grant budget, until
   the document is removed; an intercepted assertion is useless after its

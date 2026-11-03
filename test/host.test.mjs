@@ -337,6 +337,22 @@ test("every App token that can write the host key repository already carries mem
   assert.equal(tokenPermissions(workspacePolicy, WRITE_ACCESS, workspacePolicy.workspaces[0]).members, "read");
 });
 
+test("the broker never asks who wrote a key document: it mints while the document names the key and stops once it is removed or replaced (accepted boundary, 2026-11-03)", async () => {
+  const documents = { [`${DIRECTORY}/${HOST}.json`]: keyDocument() };
+  const github = syntheticGithub({ documents });
+  const { handle } = hostHandler({ github });
+  // Whoever wrote it, and whether that writer still has a grant, is not an input.
+  assert.equal((await hostCall(handle, assertion())).status, 200);
+  assert.equal((await hostCall(handle, assertion())).status, 200);
+  // Replaced with the host's own key by the next lane apply: the foreign key stops.
+  documents[`${DIRECTORY}/${HOST}.json`] = keyDocument({ broker_key: OTHER_KEY.brokerKey });
+  assert.deepEqual((await hostCall(handle, assertion())).body, { error: "assertion_signature_invalid" });
+  assert.equal((await hostCall(handle, assertion({ key: OTHER_KEY }))).status, 200);
+  // Removed: nothing mints.
+  delete documents[`${DIRECTORY}/${HOST}.json`];
+  assert.deepEqual((await hostCall(handle, assertion({ key: OTHER_KEY }))).body, { error: "host_unknown" });
+});
+
 // ---------------------------------------------------------------------------- the assertion ---
 
 test("an assertion is refused by its header, claims, audience, lifetime and time before any key is read", () => {

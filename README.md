@@ -1236,8 +1236,12 @@ first two live and refuses otherwise (`deployment_repository_writer_not_approved
 (`key_ref_unprotected`); on a plan without rulesets for private repositories
 (`"none"`) it is the Organization's accepted precondition. Tokens of this App
 that can write the repository already carry `members: read` (the parser
-refuses an OIDC purpose that could write it without), so they gain nothing
-through a key document. The repository's Git
+refuses an OIDC purpose that could write it without). A key document such a
+token wrote keeps minting after the token or grant ends: the broker checks the
+current writers, never who wrote a document. That durable access is accepted
+with its boundary: the document mints until it is removed or replaced, which
+the Organization's next lane apply does with the host's own key, and Git
+history shows who wrote it. The repository's Git
 history records who changed a key document; the ruleset also keeps that
 history from deletion and rewrite. An Owner-confirmed key
 fingerprint is a possible later step, not part of `0.15.0`
