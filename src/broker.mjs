@@ -188,6 +188,18 @@ function formatOidcSummary(oidc) {
 }
 
 /**
+ * The offline line of a policy's Conglomerate Host route: audience, the Deployment Repo and ref the
+ * host key documents are read from, their directory and the fixed permission set. The Node adapter
+ * does not serve the route; the line lets an operator review the policy before a Worker deploy.
+ */
+function formatHostsSummary(hosts) {
+  if (hosts === undefined) return [];
+  return [
+    `conglomerate_hosts audience=${hosts.audience} repository=${hosts.repository_id} ref=${hosts.ref} directory=${hosts.directory} approved_writers=${hosts.approved_writers.map(({ id }) => id).join(",") || "-"} key_ref_protection=${hosts.key_ref_protection} asks for: ${formatPermissions(hosts.permissions)}`,
+  ];
+}
+
+/**
  * Offline summary of the parsed Team binding and of the exact permission set each access tier
  * mints under this policy; no GitHub traffic and no secret. A policy whose Workspaces declare no
  * permission ceiling prints exactly the two tier lines; a read ceiling adds the one set every
@@ -218,6 +230,7 @@ export function formatPolicySummary(policy) {
       : []),
     ...(rows.length > 0 ? [line(header), ...rows.map(line)] : ["no Workspaces"]),
     ...formatOidcSummary(policy.oidc),
+    ...formatHostsSummary(policy.conglomerate_hosts),
   ].join("\n") + "\n";
 }
 

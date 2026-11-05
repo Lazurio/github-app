@@ -6,10 +6,12 @@ import {
   createGithubClient,
   parsePolicy,
 } from "./core.mjs";
+import { verifyEd25519 } from "./host.mjs";
 import { createGithubActionsKeySet, createOidcVerifier } from "./oidc.mjs";
 
 /**
- * The Durable Object binding that holds the per-run OIDC replay and grant record. Not exported:
+ * The Durable Object binding that holds the per-run OIDC replay and grant record, and since 0.15.0
+ * the Conglomerate Host replay and hourly budgets under their own names. Not exported:
  * workerd treats every named export of the entry module as an entrypoint and refuses to start a
  * Worker that exports a plain value.
  */
@@ -221,6 +223,7 @@ export function createWorkerEntrypoint({
       let credentials;
       let github;
       let oidc;
+      let hosts;
       try {
         policy = parsePolicy(requiredBinding(env, "BROKER_POLICY_JSON"));
         const appId = requiredBinding(env, "GITHUB_APP_ID");
@@ -237,7 +240,9 @@ export function createWorkerEntrypoint({
           typeof github.verifyTeamGrant !== "function" ||
           typeof github.verifyWorkspaceTeam !== "function" ||
           typeof github.mintToken !== "function" ||
-          (policy.oidc !== undefined && typeof github.mintPurposeToken !== "function")
+          (policy.oidc !== undefined && typeof github.mintPurposeToken !== "function") ||
+          (policy.conglomerate_hosts !== undefined &&
+            (typeof github.mintPurposeToken !== "function" || typeof github.readHostAdmission !== "function"))
         ) {
           fail("GitHub client is invalid");
         }
@@ -245,6 +250,15 @@ export function createWorkerEntrypoint({
         if (policy.oidc !== undefined) {
           oidc = Object.freeze({
             verify: createOidcVerifier({ audience: policy.oidc.audience, keySet: oidcKeySet(), now }),
+            guard: durableObjectRunGuard(env?.[OIDC_RUN_GUARD_BINDING]),
+            audit,
+            now,
+          });
+        }
+        // Conglomerate Hosts share the run guard binding: a policy that names them needs it too.
+        if (policy.conglomerate_hosts !== undefined) {
+          hosts = Object.freeze({
+            verify: (publicKey, signingInput, signature) => verifyEd25519(publicKey, signingInput, signature),
             guard: durableObjectRunGuard(env?.[OIDC_RUN_GUARD_BINDING]),
             audit,
             now,
@@ -273,6 +287,10 @@ export function createWorkerEntrypoint({
           await github.verifyPolicy(activePolicy);
           return github.mintPurposeToken(activePolicy, repositoryId, permissions);
         },
+        async readHostAdmission(activePolicy, path) {
+          await github.verifyPolicy(activePolicy);
+          return github.readHostAdmission(activePolicy, path);
+        },
       });
       const handle = createBrokerHandler({
         policy,
@@ -280,6 +298,7 @@ export function createWorkerEntrypoint({
         github: verifiedGithub,
         secretMatches: workerSecretMatches,
         oidc,
+        hosts,
       });
       const url = new URL(request.url);
       return workerResponse(await handle({

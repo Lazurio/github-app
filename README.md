@@ -28,6 +28,12 @@ stored in GitHub. Since `0.14.0` a purpose can also name its `callers`, the
 only allowlisted Deployment Repos that may ask for it. See
 [CI runners: GitHub Actions OIDC purposes](#ci-runners-github-actions-oidc-purposes).
 
+Since `0.15.0` the Worker adapter also serves Conglomerate Hosts: a host proves
+itself with an Ed25519 key it generated, whose public part the broker reads
+live from its own Organization's Deployment Repo, and receives one token with
+exactly `contents: read` and `members: read` on that repository. See
+[Conglomerate Hosts](#conglomerate-hosts).
+
 **Provider limitation.** For an installation that accepted the Issues
 permission, GitHub let every installation token tested open an issue in a
 public repository, whatever permissions it asked for and whatever repository it
@@ -1105,6 +1111,153 @@ does not start. It never serves such a purpose to every listed Deployment Repo.
 For the same reason, remove every purpose that names `callers` before rolling a
 broker back below `0.14.0`; deleting only the key would open the purpose to
 every listed Deployment Repo.
+
+## Conglomerate Hosts
+
+A Conglomerate Host's access service reads each served Organization's
+membership and Deployment Repo about once a minute. It holds no GitHub token,
+Workspace credential or App key: it signs a short assertion with an Ed25519 key
+it generated, and the broker reads that key's public part from a document in
+its own Organization's Deployment Repo. Design and threat model:
+[ARCHITECTURE.md](./ARCHITECTURE.md#conglomerate-host-callers).
+
+### Policy key `conglomerate_hosts`
+
+Optional. A policy with it may declare no Workspace and no OIDC purpose.
+
+```json
+"conglomerate_hosts": {
+  "audience": "https://github-broker.example.com",
+  "repository_id": 3101,
+  "ref": "machines-evidence-v1",
+  "directory": "access/conglomerate-hosts",
+  "approved_writers": [{ "id": 5001, "login": "example-reviewer" }],
+  "key_ref_protection": "ruleset"
+}
+```
+
+- `audience`: this broker's exact public origin.
+- `repository_id`: the Organization's own Deployment Repo; the mint checks
+  live that it belongs to the policy's Organization.
+- `ref`: the branch the key documents live on, written as its short name.
+- `directory`: a relative path of plain lowercase segments.
+- `approved_writers`: besides the Organization's Owners, the only accounts
+  that may have write access to that repository while the route serves (by
+  immutable id; the login is for review), at most 20, possibly empty. Whoever
+  can write the key document can obtain `members: read` through it, so this
+  list is the Organization's decision who may.
+- `key_ref_protection`: `"ruleset"` on a paid plan: the broker verifies live
+  that two active rulesets apply to the ref: one with `update` that only this
+  App and the Organization's Owners bypass (an `Integration` bypass actor with
+  this App's id and the `OrganizationAdmin` role), which shuts every other
+  GitHub App and deploy key out of the key documents, and one with
+  `deletion` and `non_fast_forward` without any bypass actor, since GitHub
+  applies a ruleset's bypass to all of its rules. `"none"` on a plan without rulesets for
+  private repositories, where the Organization accepts that other Apps with
+  `contents: write` could write the ref.
+
+The token's permission set is fixed: `contents: read` and `members: read`
+(GitHub adds `metadata: read`). It is not configurable.
+
+### Key documents
+
+One per host, at `<directory>/<host id>.json` on `ref`, written by the
+Organization's own tooling (Machines projects it with the Organization's lane
+applies). The broker accepts exactly this shape:
+
+```json
+{
+  "schema_version": "machines.conglomerate-host-broker-key.v1",
+  "host": "example-conglomerate-host",
+  "organization_id": 1001,
+  "broker_key": "ed25519:<unpadded base64url of the 32 key bytes>",
+  "source": { "repository_id": 3102, "evidence_commit": "<40 or 64 hex>", "evidence_path": "<path>" },
+  "written_at": "2026-11-02T11:00:00Z"
+}
+```
+
+`host` must equal the assertion's `kid` and `organization_id` the policy's
+Organization id. Nothing is cached: removing the document refuses the next
+request.
+
+### `POST /v1/host/token`
+
+```http
+POST /v1/host/token
+Authorization: Bearer <compact JWS>
+Content-Type: application/json
+
+{}
+```
+
+The JWS header is exactly `{"alg": "EdDSA", "kid": "<host id>"}` (an optional
+`"typ": "JWT"` is accepted); its claims are exactly `aud` (this broker's
+origin), `iss` (the host id), `iat`, `exp` (at most 60 s after `iat`) and
+`jti` (22 to 128 base64url characters, random per request). Times are checked
+with 30 s of tolerance, and again by a fresh clock after the body is read and
+before the grant. The answer has the shape of the OIDC route's:
+
+```json
+{
+  "token": "<installation token>",
+  "expires_at": "2026-11-02T13:00:00Z",
+  "repository_id": 3101,
+  "repository": "example-org/deployment",
+  "access": "read",
+  "permissions": { "contents": "read", "members": "read" }
+}
+```
+
+Refusals, each `{"error": "<code>"}`:
+
+| Status | Codes |
+| --- | --- |
+| 400 | `invalid_request` (the body is not `{}`) |
+| 401 | `assertion_missing`, `assertion_malformed`, `assertion_algorithm_refused`, `assertion_audience_mismatch`, `assertion_claims_invalid`, `assertion_lifetime_too_long`, `assertion_not_yet_valid`, `assertion_expired`, `assertion_signature_invalid`, `assertion_replayed` |
+| 403 | `host_unknown` (no key document), `host_key_invalid`, `organization_mismatch`, `deployment_repository_writer_not_approved` (a writer of the repository is neither an Owner nor an approved writer), `deployment_repository_write_key` (a deploy key can write the repository), `key_ref_unprotected` (no ruleset protects the key ref as `key_ref_protection: "ruleset"` requires); all checked after the signature |
+| 415 | `unsupported_media_type` |
+| 429 | `rate_limited`: the broker's 60 key document reads per hour, before any assertion is verified, or a host's 12 tokens per hour |
+| 502 | `token_unavailable` |
+
+Every decision writes one audit line (`route: "host"`, the host id, the
+Organization id and, for a grant, repository, permissions and expiry); never a
+token, an assertion or a key document.
+
+### Precondition: who writes the Deployment Repo
+
+Whoever can write the key document's ref can obtain `members: read` through
+it, so the route assumes that every account with write access to the
+configured repository is an Owner of the Organization or an account its
+`approved_writers` names, that no deploy key can write it, and that no GitHub
+App other than Lazurio for GitHub can write the key ref. The broker checks the
+first two live and refuses otherwise (`deployment_repository_writer_not_approved`,
+`deployment_repository_write_key`; the installation must accept
+`administration: read`). The third it checks through the ruleset that
+`key_ref_protection: "ruleset"` requires on a paid plan
+(`key_ref_unprotected`); on a plan without rulesets for private repositories
+(`"none"`) it is the Organization's accepted precondition. Tokens of this App
+that can write the repository already carry `members: read` (the parser
+refuses an OIDC purpose that could write it without). A key document such a
+token wrote keeps minting after the token or grant ends: the broker checks the
+current writers, never who wrote a document. That durable access is accepted
+with its boundary: the document mints until it is removed or replaced, which
+the Organization's next lane apply does with the host's own key. The
+repository's Git history keeps every change of a key document, and the ruleset
+nobody bypasses keeps that history from deletion and rewrite; it shows what
+changed and when, not who pushed it (commit metadata is the writer's own, and
+every write through this App appears as this App). An Owner-confirmed key
+fingerprint is a possible later step, not part of `0.15.0`
+([#32](https://github.com/Lazurio/github-app/issues/32)).
+
+### Deploying
+
+The route uses the run guard's Durable Object binding (`OIDC_RUN_GUARD`) under
+its own names, so a policy with `conglomerate_hosts` needs that binding; no new
+class or migration. Release and deploy `0.15.0` first. A `0.14.0` broker
+ignores the key, so the host's requests get `404` and fail closed; a policy
+with only `conglomerate_hosts` and neither Workspaces nor OIDC purposes is
+refused by `0.14.0` as a whole (`503 configuration_unavailable`). The Node
+adapter lists the key in `policy check` and answers `404` on the route.
 
 ## Container build
 

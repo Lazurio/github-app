@@ -1,0 +1,973 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Conglomerate Host callers (0.15.0, Lazurio/github-app#30): a host proves itself with its own
+// Ed25519 key, whose public part the broker reads live from its own Organization's Deployment Repo,
+// and receives one token with exactly contents: read and members: read on that repository.
+//
+// Synthetic identities only: the broker's Organization 1001 with its Deployment Repo 3101; another
+// Organization 7001; hosts "example-conglomerate-host" and "other-host".
+
+import assert from "node:assert/strict";
+import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import test from "node:test";
+
+import { formatPolicySummary } from "../src/broker.mjs";
+import {
+  WRITE_ACCESS,
+  admitRunGrant,
+  createBrokerHandler,
+  createGithubClient,
+  parsePolicy,
+  tokenPermissions,
+} from "../src/core.mjs";
+import {
+  HOST_GRANTS_PER_HOUR,
+  HOST_KEY_DOCUMENT_SCHEMA,
+  HOST_READS_PER_HOUR,
+  HOST_REFUSALS,
+  HOST_TOKEN_PERMISSIONS,
+  HostRefusal,
+  base64urlBytes,
+  decodeHostAssertion,
+  parseHostKeyDocument,
+  verifyEd25519,
+} from "../src/host.mjs";
+import { OidcRunGuard, createWorkerEntrypoint } from "../src/worker.mjs";
+
+const AUDIENCE = "https://github-broker.example.com";
+const HOST = "example-conglomerate-host";
+const NOW = Date.parse("2026-11-02T12:00:00Z");
+const NOW_S = Math.floor(NOW / 1000);
+const DIRECTORY = "access/conglomerate-hosts";
+const REF = "machines-evidence-v1";
+
+function hostsPolicyFixture(overrides = {}) {
+  return {
+    schema_version: "lazurio.github_app_broker.policy.v3",
+    github_app: { id: 42, slug: "example-app" },
+    github_owner: { id: 1001, login: "example-org" },
+    installation_id: 2001,
+    installation_repository_selection: "all",
+    installation_permissions: {
+      actions: "write",
+      administration: "read",
+      checks: "read",
+      contents: "write",
+      members: "read",
+      metadata: "read",
+      pull_requests: "write",
+    },
+    workspaces: [],
+    conglomerate_hosts: {
+      audience: AUDIENCE,
+      repository_id: 3101,
+      ref: REF,
+      directory: DIRECTORY,
+      approved_writers: [{ id: 5001, login: "example-reviewer" }],
+      key_ref_protection: "ruleset",
+      ...overrides,
+    },
+  };
+}
+
+function b64url(bytes) {
+  return Buffer.from(bytes).toString("base64url");
+}
+
+function keyPair() {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const x = publicKey.export({ format: "jwk" }).x;
+  return { privateKey, brokerKey: `ed25519:${x}` };
+}
+
+const HOST_KEY = keyPair();
+const OTHER_KEY = keyPair();
+
+/** A compact EdDSA JWS as the host's access service builds it. */
+function assertion({
+  key = HOST_KEY,
+  header = { alg: "EdDSA", kid: HOST },
+  claims = {},
+  signature,
+} = {}) {
+  const payload = {
+    aud: AUDIENCE,
+    iss: header.kid,
+    iat: NOW_S,
+    exp: NOW_S + 60,
+    jti: b64url(randomBytes(18)),
+    ...claims,
+  };
+  const input = `${b64url(Buffer.from(JSON.stringify(header)))}.${b64url(Buffer.from(JSON.stringify(payload)))}`;
+  const signed = signature ?? b64url(sign(null, Buffer.from(input), key.privateKey));
+  return `${input}.${signed}`;
+}
+
+function keyDocument(overrides = {}) {
+  return JSON.stringify({
+    schema_version: HOST_KEY_DOCUMENT_SCHEMA,
+    host: HOST,
+    organization_id: 1001,
+    broker_key: HOST_KEY.brokerKey,
+    source: {
+      repository_id: 3102,
+      evidence_commit: "a".repeat(40),
+      evidence_path: "evidence/example-conglomerate-host/20261102T110000Z-apply.json",
+    },
+    written_at: "2026-11-02T11:00:00Z",
+    ...overrides,
+  });
+}
+
+function memoryStorage() {
+  const data = new Map();
+  let alarm = null;
+  return {
+    async get(key) {
+      return structuredClone(data.get(key));
+    },
+    async put(key, value) {
+      data.set(key, structuredClone(value));
+    },
+    async getAlarm() {
+      return alarm;
+    },
+    async setAlarm(at) {
+      alarm = at;
+    },
+    async deleteAll() {
+      data.clear();
+      alarm = null;
+    },
+  };
+}
+
+/** The deny-only guard as the Worker's Durable Object answers it, one storage per key. */
+function memoryGuard(now = () => NOW) {
+  const objects = new Map();
+  const calls = [];
+  return {
+    calls,
+    async admit({ key, ...grant }) {
+      calls.push({ key, ...grant });
+      if (!objects.has(key)) objects.set(key, memoryStorage());
+      return admitRunGrant(objects.get(key), grant, now());
+    },
+  };
+}
+
+/** A GitHub client double: the key documents by path, and a record of every read and mint. */
+function syntheticGithub({
+  documents = { [`${DIRECTORY}/${HOST}.json`]: keyDocument() },
+  mint,
+  read,
+  unapprovedWriters = 0,
+  writeDeployKeys = 0,
+  keyRefProtected = true,
+} = {}) {
+  const reads = [];
+  const mints = [];
+  return {
+    reads,
+    mints,
+    client: {
+      async verifyPolicy() {},
+      async verifyTeamGrant() {
+        throw new Error("no Workspace in this test");
+      },
+      async verifyWorkspaceTeam() {
+        throw new Error("no Workspace in this test");
+      },
+      async mintToken() {
+        throw new Error("no Workspace in this test");
+      },
+      async readHostAdmission(_policy, path) {
+        reads.push(path);
+        if (read) return read(path);
+        return {
+          document: documents[path],
+          unapproved_writers: unapprovedWriters,
+          write_deploy_keys: writeDeployKeys,
+          key_ref_protected: keyRefProtected,
+        };
+      },
+      async mintPurposeToken(_policy, repositoryId, permissions) {
+        mints.push({ repositoryId, permissions });
+        if (mint) return mint(repositoryId, permissions);
+        return {
+          token: "ghs_synthetic_host_token_value",
+          expires_at: "2026-11-02T13:00:00Z",
+          repository_id: repositoryId,
+          repository: "example-org/deployment",
+          permissions: { ...permissions },
+        };
+      },
+    },
+  };
+}
+
+function hostHandler({ policy = hostsPolicyFixture(), github = syntheticGithub(), guard = memoryGuard(), now = () => NOW } = {}) {
+  const records = [];
+  const handle = createBrokerHandler({
+    policy: parsePolicy(policy),
+    github: github.client,
+    credentials: new Map(),
+    secretMatches: async () => false,
+    hosts: { verify: verifyEd25519, guard, audit: (record) => records.push(record), now },
+  });
+  return { handle, github, guard, records };
+}
+
+function hostCall(handle, token, { body = "{}", contentType = "application/json" } = {}) {
+  return handle({
+    method: "POST",
+    path: "/v1/host/token",
+    contentType,
+    authorization: token === undefined ? "" : `Bearer ${token}`,
+    readBody: async () => body,
+  });
+}
+
+// ------------------------------------------------------------------------------- the policy ---
+
+test("conglomerate_hosts is optional; with it a policy may hold no Workspace, and its permission set is fixed", () => {
+  const policy = parsePolicy(hostsPolicyFixture());
+  assert.deepEqual(policy.conglomerate_hosts, {
+    audience: AUDIENCE,
+    repository_id: 3101,
+    ref: REF,
+    directory: DIRECTORY,
+    approved_writers: [{ id: 5001, login: "example-reviewer" }],
+    key_ref_protection: "ruleset",
+    permissions: HOST_TOKEN_PERMISSIONS,
+  });
+  assert.deepEqual(parsePolicy(hostsPolicyFixture({ approved_writers: [] })).conglomerate_hosts.approved_writers, []);
+  assert.deepEqual(HOST_TOKEN_PERMISSIONS, { contents: "read", members: "read" });
+  const { conglomerate_hosts: _hosts, ...without } = hostsPolicyFixture();
+  assert.throws(() => parsePolicy(without), /workspaces must be a non-empty array/);
+  assert.match(formatPolicySummary(policy), /conglomerate_hosts audience=https:\/\/github-broker\.example\.com repository=3101 ref=machines-evidence-v1 directory=access\/conglomerate-hosts approved_writers=5001 key_ref_protection=ruleset asks for: contents=read members=read/);
+});
+
+test("conglomerate_hosts refuses anything but exact keys, a canonical origin, one branch and a plain relative directory", () => {
+  const invalid = [
+    { permissions: { contents: "write" } },
+    { audience: "http://github-broker.example.com" },
+    { audience: "https://github-broker.example.com/" },
+    { audience: "https://user@github-broker.example.com" },
+    { repository_id: 0 },
+    { repository_id: "3101" },
+    { ref: "refs/heads/machines-evidence-v1" },
+    { ref: "a/../b" },
+    { ref: "branch.lock" },
+    { ref: "" },
+    { directory: "/access/conglomerate-hosts" },
+    { directory: "access/../secrets" },
+    { directory: "access//hosts" },
+    { directory: "Access/Hosts" },
+    { directory: "." },
+    { approved_writers: undefined },
+    { key_ref_protection: undefined },
+    { key_ref_protection: "branch-protection" },
+    { approved_writers: [{ id: 5001 }] },
+    { approved_writers: [{ id: "5001", login: "example-reviewer" }] },
+    { approved_writers: [{ id: 5001, login: "-bad" }] },
+    { approved_writers: [{ id: 5001, login: "a" }, { id: 5001, login: "b" }] },
+    { approved_writers: Array.from({ length: 21 }, (_, index) => ({ id: index + 1, login: `writer-${index}` })) },
+  ];
+  for (const overrides of invalid) {
+    assert.throws(() => parsePolicy(hostsPolicyFixture(overrides)), Error, JSON.stringify(overrides));
+  }
+  const missing = hostsPolicyFixture();
+  delete missing.conglomerate_hosts.ref;
+  assert.throws(() => parsePolicy(missing), /exactly audience, repository_id, ref, directory, approved_writers and key_ref_protection/);
+});
+
+test("every App token that can write the host key repository already carries members: read; a policy with an OIDC purpose that would not is refused (review)", () => {
+  const purpose = (overrides = {}) => ({
+    purpose: "deployment-apply",
+    repository: "caller",
+    workflow: ".github/workflows/lazurio-rollout.yml",
+    rules: [{ events: ["push", "workflow_dispatch"], ref: "refs/heads/main", environment: "production" }],
+    permissions: { contents: "write", members: "read" },
+    max_grants_per_run: 2,
+    ...overrides,
+  });
+  const withOidc = (purposes, deployment = [{ repository_id: 3101, repository_owner_id: 1001 }]) => ({
+    ...hostsPolicyFixture(),
+    oidc: { audience: AUDIENCE, deployment_repositories: deployment, purposes },
+  });
+  // Accepted: the write carries members: read; a read-only rule; another repository; a caller list without it.
+  assert.ok(parsePolicy(withOidc([purpose()])).conglomerate_hosts);
+  assert.ok(
+    parsePolicy(
+      withOidc([
+        purpose({
+          permissions: { contents: "write" },
+          rules: [{ events: ["pull_request_target"], ref: "refs/heads/main", environment: null, read_only: true }],
+        }),
+      ]),
+    ),
+  );
+  assert.ok(parsePolicy(withOidc([purpose({ repository: { repository_id: 3201 }, permissions: { contents: "write" } })])));
+  assert.ok(
+    parsePolicy(
+      withOidc(
+        [purpose({ permissions: { contents: "write" }, callers: [{ repository_id: 3102, repository_owner_id: 1001 }] })],
+        [
+          { repository_id: 3101, repository_owner_id: 1001 },
+          { repository_id: 3102, repository_owner_id: 1001 },
+        ],
+      ),
+    ),
+  );
+  // Refused: a write of the key repository without members: read, as the caller's own or as a named repository.
+  assert.throws(
+    () => parsePolicy(withOidc([purpose({ permissions: { contents: "write" } })])),
+    /deployment-apply can write the host key repository without members: read/,
+  );
+  assert.throws(
+    () => parsePolicy(withOidc([purpose({ purpose: "key-writer", repository: { repository_id: 3101 }, permissions: { contents: "write" } })])),
+    /key-writer can write the host key repository without members: read/,
+  );
+  // A Workspace's write tier always carries members: read.
+  const workspacePolicy = parsePolicy({
+    ...hostsPolicyFixture(),
+    workspaces: [{ id: "alpha-team", github_team_id: 4001, credential_file: "/run/secrets/workspace-alpha" }],
+  });
+  assert.equal(tokenPermissions(workspacePolicy, WRITE_ACCESS, workspacePolicy.workspaces[0]).members, "read");
+});
+
+test("the broker never asks who wrote a key document: it mints while the document names the key and stops once it is removed or replaced (accepted boundary, 2026-11-03)", async () => {
+  const documents = { [`${DIRECTORY}/${HOST}.json`]: keyDocument() };
+  const github = syntheticGithub({ documents });
+  const { handle } = hostHandler({ github });
+  // Whoever wrote it, and whether that writer still has a grant, is not an input.
+  assert.equal((await hostCall(handle, assertion())).status, 200);
+  assert.equal((await hostCall(handle, assertion())).status, 200);
+  // Replaced with the host's own key by the next lane apply: the foreign key stops.
+  documents[`${DIRECTORY}/${HOST}.json`] = keyDocument({ broker_key: OTHER_KEY.brokerKey });
+  assert.deepEqual((await hostCall(handle, assertion())).body, { error: "assertion_signature_invalid" });
+  assert.equal((await hostCall(handle, assertion({ key: OTHER_KEY }))).status, 200);
+  // Removed: nothing mints.
+  delete documents[`${DIRECTORY}/${HOST}.json`];
+  assert.deepEqual((await hostCall(handle, assertion({ key: OTHER_KEY }))).body, { error: "host_unknown" });
+});
+
+// ---------------------------------------------------------------------------- the assertion ---
+
+test("an assertion is refused by its header, claims, audience, lifetime and time before any key is read", () => {
+  const decode = (token, now = NOW) => {
+    try {
+      decodeHostAssertion(token, { audience: AUDIENCE, now });
+      return "accepted";
+    } catch (error) {
+      assert.ok(error instanceof HostRefusal);
+      return error.code;
+    }
+  };
+  assert.equal(decode(assertion()), "accepted");
+  assert.equal(decode(""), "assertion_missing");
+  assert.equal(decode("a.b"), "assertion_malformed");
+  assert.equal(decode(`${assertion()}=`), "assertion_malformed");
+  assert.equal(decode(assertion({ header: { alg: "RS256", kid: HOST } })), "assertion_algorithm_refused");
+  assert.equal(decode(assertion({ header: { alg: "none", kid: HOST } })), "assertion_algorithm_refused");
+  assert.equal(decode(assertion({ header: { alg: "EdDSA", kid: HOST, jku: "https://x" } })), "assertion_malformed");
+  assert.equal(decode(assertion({ header: { alg: "EdDSA", kid: HOST, typ: "at+jwt" } })), "assertion_malformed");
+  assert.equal(decode(assertion({ header: { alg: "EdDSA", kid: "../secrets" } })), "assertion_claims_invalid");
+  assert.equal(decode(assertion({ header: { alg: "EdDSA", kid: "Example-Host" } })), "assertion_claims_invalid");
+  assert.equal(decode(assertion({ claims: { aud: "https://other-broker.example.com" } })), "assertion_audience_mismatch");
+  assert.equal(decode(assertion({ claims: { aud: [AUDIENCE] } })), "assertion_audience_mismatch");
+  assert.equal(decode(assertion({ claims: { iss: "other-host" } })), "assertion_claims_invalid");
+  assert.equal(decode(assertion({ claims: { jti: "short" } })), "assertion_claims_invalid");
+  assert.equal(decode(assertion({ claims: { exp: NOW_S } })), "assertion_claims_invalid");
+  assert.equal(decode(assertion({ claims: { exp: NOW_S + 61 } })), "assertion_lifetime_too_long");
+  assert.equal(decode(assertion({ claims: { nbf: NOW_S } })), "assertion_claims_invalid");
+  assert.equal(decode(assertion({ claims: { iat: NOW_S + 31, exp: NOW_S + 60 } })), "assertion_not_yet_valid");
+  assert.equal(decode(assertion({ claims: { iat: NOW_S - 120, exp: NOW_S - 61 } })), "assertion_expired");
+  // Tolerated: 30 s of clock skew either way.
+  assert.equal(decode(assertion({ claims: { iat: NOW_S + 30, exp: NOW_S + 60 } })), "accepted");
+  assert.equal(decode(assertion({ claims: { iat: NOW_S - 90, exp: NOW_S - 30 } })), "accepted");
+  // A signature that is not 64 bytes.
+  assert.equal(decode(assertion({ signature: b64url(randomBytes(63)) })), "assertion_malformed");
+});
+
+test("base64url is accepted only in its one canonical unpadded form", () => {
+  assert.deepEqual([...base64urlBytes("AQID")], [1, 2, 3]);
+  assert.equal(base64urlBytes("AQID="), undefined);
+  assert.equal(base64urlBytes("AQ+D"), undefined);
+  // "AR" and "AQ" both decode to 0x01 with lax decoders; only "AQ" is canonical.
+  assert.deepEqual([...base64urlBytes("AQ")], [1]);
+  assert.equal(base64urlBytes("AR"), undefined);
+});
+
+// -------------------------------------------------------------------------- the key document ---
+
+test("a key document must name exactly this host and this broker's Organization, with one Ed25519 key", () => {
+  const parse = (text) => {
+    try {
+      return parseHostKeyDocument(text, { host: HOST, organizationId: 1001 }).length;
+    } catch (error) {
+      assert.ok(error instanceof HostRefusal);
+      return error.code;
+    }
+  };
+  assert.equal(parse(keyDocument()), 32);
+  assert.equal(parse(keyDocument({ organization_id: 7001 })), "organization_mismatch");
+  assert.equal(parse(keyDocument({ host: "other-host" })), "host_key_invalid");
+  assert.equal(parse(keyDocument({ schema_version: "machines.conglomerate-host-broker-key.v2" })), "host_key_invalid");
+  assert.equal(parse(keyDocument({ broker_key: HOST_KEY.brokerKey.replace("ed25519:", "ssh-ed25519 ") })), "host_key_invalid");
+  assert.equal(parse(keyDocument({ broker_key: `ed25519:${b64url(randomBytes(31))}` })), "host_key_invalid");
+  assert.equal(parse(keyDocument({ extra: true })), "host_key_invalid");
+  assert.equal(parse(keyDocument({ source: { repository_id: 3102 } })), "host_key_invalid");
+  assert.equal(parse(keyDocument({ written_at: "yesterday" })), "host_key_invalid");
+  assert.equal(parse("not json"), "host_key_invalid");
+  assert.equal(parse(`${keyDocument()}${" ".repeat(5000)}`), "host_key_invalid");
+});
+
+// --------------------------------------------------------------------------- the route ---
+
+test("a host with its key document and a valid signature gets one token: its Deployment Repo, contents and members read, audited without the token", async () => {
+  const { handle, github, records } = hostHandler();
+  const { status, body } = await hostCall(handle, assertion());
+  assert.equal(status, 200);
+  assert.deepEqual(body, {
+    token: "ghs_synthetic_host_token_value",
+    expires_at: "2026-11-02T13:00:00Z",
+    repository_id: 3101,
+    repository: "example-org/deployment",
+    access: "read",
+    permissions: { contents: "read", members: "read" },
+  });
+  assert.deepEqual(github.reads, [`${DIRECTORY}/${HOST}.json`]);
+  assert.deepEqual(github.mints, [{ repositoryId: 3101, permissions: HOST_TOKEN_PERMISSIONS }]);
+  assert.equal(records.length, 1);
+  assert.deepEqual(records[0], {
+    schema_version: "lazurio.github_app_broker.audit.v1",
+    at: "2026-11-02T12:00:00.000Z",
+    route: "host",
+    status: 200,
+    decision: "granted",
+    host: HOST,
+    organization_id: 1001,
+    grant: {
+      repository_id: 3101,
+      repository: "example-org/deployment",
+      access: "read",
+      permissions: { contents: "read", members: "read" },
+      expires_at: "2026-11-02T13:00:00Z",
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(records), /ghs_synthetic|eyJ/);
+});
+
+test("an unknown host, another key, another Organization's document or an invalid document mint nothing", async () => {
+  const cases = [
+    [{}, assertion({ header: { alg: "EdDSA", kid: "other-host" } }), "host_unknown"],
+    [{}, assertion({ key: OTHER_KEY }), "assertion_signature_invalid"],
+    [{ [`${DIRECTORY}/${HOST}.json`]: keyDocument({ organization_id: 7001 }) }, assertion(), "organization_mismatch"],
+    [{ [`${DIRECTORY}/${HOST}.json`]: keyDocument({ broker_key: OTHER_KEY.brokerKey }) }, assertion(), "assertion_signature_invalid"],
+    [{ [`${DIRECTORY}/${HOST}.json`]: "{}" }, assertion(), "host_key_invalid"],
+  ];
+  for (const [documents, token, code] of cases) {
+    const github = syntheticGithub(Object.keys(documents).length ? { documents } : undefined);
+    const { handle, records } = hostHandler({ github });
+    const { status, body } = await hostCall(handle, token);
+    assert.equal(status, HOST_REFUSALS[code], code);
+    assert.deepEqual(body, { error: code });
+    assert.equal(github.mints.length, 0, code);
+    assert.equal(records.at(-1).decision, code);
+    assert.equal(records.at(-1).grant, undefined);
+  }
+});
+
+test("a signature over other claims than those presented is refused: the signing input is the presented header and claims", async () => {
+  const genuine = assertion();
+  const [header, , signature] = genuine.split(".");
+  const altered = `${header}.${b64url(Buffer.from(JSON.stringify({ aud: AUDIENCE, iss: HOST, iat: NOW_S, exp: NOW_S + 60, jti: b64url(randomBytes(18)) })))}.${signature}`;
+  const { handle, github } = hostHandler();
+  const { status, body } = await hostCall(handle, altered);
+  assert.equal(status, 401);
+  assert.deepEqual(body, { error: "assertion_signature_invalid" });
+  assert.equal(github.mints.length, 0);
+});
+
+test("refusals that need no key happen before any GitHub request: media type, body, audience, time", async () => {
+  const github = syntheticGithub();
+  const { handle } = hostHandler({ github });
+  const results = [
+    await hostCall(handle, assertion(), { contentType: "text/plain" }),
+    await hostCall(handle, assertion(), { body: '{"repository":"example-org/other"}' }),
+    await hostCall(handle, assertion(), { body: "[]" }),
+    await hostCall(handle, assertion(), { body: "not json" }),
+    await hostCall(handle, undefined),
+    await hostCall(handle, assertion({ claims: { aud: "https://other-broker.example.com" } })),
+    await hostCall(handle, assertion({ claims: { iat: NOW_S - 300, exp: NOW_S - 240 } })),
+  ];
+  assert.deepEqual(
+    results.map(({ status, body }) => [status, body.error]),
+    [
+      [415, "unsupported_media_type"],
+      [400, "invalid_request"],
+      [400, "invalid_request"],
+      [400, "invalid_request"],
+      [401, "assertion_missing"],
+      [401, "assertion_audience_mismatch"],
+      [401, "assertion_expired"],
+    ],
+  );
+  assert.equal(github.reads.length, 0);
+  assert.equal(github.mints.length, 0);
+});
+
+test("a replayed assertion is refused before the key document is read again, and never mints twice", async () => {
+  const { handle, github } = hostHandler();
+  const token = assertion();
+  assert.equal((await hostCall(handle, token)).status, 200);
+  const again = await hostCall(handle, token);
+  assert.equal(again.status, 401);
+  assert.deepEqual(again.body, { error: "assertion_replayed" });
+  assert.equal(github.reads.length, 1);
+  assert.equal(github.mints.length, 1);
+});
+
+test("a Deployment Repo with a writer who is neither an Owner nor an approved writer stops the route, but only after the signature", async () => {
+  const github = syntheticGithub({ unapprovedWriters: 1 });
+  const { handle, records } = hostHandler({ github });
+  const refused = await hostCall(handle, assertion());
+  assert.deepEqual([refused.status, refused.body], [403, { error: "deployment_repository_writer_not_approved" }]);
+  assert.equal(github.mints.length, 0);
+  assert.equal(records.at(-1).decision, "deployment_repository_writer_not_approved");
+  // An unauthenticated caller learns nothing about the writers: its signature fails first.
+  const forged = await hostCall(handle, assertion({ key: OTHER_KEY }));
+  assert.deepEqual(forged.body, { error: "assertion_signature_invalid" });
+});
+
+test("a deploy key that can write the Deployment Repo stops the route after the signature, whatever the account lists say (review)", async () => {
+  const github = syntheticGithub({ writeDeployKeys: 1 });
+  const { handle, records } = hostHandler({ github });
+  const refused = await hostCall(handle, assertion());
+  assert.deepEqual([refused.status, refused.body], [403, { error: "deployment_repository_write_key" }]);
+  assert.equal(github.mints.length, 0);
+  assert.equal(records.at(-1).decision, "deployment_repository_write_key");
+  const forged = await hostCall(handle, assertion({ key: OTHER_KEY }));
+  assert.deepEqual(forged.body, { error: "assertion_signature_invalid" });
+});
+
+test("on a paid plan the key ref needs an update ruleset only this App and the Owners bypass and a history ruleset nobody bypasses; on \"none\" nothing is read (review)", async () => {
+  const policy = parsePolicy(hostsPolicyFixture());
+  const verdict = async (rulesets) =>
+    (await fakeGithubApi({ rulesets }).client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).key_ref_protected;
+  assert.equal(await verdict([updateRuleset(), historyRuleset()]), true);
+  assert.equal(
+    await verdict([
+      updateRuleset({ conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/main"] } } }),
+      historyRuleset({ conditions: { ref_name: { include: ["~ALL"], exclude: [] } } }),
+    ]),
+    true,
+  );
+  // One ruleset with every rule and the App and Owners as bypass actors is not enough: its bypass
+  // also covers deletion and history rewrite.
+  assert.equal(
+    await verdict([updateRuleset({ rules: [{ type: "update" }, { type: "deletion" }, { type: "non_fast_forward" }] })]),
+    false,
+  );
+  assert.equal(await verdict([]), false);
+  assert.equal(await verdict([updateRuleset()]), false);
+  assert.equal(await verdict([historyRuleset()]), false);
+  for (const overrides of [
+    { enforcement: "evaluate" },
+    { enforcement: "disabled" },
+    { target: "tag" },
+    { conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } } },
+    { conditions: { ref_name: { include: ["~ALL"], exclude: [`refs/heads/${REF}`] } } },
+    { conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/machines-*"] } } },
+    { conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] }, repository_name: { include: ["~ALL"] } } },
+    { rules: [{ type: "deletion" }, { type: "non_fast_forward" }] },
+    { bypass_actors: [{ actor_id: 99, actor_type: "Integration", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 7, actor_type: "Team", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 8, actor_type: "DeployKey", bypass_mode: "always" }] },
+    { bypass_actors: undefined },
+  ]) {
+    assert.equal(await verdict([updateRuleset(overrides), historyRuleset()]), false, `update ${JSON.stringify(overrides)}`);
+  }
+  for (const overrides of [
+    { enforcement: "evaluate" },
+    { rules: [{ type: "deletion" }] },
+    { rules: [{ type: "non_fast_forward" }] },
+    { bypass_actors: [{ actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "always" }] },
+    { bypass_actors: [{ actor_id: 42, actor_type: "Integration", bypass_mode: "always" }] },
+    { conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } } },
+  ]) {
+    assert.equal(await verdict([updateRuleset(), historyRuleset(overrides)]), false, `history ${JSON.stringify(overrides)}`);
+  }
+  // A plan without rulesets: the policy says so explicitly, and no ruleset is read.
+  const free = fakeGithubApi({ rulesets: [] });
+  const admission = await free.client.readHostAdmission(
+    parsePolicy(hostsPolicyFixture({ key_ref_protection: "none" })),
+    `${DIRECTORY}/${HOST}.json`,
+  );
+  assert.equal(admission.key_ref_protected, true);
+  assert.equal(free.calls.some((call) => call.path.includes("/rulesets")), false);
+  // Through the handler: an unprotected ref mints nothing, after the signature.
+  const github = syntheticGithub({ keyRefProtected: false });
+  const { handle } = hostHandler({ github });
+  assert.deepEqual((await hostCall(handle, assertion())).body, { error: "key_ref_unprotected" });
+  assert.equal(github.mints.length, 0);
+  assert.deepEqual((await hostCall(handle, assertion({ key: OTHER_KEY }))).body, { error: "assertion_signature_invalid" });
+});
+
+test("conglomerate_hosts needs the installation to accept administration: read for the deploy key check", () => {
+  const policy = hostsPolicyFixture();
+  delete policy.installation_permissions.administration;
+  assert.throws(() => parsePolicy(policy), /conglomerate_hosts needs the installation to accept administration: read/);
+});
+
+test("the broker's hourly read budget refuses before GitHub, and a host's hourly grant budget before the mint", async () => {
+  // Reads: unauthenticated callers can only spend this deny-only budget, never the installation's.
+  {
+    const github = syntheticGithub({ documents: {} });
+    const { handle } = hostHandler({ github });
+    for (let index = 0; index < HOST_READS_PER_HOUR; index += 1) {
+      assert.equal((await hostCall(handle, assertion())).body.error, "host_unknown");
+    }
+    const limited = await hostCall(handle, assertion());
+    assert.deepEqual([limited.status, limited.body.error], [429, "rate_limited"]);
+    assert.equal(github.reads.length, HOST_READS_PER_HOUR);
+  }
+  // Grants: one host mints at most HOST_GRANTS_PER_HOUR tokens per hour of its assertions' iat.
+  {
+    const { handle, github } = hostHandler();
+    for (let index = 0; index < HOST_GRANTS_PER_HOUR; index += 1) {
+      assert.equal((await hostCall(handle, assertion())).status, 200);
+    }
+    const limited = await hostCall(handle, assertion());
+    assert.deepEqual([limited.status, limited.body.error], [429, "rate_limited"]);
+    assert.equal(github.mints.length, HOST_GRANTS_PER_HOUR);
+  }
+});
+
+test("a mint outside the configured repository or permission set, or a failing GitHub read, is token_unavailable", async () => {
+  const outside = [
+    (repositoryId, permissions) => ({
+      token: "ghs_x_token_value_long_enough",
+      expires_at: "2026-11-02T13:00:00Z",
+      repository_id: 3999,
+      repository: "example-org/other",
+      permissions,
+    }),
+    (repositoryId) => ({
+      token: "ghs_x_token_value_long_enough",
+      expires_at: "2026-11-02T13:00:00Z",
+      repository_id: repositoryId,
+      repository: "example-org/deployment",
+      permissions: { contents: "write", members: "read" },
+    }),
+  ];
+  for (const mint of outside) {
+    const { handle } = hostHandler({ github: syntheticGithub({ mint }) });
+    const { status, body } = await hostCall(handle, assertion());
+    assert.deepEqual([status, body], [502, { error: "token_unavailable" }]);
+  }
+  const failing = syntheticGithub({
+    read: () => {
+      throw new Error("GitHub request failed with HTTP 500");
+    },
+  });
+  const { handle } = hostHandler({ github: failing });
+  assert.deepEqual((await hostCall(handle, assertion())).body, { error: "token_unavailable" });
+  assert.equal(failing.mints.length, 0);
+});
+
+test("without conglomerate_hosts, or without the host dependencies (the Node adapter), the route does not exist", async () => {
+  const { conglomerate_hosts: _hosts, ...plain } = hostsPolicyFixture();
+  plain.workspaces = [{ id: "alpha-team", github_team_id: 4001, credential_file: "/run/secrets/workspace-alpha" }];
+  for (const [policy, hosts] of [
+    [plain, { verify: verifyEd25519, guard: memoryGuard(), audit: () => {}, now: () => NOW }],
+    [hostsPolicyFixture(), undefined],
+  ]) {
+    const github = syntheticGithub();
+    const handle = createBrokerHandler({
+      policy: parsePolicy(policy),
+      github: github.client,
+      credentials: new Map(),
+      secretMatches: async () => false,
+      hosts,
+    });
+    const { status, body } = await hostCall(handle, assertion());
+    assert.deepEqual([status, body], [404, { error: "not_found" }]);
+    assert.equal(github.reads.length, 0);
+  }
+});
+
+// ------------------------------------------------------------------- the real GitHub client ---
+
+/** The ruleset that keeps updates of the key ref to this App and the Owners. */
+function updateRuleset(overrides = {}) {
+  return {
+    id: 777,
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] } },
+    rules: [{ type: "update" }],
+    bypass_actors: [
+      { actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "always" },
+      { actor_id: 42, actor_type: "Integration", bypass_mode: "always" },
+    ],
+    ...overrides,
+  };
+}
+
+/** The ruleset nobody bypasses: no deletion, no history rewrite of the key ref. */
+function historyRuleset(overrides = {}) {
+  return {
+    id: 778,
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: [`refs/heads/${REF}`], exclude: [] } },
+    rules: [{ type: "deletion" }, { type: "non_fast_forward" }],
+    bypass_actors: [],
+    ...overrides,
+  };
+}
+
+function fakeGithubApi({
+  document = keyDocument(),
+  status = 200,
+  revokeStatus = 204,
+  deployKeys = [{ id: 9001, read_only: true }],
+  rulesets = [updateRuleset(), historyRuleset()],
+  owner = 1001,
+  owners = [{ id: 6001, login: "example-owner" }],
+  collaborators = [
+    { id: 6001, login: "example-owner", permissions: { admin: true, maintain: true, push: true, pull: true } },
+    { id: 5001, login: "example-reviewer", permissions: { admin: false, maintain: false, push: true, pull: true } },
+    { id: 5002, login: "example-reader", permissions: { admin: false, maintain: false, push: false, pull: true } },
+  ],
+} = {}) {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const { pathname, search } = new URL(url);
+    calls.push({ method: init.method ?? "GET", path: `${pathname}${search}`, accept: init.headers?.Accept, authorization: init.headers?.Authorization, body: init.body });
+    if (pathname === "/app/installations/2001/access_tokens") {
+      const requested = JSON.parse(init.body);
+      return Response.json(
+        {
+          token: "ghs_internal_read_token_value",
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          permissions: requested.permissions,
+          repositories: [{ id: requested.repository_ids[0], full_name: "example-org/deployment", owner: { id: owner, login: "example-org" } }],
+        },
+        { status: 201 },
+      );
+    }
+    if (pathname.startsWith("/repositories/3101/contents/")) {
+      return status === 200 ? new Response(document, { status: 200 }) : new Response("", { status });
+    }
+    if (pathname === "/organizations/1001/members") return Response.json(owners);
+    if (pathname === "/repositories/3101/collaborators") return Response.json(collaborators);
+    if (pathname === "/repositories/3101/keys") return Response.json(deployKeys);
+    if (pathname === "/repositories/3101/rulesets") {
+      return Response.json(rulesets.map(({ id, enforcement, target }) => ({ id, enforcement, target })));
+    }
+    const single = /^\/repositories\/3101\/rulesets\/(\d+)$/.exec(pathname);
+    if (single) return Response.json(rulesets.find((ruleset) => ruleset.id === Number(single[1])) ?? {}, { status: 200 });
+    if (pathname === "/installation/token") return new Response(null, { status: revokeStatus });
+    return new Response("{}", { status: 404 });
+  };
+  return { calls, client: createGithubClient({ appId: 42, signJwt: async () => "c2lnbmF0dXJl", fetchImpl }) };
+}
+
+test("the GitHub client reads the key document raw at the policy's ref and the writers live, with one token for exactly that repository, and revokes it", async () => {
+  const policy = parsePolicy(hostsPolicyFixture());
+  const api = fakeGithubApi();
+  assert.deepEqual(await api.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), {
+    document: keyDocument(),
+    unapproved_writers: 0,
+    write_deploy_keys: 0,
+    key_ref_protected: true,
+  });
+  const [mint, read, owners, collaborators, keys, rulesetList, rulesetUpdate, rulesetHistory, revoke] = api.calls;
+  assert.equal(rulesetList.path, "/repositories/3101/rulesets?includes_parents=true&per_page=100&page=1");
+  assert.equal(rulesetUpdate.path, "/repositories/3101/rulesets/777");
+  assert.equal(rulesetHistory.path, "/repositories/3101/rulesets/778");
+  assert.deepEqual(JSON.parse(mint.body), {
+    repository_ids: [3101],
+    permissions: { administration: "read", contents: "read", members: "read" },
+  });
+  assert.equal(keys.path, "/repositories/3101/keys?per_page=100&page=1");
+  assert.equal(read.path, `/repositories/3101/contents/access/conglomerate-hosts/${HOST}.json?ref=machines-evidence-v1`);
+  assert.equal(read.accept, "application/vnd.github.raw+json");
+  assert.equal(read.authorization, "Bearer ghs_internal_read_token_value");
+  assert.equal(owners.path, "/organizations/1001/members?role=admin&per_page=100&page=1");
+  assert.equal(collaborators.path, "/repositories/3101/collaborators?affiliation=all&per_page=100&page=1");
+  assert.deepEqual([revoke.method, revoke.path, revoke.authorization], ["DELETE", "/installation/token", "Bearer ghs_internal_read_token_value"]);
+  // A writer who is neither an Owner nor approved is counted; a reader is not.
+  const extra = fakeGithubApi({
+    collaborators: [
+      { id: 6001, permissions: { push: true } },
+      { id: 5003, permissions: { maintain: true } },
+      { id: 5004, permissions: { pull: true } },
+    ],
+  });
+  assert.equal((await extra.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).unapproved_writers, 1);
+  // A deploy key that can write counts; a read-only one does not.
+  const keyed = fakeGithubApi({ deployKeys: [{ id: 9001, read_only: true }, { id: 9002, read_only: false }, { id: 9003 }] });
+  assert.equal((await keyed.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).write_deploy_keys, 2);
+  // Without approved writers, the reviewer persona counts too.
+  const strict = parsePolicy(hostsPolicyFixture({ approved_writers: [] }));
+  assert.equal((await fakeGithubApi().client.readHostAdmission(strict, `${DIRECTORY}/${HOST}.json`)).unapproved_writers, 1);
+});
+
+test("the GitHub client answers a missing document as unknown, refuses another owner and paths outside the directory, and always revokes", async () => {
+  const policy = parsePolicy(hostsPolicyFixture());
+  const missing = fakeGithubApi({ status: 404 });
+  assert.equal((await missing.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`)).document, undefined);
+  assert.equal(missing.calls.at(-1).method, "DELETE");
+  const failing = fakeGithubApi({ status: 500 });
+  await assert.rejects(failing.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), /HTTP 500/);
+  assert.equal(failing.calls.at(-1).method, "DELETE");
+  const foreign = fakeGithubApi({ owner: 7001 });
+  await assert.rejects(foreign.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), /outside the requested repository/);
+  assert.equal(foreign.calls.some((call) => call.path.startsWith("/repositories/")), false);
+  const api = fakeGithubApi();
+  await assert.rejects(api.client.readHostAdmission(policy, "secrets/key.json"), /outside the policy's directory/);
+  await assert.rejects(api.client.readHostAdmission(policy, `${DIRECTORY}/../x.json`), /outside the policy's directory/);
+  assert.equal(api.calls.length, 0);
+});
+
+test("a failed revocation of the internal token fails the request: nothing is returned and no host token is minted", async () => {
+  const policy = parsePolicy(hostsPolicyFixture());
+  const api = fakeGithubApi({ revokeStatus: 500 });
+  await assert.rejects(api.client.readHostAdmission(policy, `${DIRECTORY}/${HOST}.json`), /HTTP 500/);
+  assert.equal(api.calls.at(-1).method, "DELETE");
+  // Through the handler: token_unavailable, and the mint is never reached.
+  const github = syntheticGithub({
+    read: (path) => api.client.readHostAdmission(policy, path),
+  });
+  const { handle } = hostHandler({ github });
+  assert.deepEqual((await hostCall(handle, assertion())).body, { error: "token_unavailable" });
+  assert.equal(github.mints.length, 0);
+});
+
+test("an assertion that expires while its body or the GitHub reads are pending is refused by a fresh clock and never mints (Greptile review)", async () => {
+  // A late body: the clock passes exp + 30 s while the body is read.
+  {
+    let now = NOW;
+    const github = syntheticGithub();
+    const { handle } = hostHandler({ github, now: () => now, guard: memoryGuard(() => now) });
+    const token = assertion();
+    const response = await handle({
+      method: "POST",
+      path: "/v1/host/token",
+      contentType: "application/json",
+      authorization: `Bearer ${token}`,
+      readBody: async () => {
+        now = NOW + 91_000;
+        return "{}";
+      },
+    });
+    assert.deepEqual([response.status, response.body], [401, { error: "assertion_expired" }]);
+    assert.equal(github.reads.length, 0);
+    assert.equal(github.mints.length, 0);
+  }
+  // Slow GitHub reads: the clock passes exp + 30 s before the grant.
+  {
+    let now = NOW;
+    const github = syntheticGithub({
+      read: () => {
+        now = NOW + 91_000;
+        return { document: keyDocument(), unapproved_writers: 0, write_deploy_keys: 0, key_ref_protected: true };
+      },
+    });
+    const { handle } = hostHandler({ github, now: () => now, guard: memoryGuard(() => now) });
+    const response = await hostCall(handle, assertion());
+    assert.deepEqual([response.status, response.body], [401, { error: "assertion_expired" }]);
+    assert.equal(github.mints.length, 0);
+  }
+});
+
+// ------------------------------------------------------------------------------- the Worker ---
+
+function durableObjectNamespace() {
+  const objects = new Map();
+  return {
+    objects,
+    idFromName: (name) => ({ name }),
+    get(id) {
+      if (!objects.has(id.name)) objects.set(id.name, new OidcRunGuard({ storage: memoryStorage() }));
+      const guard = objects.get(id.name);
+      return { fetch: (url, init) => guard.fetch(new Request(url, init)) };
+    },
+  };
+}
+
+function hostRequest(token) {
+  return new Request(`${AUDIENCE}/v1/host/token`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: "{}",
+  });
+}
+
+test("Worker end to end: WebCrypto Ed25519, the Durable Object guard and the live installation gate before the key read and the mint", async () => {
+  const github = syntheticGithub();
+  const order = [];
+  const client = {
+    ...github.client,
+    async verifyPolicy() {
+      order.push("verifyPolicy");
+    },
+    async readHostAdmission(policy, path) {
+      order.push("read");
+      return github.client.readHostAdmission(policy, path);
+    },
+    async mintPurposeToken(policy, repositoryId, permissions) {
+      order.push("mint");
+      return github.client.mintPurposeToken(policy, repositoryId, permissions);
+    },
+  };
+  const records = [];
+  const namespace = durableObjectNamespace();
+  const worker = createWorkerEntrypoint({ createGithub: () => client, audit: (record) => records.push(record), now: () => Date.now() });
+  const env = {
+    BROKER_POLICY_JSON: JSON.stringify(hostsPolicyFixture()),
+    GITHUB_APP_ID: "42",
+    GITHUB_APP_PRIVATE_KEY: "synthetic-test-key",
+    OIDC_RUN_GUARD: namespace,
+  };
+  const now = Math.floor(Date.now() / 1000);
+  const token = assertion({ claims: { iat: now, exp: now + 60 } });
+  const response = await worker.fetch(hostRequest(token), env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual((await response.json()).permissions, { contents: "read", members: "read" });
+  assert.deepEqual(order, ["verifyPolicy", "read", "verifyPolicy", "mint"]);
+  assert.ok([...namespace.objects.keys()].some((name) => name.startsWith(`host/${HOST}/`)));
+  assert.equal(records.at(-1).decision, "granted");
+  // The same assertion again: refused by the Durable Object, no further GitHub request.
+  const replay = await worker.fetch(hostRequest(token), env);
+  assert.equal(replay.status, 401);
+  assert.deepEqual(await replay.json(), { error: "assertion_replayed" });
+  assert.equal(order.length, 4);
+});
+
+test("Worker: a policy naming conglomerate_hosts without the guard binding, or a client without a key reader, is unavailable configuration", async () => {
+  const github = syntheticGithub();
+  const { readHostAdmission: _read, ...withoutReader } = github.client;
+  for (const [client, withGuard] of [
+    [github.client, false],
+    [withoutReader, true],
+  ]) {
+    const worker = createWorkerEntrypoint({ createGithub: () => client, audit: () => {} });
+    const env = {
+      BROKER_POLICY_JSON: JSON.stringify(hostsPolicyFixture()),
+      GITHUB_APP_ID: "42",
+      GITHUB_APP_PRIVATE_KEY: "synthetic-test-key",
+      ...(withGuard ? { OIDC_RUN_GUARD: durableObjectNamespace() } : {}),
+    };
+    const response = await worker.fetch(hostRequest(assertion()), env);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "configuration_unavailable" });
+  }
+});
