@@ -137,7 +137,8 @@ all.
 A Workspace that reads and writes nothing but repository contents, such as a
 production applications host that pushes its applications' data, declares
 `permission_ceiling: "contents"` (since `0.16.0`). Its Team gate keeps the
-tier of each grant, and each tier asks for repository contents only:
+tier of each grant, with one exception below, and each tier asks for
+repository contents only:
 `contents: write` or `contents: read`, plus GitHub's `metadata: read`, with no
 opt-in whatever the installation accepted. Its tokens therefore carry no
 permission for pull requests, issues, check runs, workflow runs, workflow

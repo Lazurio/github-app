@@ -23,7 +23,8 @@ permission. See [Read-only Workspaces](#read-only-workspaces-permission_ceiling)
 Since `0.16.0` a Workspace whose policy entry declares
 `permission_ceiling: "contents"` keeps the tier of each grant but asks for
 repository contents only: `contents: write` for a `push`, `maintain` or
-`admin` grant, `contents: read` for a `pull` or `triage` grant. Its tokens
+`admin` grant, `contents: read` for a `pull` or `triage` grant, and only
+`contents: read` on the policy's `conglomerate_hosts` repository. Its tokens
 never carry an Actions, Checks, issue, membership, pull request or workflow
 permission. See
 [Contents-only Workspaces](#contents-only-workspaces-permission_ceiling-contents).
@@ -476,7 +477,8 @@ declares:
 
 For such a Workspace:
 
-- every grant keeps its tier: `push`, `maintain` or `admin` mints exactly
+- every grant keeps its tier, except on the policy's `conglomerate_hosts`
+  repository (last item): `push`, `maintain` or `admin` mints exactly
   `contents: write`, `pull` or `triage` exactly `contents: read`, and GitHub
   adds `metadata: read`. The token response says `access: "write"` or
   `"read"` as for any Workspace. No opt-in reaches it: whatever the

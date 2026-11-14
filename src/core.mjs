@@ -70,7 +70,8 @@ export const READ_CEILING = "read";
 
 /**
  * `workspaces[].permission_ceiling: "contents"` (since 0.16.0): every token of the Workspace
- * carries repository contents only, at the level its live grant selects. It is meant for a
+ * carries repository contents only, at the level the Team gate selects for its live grant (see
+ * grantAccess for the one repository where that is always read). It is meant for a
  * Workspace that reads and writes nothing but repository contents, such as a production
  * applications host.
  */
@@ -103,9 +104,10 @@ const PERMISSION_LEVELS = Object.freeze({ read: 1, write: 2 });
  * Team gate already selects the read tier for it. Any set that asks for a permission or level the
  * installation has not accepted is refused before GitHub is asked.
  *
- * A Workspace with `permission_ceiling: "contents"` keeps the tier its grant selects and asks for
- * repository contents only, at that level: `contents: write` for the write tier and
- * `contents: read` for the read tier. Neither opt-in reaches it, whatever the installation accepted.
+ * A Workspace with `permission_ceiling: "contents"` keeps the tier the Team gate selects for its
+ * grant (see grantAccess) and asks for repository contents only, at that level: `contents: write`
+ * for the write tier and `contents: read` for the read tier. Neither opt-in reaches it, whatever
+ * the installation accepted.
  */
 export function tokenPermissions(policy, access, workspace) {
   if (!policy.workspaces.includes(workspace)) fail("token permissions need a Workspace of the policy");
