@@ -1854,7 +1854,7 @@ test("policy accepts an optional read permission ceiling per Workspace and rejec
   for (const value of ["write", "none", "READ", "", null, true, 0, { issues: "read" }]) {
     const fixture = policyFixture();
     fixture.workspaces[1].permission_ceiling = value;
-    assert.throws(() => parsePolicy(fixture), /workspaces\[1\]\.permission_ceiling must be "read" when present/, JSON.stringify(value));
+    assert.throws(() => parsePolicy(fixture), /workspaces\[1\]\.permission_ceiling must be "read" or "contents" when present/, JSON.stringify(value));
   }
 });
 
@@ -2070,4 +2070,284 @@ test("policy check prints the read-ceiling set and a CEILING column, and live ro
   const rows = await github.readWorkspaceTeamGrants(policy, policy.workspaces[0]);
   assert.deepEqual(rows.map(({ repository_id, role, access }) => [repository_id, role, access]), [[3001, "write", "read"], [3004, "read", "read"]]);
   assert.match(formatPolicyCheckTable(rows), /2 repository grants \(0 write, 2 read\)/);
+});
+
+/**
+ * alpha-team declares the contents permission ceiling unless `contentsWorkspace` says otherwise;
+ * `readWorkspace` adds a read ceiling to the other Workspace. The installation accepted every
+ * opt-in an Organization may hold (Issues, workflows, administration and the Organization plan),
+ * so a test can tell that none of them reaches a contents-ceiling token.
+ */
+function contentsPolicyFixture({ contentsWorkspace = 0, readWorkspace } = {}) {
+  const fixture = policyFixture();
+  fixture.installation_permissions = {
+    ...fixture.installation_permissions,
+    administration: "read",
+    issues: "write",
+    organization_plan: "read",
+    workflows: "write",
+  };
+  fixture.workspaces[contentsWorkspace].permission_ceiling = "contents";
+  if (readWorkspace !== undefined) fixture.workspaces[readWorkspace].permission_ceiling = "read";
+  return fixture;
+}
+
+const CONTENTS_WRITE_SET = { contents: "write" };
+const CONTENTS_READ_SET = { contents: "read" };
+
+test("policy accepts a contents permission ceiling next to a read one and rejects every other value", () => {
+  const parsed = parsePolicy(contentsPolicyFixture({ readWorkspace: 1 }));
+  assert.equal(parsed.workspaces[0].permission_ceiling, "contents");
+  assert.equal(parsed.workspaces[1].permission_ceiling, "read");
+  for (const value of ["CONTENTS", "Contents", "contents ", "contents:write", "metadata", ["contents"], { contents: "write" }]) {
+    const fixture = policyFixture();
+    fixture.workspaces[0].permission_ceiling = value;
+    assert.throws(
+      () => parsePolicy(fixture),
+      /workspaces\[0\]\.permission_ceiling must be "read" or "contents" when present/,
+      JSON.stringify(value),
+    );
+  }
+});
+
+test("a contents ceiling asks for exactly contents: write or contents: read, whatever the installation accepted", () => {
+  const policy = parsePolicy(contentsPolicyFixture());
+  const [alpha, beta] = policy.workspaces;
+  assert.deepEqual(tokenPermissions(policy, "write", alpha), CONTENTS_WRITE_SET);
+  assert.deepEqual(tokenPermissions(policy, "read", alpha), CONTENTS_READ_SET);
+  // The Workspace without a ceiling in the same policy keeps both tiers with every declared opt-in.
+  assert.deepEqual(tokenPermissions(policy, "write", beta), { ...WRITE_SET, issues: "write", workflows: "write" });
+  assert.deepEqual(tokenPermissions(policy, "read", beta), { ...READ_SET, issues: "write" });
+  // There is no default tier, and a copy of the Workspace, with or without its ceiling, is not a Workspace of the policy.
+  for (const access of [undefined, "", "admin", "contents", "WRITE"]) {
+    assert.throws(() => tokenPermissions(policy, access, alpha), /access tier must be read or write/, String(access));
+  }
+  for (const outsider of [undefined, { ...alpha }, { ...alpha, permission_ceiling: undefined }, structuredClone(beta)]) {
+    assert.throws(() => tokenPermissions(policy, "write", outsider), /need a Workspace of the policy/);
+  }
+});
+
+test("a contents-ceiling mint asks GitHub for exactly that set and revokes and refuses every other answer", async () => {
+  const now = 1_700_000_000_000;
+  const requests = [];
+  const revocations = [];
+  let responsePermissions;
+  let responseRepositories = [{ id: 3001 }];
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (url, init) => {
+      if (new URL(url).pathname === "/installation/token" && init.method === "DELETE") {
+        revocations.push(init.headers.Authorization);
+        return jsonResponse(null, 204);
+      }
+      requests.push(JSON.parse(init.body));
+      return jsonResponse({
+        token: `ghs_contents_synthetic_${requests.length}`,
+        expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+        repositories: responseRepositories,
+        permissions: responsePermissions,
+      });
+    },
+    now: () => now,
+  });
+  const policy = parsePolicy(contentsPolicyFixture());
+  const alpha = policy.workspaces[0];
+
+  for (const [access, set] of [["write", CONTENTS_WRITE_SET], ["read", CONTENTS_READ_SET]]) {
+    // GitHub's own answer: the set plus its automatic metadata: read.
+    responsePermissions = { ...set, metadata: "read" };
+    const minted = await github.mintToken(policy, alpha, 3001, access);
+    assert.deepEqual(
+      [minted.token, minted.repository_id, minted.access],
+      [`ghs_contents_synthetic_${requests.length}`, 3001, access],
+    );
+    assert.deepEqual(requests.at(-1), { repository_ids: [3001], permissions: set });
+  }
+  assert.deepEqual(revocations, [], "a token inside its scope is delivered, not revoked");
+
+  // Any extra permission, another level, a missing contents or another repository is revoked with
+  // its own token and refused.
+  const refused = [
+    ["write", { contents: "write", metadata: "read", issues: "write" }],
+    ["write", { contents: "write", metadata: "read", pull_requests: "write" }],
+    ["write", { contents: "write", metadata: "read", actions: "write" }],
+    ["write", { contents: "write", metadata: "read", checks: "read" }],
+    ["write", { contents: "write", metadata: "read", members: "read" }],
+    ["write", { contents: "write", metadata: "read", workflows: "write" }],
+    ["write", { contents: "write", metadata: "read", administration: "read" }],
+    ["write", { contents: "write", metadata: "write" }],
+    ["write", { contents: "read", metadata: "read" }],
+    ["write", { metadata: "read" }],
+    ["read", { contents: "write", metadata: "read" }],
+    ["read", { contents: "read", metadata: "read", issues: "read" }],
+    ["read", { contents: "read", metadata: "read", pull_requests: "read" }],
+    ["read", { contents: "read", metadata: "read", actions: "read" }],
+    ["read", {}],
+  ];
+  for (const [access, permissions] of refused) {
+    responsePermissions = permissions;
+    await assert.rejects(
+      () => github.mintToken(policy, alpha, 3001, access),
+      /outside the requested repository or permission scope/,
+      `${access} ${JSON.stringify(permissions)}`,
+    );
+    assert.equal(revocations.at(-1), `Bearer ghs_contents_synthetic_${requests.length}`, JSON.stringify(permissions));
+  }
+  responsePermissions = { ...CONTENTS_WRITE_SET, metadata: "read" };
+  responseRepositories = [{ id: 3002 }];
+  await assert.rejects(() => github.mintToken(policy, alpha, 3001, "write"), /outside the requested repository or permission scope/);
+  assert.equal(revocations.length, refused.length + 1);
+  assert.equal(new Set(revocations).size, revocations.length, "each refused token is revoked with its own credential");
+  // Every mint asked for exactly one of the two contents sets.
+  assert.deepEqual(
+    [...new Set(requests.map(({ permissions }) => JSON.stringify(permissions)))].sort(),
+    [JSON.stringify(CONTENTS_READ_SET), JSON.stringify(CONTENTS_WRITE_SET)],
+  );
+});
+
+test("the Team gate keeps every grant's tier for a contents-ceiling Workspace and still refuses a missing grant", async () => {
+  const policy = parsePolicy(contentsPolicyFixture());
+  const privateKey = testPrivateKey();
+  for (const [permissions, role, access] of [
+    [{ admin: false, maintain: false, pull: true, push: false, triage: false }, "read", "read"],
+    [{ admin: false, maintain: false, pull: true, push: false, triage: true }, "triage", "read"],
+    [{ admin: false, maintain: false, pull: true, push: true, triage: true }, "write", "write"],
+    [{ admin: false, maintain: true, pull: true, push: true, triage: true }, "maintain", "write"],
+    [{ admin: true, maintain: true, pull: true, push: true, triage: true }, "admin", "write"],
+  ]) {
+    for (const target of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+      const github = createGithubClient({
+        appId: "42",
+        privateKey,
+        fetchImpl: teamGrantFetch({
+          grant: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions },
+        }),
+      });
+      const grant = await github.verifyTeamGrant(policy, policy.workspaces[0], target);
+      assert.deepEqual([grant.role, grant.access], [role, access], role);
+    }
+  }
+  // No grant is still refused; the ceiling never creates access.
+  const none = createGithubClient({ appId: "42", privateKey, fetchImpl: teamGrantFetch({ grant: null }) });
+  await assert.rejects(
+    () => none.verifyTeamGrant(policy, policy.workspaces[0], { repository: "example-org/alpha" }),
+    (error) => error.code === "team_grant_missing",
+  );
+});
+
+test("end to end: a contents-ceiling Workspace mints contents only for push and read grants; other Workspaces, repositories and owners mint nothing", async () => {
+  const grantOn = (permissions) => teamGrantFetch({
+    grant: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions },
+  });
+  for (const [permissions, access, set] of [
+    [{ admin: false, maintain: false, pull: true, push: true, triage: true }, "write", CONTENTS_WRITE_SET],
+    [{ admin: false, maintain: false, pull: true, push: false, triage: false }, "read", CONTENTS_READ_SET],
+  ]) {
+    const scopedMints = [];
+    await withLiveCoreServer(mintingFetch([], grantOn(permissions), scopedMints), async (origin) => {
+      for (const body of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+        const response = await request(origin, { body });
+        assert.equal(response.status, 200, access);
+        const json = await response.json();
+        assert.deepEqual([json.access, json.repository_id, json.repository], [access, 3001, "example-org/alpha"]);
+      }
+      assert.deepEqual(scopedMints, [set, set]);
+      // Cross-Workspace: the other Team holds nothing on alpha.
+      const crossWorkspace = await request(origin, { workspace: "beta-team", secret: secretByPath.get("/run/secrets/workspace-beta") });
+      assert.equal(crossWorkspace.status, 403);
+      assert.deepEqual(await crossWorkspace.json(), { error: "team_grant_missing" });
+      // Cross-repository and foreign owner are refused exactly as without a ceiling.
+      const crossRepository = await request(origin, { body: { repository: "example-org/beta" } });
+      assert.equal(crossRepository.status, 403);
+      assert.deepEqual(await crossRepository.json(), { error: "team_grant_missing" });
+      const foreign = await request(origin, { body: { repository: "other-org/alpha" } });
+      assert.equal(foreign.status, 403);
+      assert.deepEqual(await foreign.json(), { error: "repository_denied" });
+      assert.equal(scopedMints.length, 2);
+    }, parsePolicy(contentsPolicyFixture()));
+  }
+
+  const noneMints = [];
+  await withLiveCoreServer(mintingFetch([], teamGrantFetch({ grant: null }), noneMints), async (origin) => {
+    const response = await request(origin);
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "team_grant_missing" });
+    assert.deepEqual(noneMints, []);
+  }, parsePolicy(contentsPolicyFixture()));
+
+  // Next to a contents-ceiling Workspace, a Workspace without a ceiling still mints its whole write
+  // tier and a read-ceiling Workspace still mints only reads.
+  for (const [ceiling, access, set] of [
+    [undefined, "write", { ...WRITE_SET, issues: "write", workflows: "write" }],
+    ["read", "read", { ...READ_SET, issues: "read" }],
+  ]) {
+    const fixture = contentsPolicyFixture({ contentsWorkspace: 1 });
+    if (ceiling !== undefined) fixture.workspaces[0].permission_ceiling = ceiling;
+    const mints = [];
+    await withLiveCoreServer(mintingFetch([], teamGrantFetch(), mints), async (origin) => {
+      const response = await request(origin);
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).access, access);
+      assert.deepEqual(mints, [set]);
+    }, parsePolicy(fixture));
+  }
+});
+
+test("policy check prints the contents-ceiling sets and a CEILING column, and live rows keep the grant's tier", async () => {
+  assert.equal(
+    formatPolicySummary(parsePolicy(contentsPolicyFixture())),
+    [
+      "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
+      "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write issues=write members=read pull_requests=write workflows=write",
+      "read tier (pull/triage grant) asks for: actions=read checks=read contents=read issues=write members=read pull_requests=read",
+      "contents ceiling (push/maintain/admin grant of a CEILING contents Workspace) asks for: contents=write",
+      "contents ceiling (pull/triage grant of a CEILING contents Workspace) asks for: contents=read",
+      "WORKSPACE   TEAM_ID  TEAM_SLUG   CEILING",
+      "alpha-team  4001     alpha-team  contents",
+      "beta-team   4002     -           -",
+      "",
+    ].join("\n"),
+  );
+  // Next to a read ceiling both ceilings print their sets; with no uncapped Workspace the two tier lines go.
+  assert.equal(
+    formatPolicySummary(parsePolicy(contentsPolicyFixture({ readWorkspace: 1 }))),
+    [
+      "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
+      "read ceiling (any grant of a CEILING read Workspace) asks for: actions=read checks=read contents=read issues=read members=read pull_requests=read",
+      "contents ceiling (push/maintain/admin grant of a CEILING contents Workspace) asks for: contents=write",
+      "contents ceiling (pull/triage grant of a CEILING contents Workspace) asks for: contents=read",
+      "WORKSPACE   TEAM_ID  TEAM_SLUG   CEILING",
+      "alpha-team  4001     alpha-team  contents",
+      "beta-team   4002     -           read",
+      "",
+    ].join("\n"),
+  );
+
+  // Live rows keep the tier of the grant: under the contents ceiling `write` means contents: write.
+  const policy = parsePolicy(contentsPolicyFixture());
+  const page = [
+    { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions: { pull: true, push: true } },
+    { id: 3004, full_name: "example-org/handbook", owner: { id: 1001, login: "example-org" }, permissions: { pull: true } },
+  ];
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (url, init) => {
+      const path = new URL(url).pathname + new URL(url).search;
+      if (path === "/organizations/1001/team/4001/repos?per_page=100&page=1") return jsonResponse(page);
+      return teamGrantFetch()(url, init);
+    },
+  });
+  const rows = await github.readWorkspaceTeamGrants(policy, policy.workspaces[0]);
+  assert.equal(
+    formatPolicyCheckTable(rows),
+    [
+      "WORKSPACE   TEAM_ID  TEAM_SLUG   REPOSITORY_ID  REPOSITORY            ROLE   ACCESS  STATUS  DETAIL",
+      "alpha-team  4001     alpha-team  3001           example-org/alpha     write  write   ok",
+      "alpha-team  4001     alpha-team  3004           example-org/handbook  read   read    ok",
+      "1 Workspaces checked, 1 Teams ok, 0 refused; 2 repository grants (1 write, 1 read)",
+      "",
+    ].join("\n"),
+  );
 });

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import http from "node:http";
 
 import {
+  CONTENTS_CEILING,
   MAX_BODY_BYTES,
   READ_ACCESS,
   READ_CEILING,
@@ -203,17 +204,20 @@ function formatHostsSummary(hosts) {
  * Offline summary of the parsed Team binding and of the exact permission set each access tier
  * mints under this policy; no GitHub traffic and no secret. A policy whose Workspaces declare no
  * permission ceiling prints exactly the two tier lines; a read ceiling adds the one set every
- * grant of such a Workspace mints and a CEILING column. OIDC purposes, when declared, follow.
+ * grant of such a Workspace mints, a contents ceiling the two sets its write and read grants mint,
+ * and either adds a CEILING column. OIDC purposes, when declared, follow.
  */
 export function formatPolicySummary(policy) {
   const uncapped = policy.workspaces.find((workspace) => workspace.permission_ceiling === undefined);
   const capped = policy.workspaces.find((workspace) => workspace.permission_ceiling === READ_CEILING);
-  const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG", ...(capped ? ["CEILING"] : [])];
+  const contentsOnly = policy.workspaces.find((workspace) => workspace.permission_ceiling === CONTENTS_CEILING);
+  const ceilingColumn = capped !== undefined || contentsOnly !== undefined;
+  const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG", ...(ceilingColumn ? ["CEILING"] : [])];
   const rows = policy.workspaces.map((workspace) => [
     workspace.id,
     String(workspace.github_team_id),
     workspace.github_team_slug ?? "-",
-    ...(capped ? [workspace.permission_ceiling ?? "-"] : []),
+    ...(ceilingColumn ? [workspace.permission_ceiling ?? "-"] : []),
   ]);
   const widths = header.map((title, column) => Math.max(title.length, ...rows.map((row) => row[column].length)));
   const line = (values) => values.map((value, column) => value.padEnd(widths[column])).join("  ").trimEnd();
@@ -227,6 +231,12 @@ export function formatPolicySummary(policy) {
       : []),
     ...(capped
       ? [`read ceiling (any grant of a CEILING read Workspace) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, capped))}`]
+      : []),
+    ...(contentsOnly
+      ? [
+          `contents ceiling (push/maintain/admin grant of a CEILING contents Workspace) asks for: ${formatPermissions(tokenPermissions(policy, WRITE_ACCESS, contentsOnly))}`,
+          `contents ceiling (pull/triage grant of a CEILING contents Workspace) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, contentsOnly))}`,
+        ]
       : []),
     ...(rows.length > 0 ? [line(header), ...rows.map(line)] : ["no Workspaces"]),
     ...formatOidcSummary(policy.oidc),
