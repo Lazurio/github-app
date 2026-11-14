@@ -139,14 +139,24 @@ export function tokenPermissions(policy, access, workspace) {
   return Object.freeze(permissions);
 }
 
+/** Whether `repositoryId` is the policy's host key repository (`conglomerate_hosts`, host.mjs). */
+function isHostKeyRepository(policy, repositoryId) {
+  return policy.conglomerate_hosts !== undefined && policy.conglomerate_hosts.repository_id === repositoryId;
+}
+
 /**
- * Maps a live Team grant role to the access tier it mints for `workspace`; undefined means no usable
- * grant. A Workspace with a read permission ceiling gets the read tier for every usable grant, so a
- * Team that is later given push still mints nothing but reads. A contents ceiling keeps the tier of
- * the grant: it narrows the permission set (see tokenPermissions), never the level.
+ * Maps a live Team grant role on `repositoryId` to the access tier it mints for `workspace` of
+ * `policy`; undefined means no usable grant. A Workspace with a read permission ceiling gets the read
+ * tier for every usable grant, so a Team that is later given push still mints nothing but reads. A
+ * contents ceiling keeps the tier of the grant: it narrows the permission set (see tokenPermissions),
+ * never the level, except on the policy's host key repository. A key document written there obtains
+ * a host token with `members: read`, so every token that can write it must carry `members: read`
+ * (host.mjs); the contents ceiling's write set never does, so there every grant mints the read tier.
  */
-function grantAccess(role, workspace) {
-  const ceiling = workspace.permission_ceiling === READ_CEILING;
+function grantAccess(role, workspace, policy, repositoryId) {
+  const ceiling =
+    workspace.permission_ceiling === READ_CEILING ||
+    (workspace.permission_ceiling === CONTENTS_CEILING && isHostKeyRepository(policy, repositoryId));
   if (role === "admin" || role === "maintain" || role === "write") return ceiling ? READ_ACCESS : WRITE_ACCESS;
   if (role === "triage" || role === "read") return READ_ACCESS;
   return undefined;
@@ -987,7 +997,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       deny(`repository ${coordinate.full_name} belongs to another owner than the policy's Organization`);
     }
     const role = grantRole(grant?.permissions);
-    const access = grantAccess(role, workspace);
+    const access = grantAccess(role, workspace, policy, grant?.id);
     const returned = parseRepositoryCoordinate(grant?.full_name);
     if (
       grant?.owner?.id !== policy.github_owner.id ||
@@ -1068,7 +1078,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
         if (!Array.isArray(repositories)) fail("GitHub returned an invalid Team repository list");
         for (const repository of repositories) {
           const role = grantRole(repository?.permissions);
-          const access = grantAccess(role, workspace);
+          const access = grantAccess(role, workspace, policy, repository?.id);
           const coordinate = parseRepositoryCoordinate(repository?.full_name);
           if (
             repository?.owner?.id !== policy.github_owner.id ||
@@ -1163,6 +1173,16 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
 
   async function mintToken(policy, workspace, repositoryId, access) {
     const requested = tokenPermissions(policy, access, workspace);
+    // The Team gate already selects the read tier there for a contents-ceiling Workspace; a gate
+    // that lost that rule fails closed here instead of minting such a write (see grantAccess).
+    if (
+      isHostKeyRepository(policy, repositoryId) &&
+      requested.contents === "write" &&
+      requested.members !== "read" &&
+      requested.members !== "write"
+    ) {
+      fail(`Workspace ${workspace.id} never writes the host key repository without members: read`);
+    }
     const result = await mintScopedToken(policy, repositoryId, requested);
     return { token: result.token, expires_at: result.expires_at, repository_id: repositoryId, access };
   }

@@ -2351,3 +2351,88 @@ test("policy check prints the contents-ceiling sets and a CEILING column, and li
     ].join("\n"),
   );
 });
+
+/** contentsPolicyFixture whose host key repository (`conglomerate_hosts`) is alpha unless `repositoryId` says otherwise. */
+function contentsHostsPolicyFixture({ repositoryId = 3001, contentsWorkspace = 0 } = {}) {
+  return {
+    ...contentsPolicyFixture({ contentsWorkspace }),
+    conglomerate_hosts: {
+      audience: "https://github-broker.example.com",
+      repository_id: repositoryId,
+      ref: "main",
+      directory: "access/conglomerate-hosts",
+      approved_writers: [],
+      key_ref_protection: "none",
+    },
+  };
+}
+
+test("a contents-ceiling Workspace mints only the read tier on the host key repository, whatever its grant", async () => {
+  const privateKey = testPrivateKey();
+  const pushGrant = teamGrantFetch();
+  const onKeys = parsePolicy(contentsHostsPolicyFixture());
+  const uncapped = parsePolicy(contentsHostsPolicyFixture({ contentsWorkspace: 1 }));
+  const elsewhere = parsePolicy(contentsHostsPolicyFixture({ repositoryId: 3999 }));
+  const gate = createGithubClient({ appId: "42", privateKey, fetchImpl: pushGrant });
+
+  // A key document written there obtains members: read, which the contents write set never carries.
+  for (const target of [{ repository: "example-org/alpha" }, { repository_id: 3001 }]) {
+    const grant = await gate.verifyTeamGrant(onKeys, onKeys.workspaces[0], target);
+    assert.deepEqual([grant.role, grant.access], ["write", "read"]);
+  }
+  // The write tier, which carries members: read, keeps writing it; elsewhere the contents ceiling writes.
+  assert.equal((await gate.verifyTeamGrant(uncapped, uncapped.workspaces[0], { repository: "example-org/alpha" })).access, "write");
+  assert.equal((await gate.verifyTeamGrant(elsewhere, elsewhere.workspaces[0], { repository: "example-org/alpha" })).access, "write");
+
+  // A gate that lost the rule fails closed before GitHub is asked; the other mints are unchanged.
+  const requests = [];
+  const github = createGithubClient({
+    appId: "42",
+    privateKey,
+    fetchImpl: async (_url, init) => {
+      const { permissions } = JSON.parse(init.body);
+      requests.push(permissions);
+      return jsonResponse({
+        token: "ghs_scoped_synthetic_token",
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: 3001 }],
+        permissions: { ...permissions, metadata: "read" },
+      });
+    },
+  });
+  await assert.rejects(
+    () => github.mintToken(onKeys, onKeys.workspaces[0], 3001, "write"),
+    /never writes the host key repository without members: read/,
+  );
+  assert.deepEqual(requests, []);
+  assert.equal((await github.mintToken(onKeys, onKeys.workspaces[0], 3001, "read")).access, "read");
+  assert.equal((await github.mintToken(uncapped, uncapped.workspaces[0], 3001, "write")).access, "write");
+  assert.equal((await github.mintToken(elsewhere, elsewhere.workspaces[0], 3001, "write")).access, "write");
+  assert.deepEqual(requests, [CONTENTS_READ_SET, { ...WRITE_SET, issues: "write", workflows: "write" }, CONTENTS_WRITE_SET]);
+
+  // End to end, a push grant on the host key repository mints contents: read.
+  const scopedMints = [];
+  await withLiveCoreServer(mintingFetch([], pushGrant, scopedMints), async (origin) => {
+    const response = await request(origin);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).access, "read");
+    assert.deepEqual(scopedMints, [CONTENTS_READ_SET]);
+  }, onKeys);
+
+  // policy check --live shows the live role next to the read tier on that repository only.
+  const rows = await createGithubClient({
+    appId: "42",
+    privateKey,
+    fetchImpl: async (url, init) => {
+      const path = new URL(url).pathname + new URL(url).search;
+      if (path === "/organizations/1001/team/4001/repos?per_page=100&page=1") {
+        return jsonResponse([
+          { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions: { pull: true, push: true } },
+          { id: 3004, full_name: "example-org/handbook", owner: { id: 1001, login: "example-org" }, permissions: { pull: true, push: true } },
+        ]);
+      }
+      return pushGrant(url, init);
+    },
+  }).readWorkspaceTeamGrants(onKeys, onKeys.workspaces[0]);
+  assert.deepEqual(rows.map(({ repository_id, role, access }) => [repository_id, role, access]), [[3001, "write", "read"], [3004, "write", "write"]]);
+});
