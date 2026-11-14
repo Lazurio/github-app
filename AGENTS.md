@@ -23,9 +23,13 @@ dependency-light and customer-neutral.
    reviewed policy declares that the installation accepted that permission. A
    Workspace whose policy declares `permission_ceiling: "read"` mints only the
    read tier with every permission lowered to `read`, so its tokens carry no
-   write permission. A mint without an explicit tier or a Workspace of the
-   policy fails, and so does any set that asks for a permission or level the
-   installation has not accepted. A token of a GitHub Actions OIDC purpose is
+   write permission. A Workspace whose policy declares
+   `permission_ceiling: "contents"` (since `0.16.0`) mints exactly
+   `contents: write` for the write tier and exactly `contents: read` for the
+   read tier, never an opt-in, so its tokens carry no Actions, Checks, issue,
+   membership, pull request or workflow permission. A mint without an explicit
+   tier or a Workspace of the policy fails, and so does any set that asks for
+   a permission or level the installation has not accepted. A token of a GitHub Actions OIDC purpose is
    limited to the purpose's one repository and its exact reviewed permission
    set (plus `metadata: read`), which the parser checks against the
    installation's accepted permissions; a rule that admits an event other than
@@ -57,7 +61,9 @@ dependency-light and customer-neutral.
    exact repository, failing closed with `team_grant_missing`. The grant's
    role selects the tier: `push`, `maintain` or `admin` mints the write tier,
    `pull` or `triage` the read tier; a Workspace's read ceiling turns every
-   usable grant into the read tier and never creates access. The live Team
+   usable grant into the read tier, a contents ceiling keeps the grant's tier
+   except on the policy's `conglomerate_hosts` repository, where it selects
+   the read tier, and neither ceiling creates access. The live Team
    grant is the scope: the policy holds no repository list or tier and never
    narrows or widens which repositories it reaches.
    Nothing from that readback is cached; the policy, the Dashboard and any
@@ -118,7 +124,9 @@ dependency-light and customer-neutral.
     plan without rulesets on private repositories, such Apps remain an
     accepted, stated precondition, never described as checked. This App's
     own tokens that can write that repository must already carry
-    `members: read`: the Workspace write tier always does, and the parser
+    `members: read`: the Workspace write tier always does, a contents-ceiling
+    Workspace gets only the read tier there (its Team gate selects it and its
+    mint refuses the write set), and the parser
     refuses a policy whose OIDC purpose could mint `contents: write` on it
     without `members: read`. Such a writer can still leave a key document
     that outlives its own token or grant; the product owner accepted that on
@@ -150,6 +158,14 @@ public repositories ([#23](https://github.com/Lazurio/github-app/issues/23)): ne
 including a read-ceiling token, as unable to open issues or as writing nothing
 on GitHub. The read tier's `actions: read` likewise reads more than
 check status: it also reads the repository's workflow run logs and artifacts.
+
+`contents: write` is likewise GitHub's whole contents permission, also under
+the contents ceiling: it pushes, force-pushes and deletes every branch no
+ruleset or branch protection protects, creates and deletes tags and releases,
+and creates `repository_dispatch` events, and a push or such an event runs
+the repository's workflows. Never describe a contents-ceiling token as
+limited to one branch or to fast-forward pushes, or as unable to start
+workflows.
 
 Describe an OIDC purpose's permissions exactly as GitHub defines them, and say
 which of them a live probe has not proven yet. `contents: write` on a

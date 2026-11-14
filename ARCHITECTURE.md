@@ -12,8 +12,8 @@ deployment-owned policy binds:
 - one installation id, its repository selection mode and the exact accepted
   permission set;
 - each immutable Workspace id to exactly one immutable GitHub Team id, a
-  separate deployment credential reference and an optional read permission
-  ceiling; and
+  separate deployment credential reference and an optional permission
+  ceiling (`read`, or since `0.16.0` `contents`); and
 - optionally, the OIDC purposes: this broker's audience, the Deployment Repos
   by immutable repository and owner id, and per purpose its one repository,
   optional callers among those Deployment Repos, workflow file, admission
@@ -25,9 +25,9 @@ Organization on which the Workspace's Team holds any repository grant at the
 moment of a request, and the grant's role selects the tier. A `push`,
 `maintain` or `admin` grant mints the write tier; a `pull` or `triage` grant
 mints the read tier. The policy never narrows the scope below GitHub. Its
-only narrowing is the optional per-Workspace `permission_ceiling: "read"`,
-described below, which lowers the permissions of that Workspace's tokens and
-never changes which repositories it reaches. An
+only narrowing is the optional per-Workspace `permission_ceiling` (`"read"` or
+`"contents"`), described below, which lowers the permissions of that
+Workspace's tokens and never changes which repositories it reaches. An
 Organization that wants a narrower scope for a Team Environment does it with
 GitHub Team grants: it grants that Team only the repositories the Environment
 should reach, at the role it should have, or binds the Environment to a
@@ -59,11 +59,15 @@ its tier, and refuses a response with any other scope or any other repository:
   policy declares that the installation accepted it;
 - read tier of a Workspace with `permission_ceiling: "read"`: the read tier
   with every permission lowered to `read`, so an accepted `issues: write`
-  becomes `issues: read`.
+  becomes `issues: read`;
+- a Workspace with `permission_ceiling: "contents"`: exactly
+  `contents: write` for the write tier and exactly `contents: read` for the
+  read tier, never an opt-in.
 
 Before asking GitHub, the runtime refuses any set that asks for a permission
-or level the installation has not accepted, and any write tier for a
-Workspace with a read ceiling; the installation gate itself stays an exact
+or level the installation has not accepted, any write tier for a Workspace
+with a read ceiling, and a contents write set for the policy's
+`conglomerate_hosts` repository; the installation gate itself stays an exact
 comparison.
 
 GitHub adds `metadata: read` to both. `members: read` lets an Environment
@@ -130,6 +134,36 @@ refused issue creation in public repositories there, so a Workspace used by
 untrusted people must decide at the Workspace whether it receives a token at
 all.
 
+A Workspace that reads and writes nothing but repository contents, such as a
+production applications host that pushes its applications' data, declares
+`permission_ceiling: "contents"` (since `0.16.0`). Its Team gate keeps the
+tier of each grant, with one exception below, and each tier asks for
+repository contents only:
+`contents: write` or `contents: read`, plus GitHub's `metadata: read`, with no
+opt-in whatever the installation accepted. Its tokens therefore carry no
+permission for pull requests, issues, check runs, workflow runs, workflow
+files or Organization membership (opening an issue in a public repository,
+above, is GitHub's exception for every token). `contents: write` stays GitHub's whole
+contents permission: it pushes, force-pushes and deletes every unprotected
+branch and creates tags, releases and `repository_dispatch` events, and a
+push or such an event runs the workflows that listen for it. Keeping writes
+to one branch or to fast-forward pushes is the caller's part, or a ruleset's
+where the plan offers rulesets. One repository is the exception: on the
+policy's `conglomerate_hosts` repository every grant of such a Workspace
+mints the read tier, because a key document written there obtains
+`members: read` (see [Conglomerate Host callers](#conglomerate-host-callers)),
+and the mint refuses that write set there as a second check. Brokers from
+`0.12.0` to `0.15.x` refuse a policy with this value as a whole and older
+brokers ignore the key and mint the uncapped tiers, so it is deployed only
+with `0.16.0` or later.
+
+The ceiling bounds each token, not who uses the Workspace's credential. Its
+first user, a production applications host, runs all of its applications
+under one account with one credential, so an application of that host can
+push, through the host's data service, to the data repository of any other
+writing application of the same host. Nothing reaches a repository the Team
+holds no grant on, and a read grant never pushes.
+
 `workflows: write` lets a Workspace push commits that change
 `.github/workflows/`. Editing a workflow does not by itself run it or hand it
 secrets, but a workflow it writes can, in an eligible run, reference and
@@ -154,8 +188,8 @@ different Team for the broker.
 
 The live GitHub Team-to-repository grants are the only grant authority and the
 whole scope: the policy never grants anything GitHub has not granted and never
-narrows which repositories GitHub has granted; a read ceiling only lowers the
-tier. A request names its repository either as
+narrows which repositories GitHub has granted; a permission ceiling only
+lowers the tier or narrows its set. A request names its repository either as
 `Owner/name` or, for adapters released before `0.10.0`, as an immutable id. A
 name whose owner is not the policy's Organization login is refused with
 `403 repository_denied` before any GitHub traffic. Otherwise, after the
@@ -169,7 +203,8 @@ the one-repository token of the grant's tier for the repository id GitHub
 returned. The returned `owner.id` must equal the policy's Organization id.
 `admin`, `maintain` or `push` selects the write tier, `triage` or `pull` the
 read tier, and a Workspace's read ceiling turns every one of them into the
-read tier. A missing Team, an identity that differs from the policy
+read tier, as a contents ceiling does on the policy's `conglomerate_hosts`
+repository. A missing Team, an identity that differs from the policy
 assertions, a missing grant or one without any of these roles, a repository
 the installation cannot see or, for the id form, a returned id that differs
 from the requested id is refused with `403 team_grant_missing`; a GitHub
@@ -202,9 +237,9 @@ service for other Workspaces; it is refused per request.
 
 `policy check --live` runs the installation gate and then, per Workspace,
 verifies the Team identity and lists the Team's live repository grants with
-the tier each one mints, after any read ceiling, next to the live role.
+the tier each one mints, after any ceiling, next to the live role.
 Without `--live` it prints the exact permission set each tier asks for under
-the policy and, when a Workspace declares a read ceiling, that set and a
+the policy and, when a Workspace declares a ceiling, its sets and a
 `CEILING` column. It is the migration and readback gate an
 operator runs before deploying a policy or lowering Team grants. The
 repository rows are information; the command exits non-zero only on a missing
@@ -451,9 +486,10 @@ a Deployment Repo:
   every key change stays in history, also against an Owner or this App.
   This App itself is a bypass actor of the update ruleset, so every token it
   mints that can write the repository is a writer too: the Workspace write
-  tier always carries `members: read`, and the parser refuses a policy with
-  an OIDC purpose that could mint `contents: write` on the key repository
-  without `members: read`. Such a writer holds `members: read` already, but
+  tier always carries `members: read`, a Workspace with the contents ceiling
+  mints only `contents: read` on the key repository, and the parser refuses a
+  policy with an OIDC purpose that could mint `contents: write` on the key
+  repository without `members: read`. Such a writer holds `members: read` already, but
   only while its token or grant lasts: a key document it wrote keeps minting
   after that, because the broker checks the current writers, never who wrote
   a document. The product owner accepted this durable access on 2026-11-03
@@ -495,6 +531,11 @@ What remains:
   caller's default branch can read all of it, not only the file its runner
   needs. Removing the caller, or the purpose, stops it at the next request.
 - Audit lines name the workflow's actor and are kept by the deployment owner.
+- A Workspace credential is one identity for whatever uses it. A production
+  applications host keeps one for all of its applications, which run under
+  one account, so any of them can push, through the host's data service, to
+  the data repository of another writing application of that host, within
+  the Team's grants and the contents ceiling.
 
 ## What this service does not do
 

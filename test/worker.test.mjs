@@ -517,3 +517,88 @@ test("Worker with the real core: a read-ceiling Workspace mints only reads; the 
   assert.equal(invalid.status, 503);
   assert.deepEqual(await invalid.json(), { error: "configuration_unavailable" });
 });
+
+test("Worker with the real core: a contents-ceiling Workspace mints contents only; the other Workspace keeps its tiers", async () => {
+  const fixture = policyFixture();
+  fixture.installation_permissions = {
+    ...fixture.installation_permissions,
+    administration: "read",
+    issues: "write",
+    organization_plan: "read",
+    workflows: "write",
+  };
+  fixture.workspaces[0].permission_ceiling = "contents";
+  // alpha's Team holds push on alpha and pull on handbook; beta's Team holds push on alpha.
+  const grants = {
+    "4001/alpha": { id: 3001, full_name: "example-org/alpha", permissions: { pull: true, push: true } },
+    "4001/handbook": { id: 3004, full_name: "example-org/handbook", permissions: { pull: true } },
+    "4002/alpha": { id: 3001, full_name: "example-org/alpha", permissions: { pull: true, push: true } },
+  };
+  const scopedMints = [];
+  const github = async (url, init) => {
+    const path = new URL(url).pathname;
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    if (path === "/app/installations/2001" && init.method === "GET") {
+      return Response.json({
+        app_id: 42,
+        app_slug: "example-app",
+        account: { id: 1001, login: "example-org" },
+        target_type: "Organization",
+        repository_selection: "selected",
+        permissions: fixture.installation_permissions,
+      });
+    }
+    if (path === "/app/installations/2001/access_tokens" && !body.repository_ids) return Response.json({ token: "ghs_probe" });
+    if (path === "/app/installations/2001/access_tokens") {
+      scopedMints.push(body.permissions);
+      return Response.json({
+        token: "ghs_scoped_synthetic",
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: body.repository_ids[0] }],
+        permissions: { ...body.permissions, metadata: "read" },
+      });
+    }
+    const team = path.match(/^\/organizations\/1001\/team\/(4001|4002)$/);
+    if (team) return Response.json({ id: Number(team[1]), slug: `team-${team[1]}`, organization: { id: 1001, login: "example-org" } });
+    const grant = path.match(/^\/organizations\/1001\/team\/(400[12])\/repos\/example-org\/([a-z]+)$/);
+    if (grant) {
+      const entry = grants[`${grant[1]}/${grant[2]}`];
+      return entry
+        ? Response.json({ ...entry, owner: { id: 1001, login: "example-org" } })
+        : Response.json({ message: "Not Found" }, { status: 404 });
+    }
+    if (path === "/installation/token" && init.method === "DELETE") return new Response(null, { status: 204 });
+    throw new Error(`unexpected request ${init.method} ${path}`);
+  };
+  const worker = createWorkerEntrypoint({
+    createGithub: ({ appId }) => createGithubClient({ appId, signJwt: async () => "c2lnbmF0dXJl", fetchImpl: github }),
+  });
+  const env = environment({ BROKER_POLICY_JSON: JSON.stringify(fixture) });
+
+  const pushGrant = await worker.fetch(tokenRequest(), env);
+  assert.equal(pushGrant.status, 200);
+  assert.equal((await pushGrant.json()).access, "write");
+  const readGrant = await worker.fetch(tokenRequest({ body: { repository: "example-org/handbook" } }), env);
+  assert.equal(readGrant.status, 200);
+  assert.equal((await readGrant.json()).access, "read");
+  const uncapped = await worker.fetch(tokenRequest({ workspace: "beta-team", credential: BETA_CREDENTIAL }), env);
+  assert.equal(uncapped.status, 200);
+  assert.equal((await uncapped.json()).access, "write");
+  assert.deepEqual(scopedMints, [
+    { contents: "write" },
+    { contents: "read" },
+    { actions: "write", checks: "read", contents: "write", issues: "write", members: "read", pull_requests: "write", workflows: "write" },
+  ]);
+
+  // Cross-repository: no grant of alpha's Team, no mint.
+  const noGrant = await worker.fetch(tokenRequest({ body: { repository: "example-org/gamma" } }), env);
+  assert.equal(noGrant.status, 403);
+  assert.deepEqual(await noGrant.json(), { error: "team_grant_missing" });
+  assert.equal(scopedMints.length, 3);
+
+  // A miscased or unknown ceiling is a configuration error, never an ignored key.
+  fixture.workspaces[0].permission_ceiling = "Contents";
+  const invalid = await worker.fetch(tokenRequest(), environment({ BROKER_POLICY_JSON: JSON.stringify(fixture) }));
+  assert.equal(invalid.status, 503);
+  assert.deepEqual(await invalid.json(), { error: "configuration_unavailable" });
+});

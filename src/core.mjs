@@ -25,7 +25,7 @@ const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
 const V3_MIGRATION =
   "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.15.0";
+const USER_AGENT = "lazurio-github-app-broker/0.16.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
 const MAX_HOST_ADMISSION_PAGES = 10;
@@ -65,8 +65,27 @@ const READ_TOKEN_PERMISSIONS = Object.freeze({
   pull_requests: "read",
 });
 
-/** The only `workspaces[].permission_ceiling` value: every token of the Workspace is read-only. */
+/** `workspaces[].permission_ceiling: "read"`: every token of the Workspace is read-only. */
 export const READ_CEILING = "read";
+
+/**
+ * `workspaces[].permission_ceiling: "contents"` (since 0.16.0): every token of the Workspace
+ * carries repository contents only, at the level the Team gate selects for its live grant (see
+ * grantAccess for the one repository where that is always read). It is meant for a
+ * Workspace that reads and writes nothing but repository contents, such as a production
+ * applications host.
+ */
+export const CONTENTS_CEILING = "contents";
+
+const PERMISSION_CEILINGS = Object.freeze([READ_CEILING, CONTENTS_CEILING]);
+
+/**
+ * The two exact sets of a contents-ceiling Workspace (plus GitHub's automatic `metadata: read`).
+ * No opt-in reaches them, so such a token never carries an Actions, Checks, issue, membership,
+ * pull request or workflow permission.
+ */
+const CONTENTS_WRITE_TOKEN_PERMISSIONS = Object.freeze({ contents: "write" });
+const CONTENTS_READ_TOKEN_PERMISSIONS = Object.freeze({ contents: "read" });
 
 const PERMISSION_LEVELS = Object.freeze({ read: 1, write: 2 });
 
@@ -84,13 +103,22 @@ const PERMISSION_LEVELS = Object.freeze({ read: 1, write: 2 });
  * write of any kind. A write tier for such a Workspace is refused, never silently lowered here; the
  * Team gate already selects the read tier for it. Any set that asks for a permission or level the
  * installation has not accepted is refused before GitHub is asked.
+ *
+ * A Workspace with `permission_ceiling: "contents"` keeps the tier the Team gate selects for its
+ * grant (see grantAccess) and asks for repository contents only, at that level: `contents: write`
+ * for the write tier and `contents: read` for the read tier. Neither opt-in reaches it, whatever
+ * the installation accepted.
  */
 export function tokenPermissions(policy, access, workspace) {
   if (!policy.workspaces.includes(workspace)) fail("token permissions need a Workspace of the policy");
   const accepted = policy.installation_permissions;
   const issues = accepted.issues === "write" ? { issues: "write" } : {};
   let permissions;
-  if (access === WRITE_ACCESS) {
+  if (workspace.permission_ceiling === CONTENTS_CEILING) {
+    if (access === WRITE_ACCESS) permissions = { ...CONTENTS_WRITE_TOKEN_PERMISSIONS };
+    else if (access === READ_ACCESS) permissions = { ...CONTENTS_READ_TOKEN_PERMISSIONS };
+    else fail("token access tier must be read or write");
+  } else if (access === WRITE_ACCESS) {
     if (workspace.permission_ceiling === READ_CEILING) {
       fail(`Workspace ${workspace.id} permission ceiling is read; it never mints the write tier`);
     }
@@ -113,13 +141,24 @@ export function tokenPermissions(policy, access, workspace) {
   return Object.freeze(permissions);
 }
 
+/** Whether `repositoryId` is the policy's host key repository (`conglomerate_hosts`, host.mjs). */
+function isHostKeyRepository(policy, repositoryId) {
+  return policy.conglomerate_hosts !== undefined && policy.conglomerate_hosts.repository_id === repositoryId;
+}
+
 /**
- * Maps a live Team grant role to the access tier it mints for `workspace`; undefined means no usable
- * grant. A Workspace with a read permission ceiling gets the read tier for every usable grant, so a
- * Team that is later given push still mints nothing but reads.
+ * Maps a live Team grant role on `repositoryId` to the access tier it mints for `workspace` of
+ * `policy`; undefined means no usable grant. A Workspace with a read permission ceiling gets the read
+ * tier for every usable grant, so a Team that is later given push still mints nothing but reads. A
+ * contents ceiling keeps the tier of the grant: it narrows the permission set (see tokenPermissions),
+ * never the level, except on the policy's host key repository. A key document written there obtains
+ * a host token with `members: read`, so every token that can write it must carry `members: read`
+ * (host.mjs); the contents ceiling's write set never does, so there every grant mints the read tier.
  */
-function grantAccess(role, workspace) {
-  const ceiling = workspace.permission_ceiling === READ_CEILING;
+function grantAccess(role, workspace, policy, repositoryId) {
+  const ceiling =
+    workspace.permission_ceiling === READ_CEILING ||
+    (workspace.permission_ceiling === CONTENTS_CEILING && isHostKeyRepository(policy, repositoryId));
   if (role === "admin" || role === "maintain" || role === "write") return ceiling ? READ_ACCESS : WRITE_ACCESS;
   if (role === "triage" || role === "read") return READ_ACCESS;
   return undefined;
@@ -641,8 +680,8 @@ export function parsePolicy(raw) {
     }
     // Optional and absent by default: a Workspace without it mints exactly what its live grant selects.
     const ceiling = workspace?.permission_ceiling;
-    if (ceiling !== undefined && ceiling !== READ_CEILING) {
-      fail(`workspaces[${index}].permission_ceiling must be "${READ_CEILING}" when present`);
+    if (ceiling !== undefined && !PERMISSION_CEILINGS.includes(ceiling)) {
+      fail(`workspaces[${index}].permission_ceiling must be "${READ_CEILING}" or "${CONTENTS_CEILING}" when present`);
     }
     return Object.freeze({
       id,
@@ -960,7 +999,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
       deny(`repository ${coordinate.full_name} belongs to another owner than the policy's Organization`);
     }
     const role = grantRole(grant?.permissions);
-    const access = grantAccess(role, workspace);
+    const access = grantAccess(role, workspace, policy, grant?.id);
     const returned = parseRepositoryCoordinate(grant?.full_name);
     if (
       grant?.owner?.id !== policy.github_owner.id ||
@@ -1041,7 +1080,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
         if (!Array.isArray(repositories)) fail("GitHub returned an invalid Team repository list");
         for (const repository of repositories) {
           const role = grantRole(repository?.permissions);
-          const access = grantAccess(role, workspace);
+          const access = grantAccess(role, workspace, policy, repository?.id);
           const coordinate = parseRepositoryCoordinate(repository?.full_name);
           if (
             repository?.owner?.id !== policy.github_owner.id ||
@@ -1136,6 +1175,16 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
 
   async function mintToken(policy, workspace, repositoryId, access) {
     const requested = tokenPermissions(policy, access, workspace);
+    // The Team gate already selects the read tier there for a contents-ceiling Workspace; a gate
+    // that lost that rule fails closed here instead of minting such a write (see grantAccess).
+    if (
+      isHostKeyRepository(policy, repositoryId) &&
+      requested.contents === "write" &&
+      requested.members !== "read" &&
+      requested.members !== "write"
+    ) {
+      fail(`Workspace ${workspace.id} never writes the host key repository without members: read`);
+    }
     const result = await mintScopedToken(policy, repositoryId, requested);
     return { token: result.token, expires_at: result.expires_at, repository_id: repositoryId, access };
   }
