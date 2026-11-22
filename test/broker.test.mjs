@@ -2436,3 +2436,166 @@ test("a contents-ceiling Workspace mints only the read tier on the host key repo
   }).readWorkspaceTeamGrants(onKeys, onKeys.workspaces[0]);
   assert.deepEqual(rows.map(({ repository_id, role, access }) => [repository_id, role, access]), [[3001, "write", "read"], [3004, "write", "write"]]);
 });
+
+/** contentsPolicyFixture whose contents-ceiling Workspace also declares `checks_read: true` (0.17.0). */
+function checksReadPolicyFixture(options = {}) {
+  const fixture = contentsPolicyFixture(options);
+  fixture.workspaces[options.contentsWorkspace ?? 0].checks_read = true;
+  return fixture;
+}
+
+const CONTENTS_CHECKS_READ_SET = { checks: "read", contents: "read" };
+
+test("policy accepts checks_read only as true on a contents-ceiling Workspace", () => {
+  const parsed = parsePolicy(checksReadPolicyFixture());
+  assert.equal(parsed.workspaces[0].checks_read, true);
+  assert.equal(Object.hasOwn(parsed.workspaces[1], "checks_read"), false);
+  assert.equal(Object.hasOwn(parsePolicy(contentsPolicyFixture()).workspaces[0], "checks_read"), false);
+  // Any other value, or the opt-in on a Workspace without the contents ceiling, fails closed.
+  for (const value of [false, "true", 1, null, ["checks"], { checks: "read" }]) {
+    const fixture = checksReadPolicyFixture();
+    fixture.workspaces[0].checks_read = value;
+    assert.throws(
+      () => parsePolicy(fixture),
+      /workspaces\[0\]\.checks_read must be true and needs permission_ceiling "contents" when present/,
+      JSON.stringify(value),
+    );
+  }
+  for (const ceiling of [undefined, "read"]) {
+    const fixture = policyFixture();
+    if (ceiling !== undefined) fixture.workspaces[0].permission_ceiling = ceiling;
+    fixture.workspaces[0].checks_read = true;
+    assert.throws(
+      () => parsePolicy(fixture),
+      /workspaces\[0\]\.checks_read must be true and needs permission_ceiling "contents" when present/,
+      String(ceiling),
+    );
+  }
+});
+
+test("checks_read adds checks: read to the contents read tier only, never to the write tier or the host key repository", () => {
+  const policy = parsePolicy(checksReadPolicyFixture());
+  const [alpha, beta] = policy.workspaces;
+  assert.deepEqual(tokenPermissions(policy, "read", alpha), CONTENTS_CHECKS_READ_SET);
+  assert.deepEqual(tokenPermissions(policy, "read", alpha, 3001), CONTENTS_CHECKS_READ_SET);
+  assert.deepEqual(tokenPermissions(policy, "write", alpha), CONTENTS_WRITE_SET);
+  assert.deepEqual(tokenPermissions(policy, "write", alpha, 3001), CONTENTS_WRITE_SET);
+  // The other Workspace of the policy is unchanged.
+  assert.deepEqual(tokenPermissions(policy, "write", beta), { ...WRITE_SET, issues: "write", workflows: "write" });
+  assert.deepEqual(tokenPermissions(policy, "read", beta), { ...READ_SET, issues: "write" });
+  // Without the opt-in the contents read tier is exactly as before.
+  const plain = parsePolicy(contentsPolicyFixture());
+  assert.deepEqual(tokenPermissions(plain, "read", plain.workspaces[0]), CONTENTS_READ_SET);
+  // On the host key repository, where the Team gate lowers every grant to the read tier, nothing is added.
+  const onKeys = parsePolicy({ ...contentsHostsPolicyFixture(), workspaces: checksReadPolicyFixture().workspaces });
+  assert.deepEqual(tokenPermissions(onKeys, "read", onKeys.workspaces[0], 3001), CONTENTS_READ_SET);
+  assert.deepEqual(tokenPermissions(onKeys, "read", onKeys.workspaces[0], 3002), CONTENTS_CHECKS_READ_SET);
+});
+
+test("checks_read refuses a policy whose installation has not accepted checks: read", () => {
+  // The installation permissions must include checks: read anyway; the opt-in never asks beyond them.
+  const fixture = checksReadPolicyFixture();
+  delete fixture.installation_permissions.checks;
+  assert.throws(() => parsePolicy(fixture), /installation_permissions must be exact/);
+});
+
+test("end to end: a checks_read Workspace mints contents and checks read for a pull grant and contents write only for a push grant; others mint nothing", async () => {
+  const grantOn = (permissions) => teamGrantFetch({
+    grant: { id: 3001, full_name: "example-org/alpha", owner: { id: 1001, login: "example-org" }, permissions },
+  });
+  for (const [permissions, access, set] of [
+    [{ admin: false, maintain: false, pull: true, push: false, triage: false }, "read", CONTENTS_CHECKS_READ_SET],
+    [{ admin: false, maintain: false, pull: true, push: false, triage: true }, "read", CONTENTS_CHECKS_READ_SET],
+    [{ admin: false, maintain: false, pull: true, push: true, triage: true }, "write", CONTENTS_WRITE_SET],
+  ]) {
+    const scopedMints = [];
+    await withLiveCoreServer(mintingFetch([], grantOn(permissions), scopedMints), async (origin) => {
+      const response = await request(origin, { body: { repository: "example-org/alpha" } });
+      assert.equal(response.status, 200, access);
+      assert.equal((await response.json()).access, access);
+      assert.deepEqual(scopedMints, [set]);
+      const crossWorkspace = await request(origin, { workspace: "beta-team", secret: secretByPath.get("/run/secrets/workspace-beta") });
+      assert.equal(crossWorkspace.status, 403);
+      assert.deepEqual(await crossWorkspace.json(), { error: "team_grant_missing" });
+      const crossRepository = await request(origin, { body: { repository: "example-org/beta" } });
+      assert.equal(crossRepository.status, 403);
+      assert.deepEqual(await crossRepository.json(), { error: "team_grant_missing" });
+      const foreign = await request(origin, { body: { repository: "other-org/alpha" } });
+      assert.equal(foreign.status, 403);
+      assert.deepEqual(await foreign.json(), { error: "repository_denied" });
+      assert.equal(scopedMints.length, 1);
+    }, parsePolicy(checksReadPolicyFixture()));
+  }
+
+  // A push grant on the host key repository is lowered to the read tier and gains no checks.
+  const keyMints = [];
+  const onKeys = parsePolicy({ ...contentsHostsPolicyFixture(), workspaces: checksReadPolicyFixture().workspaces });
+  await withLiveCoreServer(mintingFetch([], teamGrantFetch(), keyMints), async (origin) => {
+    const response = await request(origin);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).access, "read");
+    assert.deepEqual(keyMints, [CONTENTS_READ_SET]);
+  }, onKeys);
+});
+
+test("a checks_read mint refuses and revokes an answer with any other permission", async () => {
+  const now = 1_700_000_000_000;
+  const requests = [];
+  const revocations = [];
+  let responsePermissions;
+  const github = createGithubClient({
+    appId: "42",
+    privateKey: testPrivateKey(),
+    fetchImpl: async (url, init) => {
+      if (new URL(url).pathname === "/installation/token" && init.method === "DELETE") {
+        revocations.push(init.headers.Authorization);
+        return jsonResponse(null, 204);
+      }
+      requests.push(JSON.parse(init.body));
+      return jsonResponse({
+        token: `ghs_checks_synthetic_${requests.length}`,
+        expires_at: new Date(now + 60 * 60 * 1000).toISOString(),
+        repositories: [{ id: 3001 }],
+        permissions: responsePermissions,
+      });
+    },
+    now: () => now,
+  });
+  const policy = parsePolicy(checksReadPolicyFixture());
+  responsePermissions = { ...CONTENTS_CHECKS_READ_SET, metadata: "read" };
+  assert.equal((await github.mintToken(policy, policy.workspaces[0], 3001, "read")).access, "read");
+  assert.deepEqual(requests.at(-1), { repository_ids: [3001], permissions: CONTENTS_CHECKS_READ_SET });
+  for (const permissions of [
+    { contents: "read", metadata: "read" },
+    { checks: "write", contents: "read", metadata: "read" },
+    { checks: "read", contents: "write", metadata: "read" },
+    { checks: "read", contents: "read", metadata: "read", actions: "read" },
+    { checks: "read", contents: "read", metadata: "read", pull_requests: "read" },
+  ]) {
+    responsePermissions = permissions;
+    await assert.rejects(
+      () => github.mintToken(policy, policy.workspaces[0], 3001, "read"),
+      /outside the requested repository or permission scope/,
+      JSON.stringify(permissions),
+    );
+    assert.equal(revocations.at(-1), `Bearer ghs_checks_synthetic_${requests.length}`);
+  }
+  assert.equal(revocations.length, 5);
+});
+
+test("policy check prints the checks_read set on its own line and marks the Workspace in the CEILING column", () => {
+  assert.equal(
+    formatPolicySummary(parsePolicy(checksReadPolicyFixture())),
+    [
+      "lazurio.github_app_broker.policy.v3 owner=example-org installation=2001",
+      "write tier (push/maintain/admin grant) asks for: actions=write checks=read contents=write issues=write members=read pull_requests=write workflows=write",
+      "read tier (pull/triage grant) asks for: actions=read checks=read contents=read issues=write members=read pull_requests=read",
+      "contents ceiling (push/maintain/admin grant of a CEILING contents Workspace) asks for: contents=write",
+      "contents ceiling with checks_read (pull/triage grant, not on the conglomerate_hosts repository) asks for: checks=read contents=read",
+      "WORKSPACE   TEAM_ID  TEAM_SLUG   CEILING",
+      "alpha-team  4001     alpha-team  contents+checks_read",
+      "beta-team   4002     -           -",
+      "",
+    ].join("\n"),
+  );
+});

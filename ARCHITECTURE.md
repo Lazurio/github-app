@@ -62,7 +62,9 @@ its tier, and refuses a response with any other scope or any other repository:
   becomes `issues: read`;
 - a Workspace with `permission_ceiling: "contents"`: exactly
   `contents: write` for the write tier and exactly `contents: read` for the
-  read tier, never an opt-in.
+  read tier, never an installation opt-in. With `checks_read: true` (since
+  `0.17.0`) its read tier is `contents: read` and `checks: read`, except on
+  the policy's `conglomerate_hosts` repository.
 
 Before asking GitHub, the runtime refuses any set that asks for a permission
 or level the installation has not accepted, any write tier for a Workspace
@@ -140,9 +142,13 @@ production applications host that pushes its applications' data, declares
 tier of each grant, with one exception below, and each tier asks for
 repository contents only:
 `contents: write` or `contents: read`, plus GitHub's `metadata: read`, with no
-opt-in whatever the installation accepted. Its tokens therefore carry no
-permission for pull requests, issues, check runs, workflow runs, workflow
-files or Organization membership (opening an issue in a public repository,
+installation opt-in whatever the installation accepted. Its tokens therefore
+carry no permission for pull requests, issues, workflow runs, workflow files
+or Organization membership, and none for check runs unless the Workspace
+declares `checks_read: true` (since `0.17.0`): then its read tier also reads
+check runs, so an application host can verify a commit's checks before it
+deploys it, while its write tier and the `conglomerate_hosts` repository stay
+contents-only (opening an issue in a public repository,
 above, is GitHub's exception for every token). `contents: write` stays GitHub's whole
 contents permission: it pushes, force-pushes and deletes every unprotected
 branch and creates tags, releases and `repository_dispatch` events, and a

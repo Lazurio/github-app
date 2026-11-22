@@ -25,7 +25,7 @@ const RETIRED_POLICY_SCHEMA_V2 = "lazurio.github_app_broker.policy.v2";
 const V3_MIGRATION =
   "migrate to lazurio.github_app_broker.policy.v3 by deleting `repositories` and every `workspaces[].repository_ids`; the live Team grant is the scope";
 const GITHUB_API_VERSION = "2026-03-10";
-const USER_AGENT = "lazurio-github-app-broker/0.16.0";
+const USER_AGENT = "lazurio-github-app-broker/0.17.0";
 /** Upper bound for `policy check --live` Team repository pages (100 repositories per page). */
 const MAX_TEAM_REPOSITORY_PAGES = 100;
 const MAX_HOST_ADMISSION_PAGES = 10;
@@ -81,11 +81,13 @@ const PERMISSION_CEILINGS = Object.freeze([READ_CEILING, CONTENTS_CEILING]);
 
 /**
  * The two exact sets of a contents-ceiling Workspace (plus GitHub's automatic `metadata: read`).
- * No opt-in reaches them, so such a token never carries an Actions, Checks, issue, membership,
- * pull request or workflow permission.
+ * Neither installation opt-in reaches them, so such a token never carries an Actions, issue,
+ * membership, pull request or workflow permission. Its one Workspace opt-in, `checks_read: true`
+ * (since 0.17.0), adds `checks: read` to the read set only (see tokenPermissions).
  */
 const CONTENTS_WRITE_TOKEN_PERMISSIONS = Object.freeze({ contents: "write" });
 const CONTENTS_READ_TOKEN_PERMISSIONS = Object.freeze({ contents: "read" });
+const CONTENTS_CHECKS_READ_TOKEN_PERMISSIONS = Object.freeze({ checks: "read", contents: "read" });
 
 const PERMISSION_LEVELS = Object.freeze({ read: 1, write: 2 });
 
@@ -106,18 +108,24 @@ const PERMISSION_LEVELS = Object.freeze({ read: 1, write: 2 });
  *
  * A Workspace with `permission_ceiling: "contents"` keeps the tier the Team gate selects for its
  * grant (see grantAccess) and asks for repository contents only, at that level: `contents: write`
- * for the write tier and `contents: read` for the read tier. Neither opt-in reaches it, whatever
- * the installation accepted.
+ * for the write tier and `contents: read` for the read tier. Neither installation opt-in reaches
+ * it, whatever the installation accepted. With `checks_read: true` (since 0.17.0) its read tier
+ * asks for `contents: read` and `checks: read`, so an application host can verify a commit's check
+ * runs before it deploys it. The write tier never gains it, and neither does the read tier on the
+ * policy's host key repository (`repositoryId`), where the Team gate lowers every grant of such a
+ * Workspace to the read tier, so a push grant there gains nothing either.
  */
-export function tokenPermissions(policy, access, workspace) {
+export function tokenPermissions(policy, access, workspace, repositoryId) {
   if (!policy.workspaces.includes(workspace)) fail("token permissions need a Workspace of the policy");
   const accepted = policy.installation_permissions;
   const issues = accepted.issues === "write" ? { issues: "write" } : {};
   let permissions;
   if (workspace.permission_ceiling === CONTENTS_CEILING) {
     if (access === WRITE_ACCESS) permissions = { ...CONTENTS_WRITE_TOKEN_PERMISSIONS };
-    else if (access === READ_ACCESS) permissions = { ...CONTENTS_READ_TOKEN_PERMISSIONS };
-    else fail("token access tier must be read or write");
+    else if (access === READ_ACCESS) {
+      const checks = workspace.checks_read === true && !isHostKeyRepository(policy, repositoryId);
+      permissions = { ...(checks ? CONTENTS_CHECKS_READ_TOKEN_PERMISSIONS : CONTENTS_READ_TOKEN_PERMISSIONS) };
+    } else fail("token access tier must be read or write");
   } else if (access === WRITE_ACCESS) {
     if (workspace.permission_ceiling === READ_CEILING) {
       fail(`Workspace ${workspace.id} permission ceiling is read; it never mints the write tier`);
@@ -683,12 +691,19 @@ export function parsePolicy(raw) {
     if (ceiling !== undefined && !PERMISSION_CEILINGS.includes(ceiling)) {
       fail(`workspaces[${index}].permission_ceiling must be "${READ_CEILING}" or "${CONTENTS_CEILING}" when present`);
     }
+    // Optional and absent by default (since 0.17.0): only a contents-ceiling Workspace takes it, and
+    // only as `true`, so a misspelled or misplaced opt-in fails closed instead of widening anything.
+    const checksRead = workspace?.checks_read;
+    if (checksRead !== undefined && (checksRead !== true || ceiling !== CONTENTS_CEILING)) {
+      fail(`workspaces[${index}].checks_read must be true and needs permission_ceiling "${CONTENTS_CEILING}" when present`);
+    }
     return Object.freeze({
       id,
       github_team_id: teamId,
       ...(teamSlug === undefined ? {} : { github_team_slug: teamSlug }),
       credential_file: credentialFile,
       ...(ceiling === undefined ? {} : { permission_ceiling: ceiling }),
+      ...(checksRead === undefined ? {} : { checks_read: true }),
     });
   });
   if (new Set(workspaces.map(({ id }) => id)).size !== workspaces.length) {
@@ -1174,7 +1189,7 @@ export function createGithubClient({ appId, signJwt, fetchImpl = fetch, now = ()
   }
 
   async function mintToken(policy, workspace, repositoryId, access) {
-    const requested = tokenPermissions(policy, access, workspace);
+    const requested = tokenPermissions(policy, access, workspace, repositoryId);
     // The Team gate already selects the read tier there for a contents-ceiling Workspace; a gate
     // that lost that rule fails closed here instead of minting such a write (see grantAccess).
     if (

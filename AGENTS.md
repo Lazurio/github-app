@@ -26,8 +26,12 @@ dependency-light and customer-neutral.
    write permission. A Workspace whose policy declares
    `permission_ceiling: "contents"` (since `0.16.0`) mints exactly
    `contents: write` for the write tier and exactly `contents: read` for the
-   read tier, never an opt-in, so its tokens carry no Actions, Checks, issue,
-   membership, pull request or workflow permission. A mint without an explicit
+   read tier, never an installation opt-in, so its tokens carry no Actions,
+   issue, membership, pull request or workflow permission. Its only opt-in,
+   `checks_read: true` (since `0.17.0`, accepted only on a contents-ceiling
+   Workspace), adds exactly `checks: read` to its read tier outside the
+   policy's `conglomerate_hosts` repository; its write tier and every other
+   Workspace never gain it. A mint without an explicit
    tier or a Workspace of the policy fails, and so does any set that asks for
    a permission or level the installation has not accepted. A token of a GitHub Actions OIDC purpose is
    limited to the purpose's one repository and its exact reviewed permission

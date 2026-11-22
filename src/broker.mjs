@@ -204,20 +204,29 @@ function formatHostsSummary(hosts) {
  * Offline summary of the parsed Team binding and of the exact permission set each access tier
  * mints under this policy; no GitHub traffic and no secret. A policy whose Workspaces declare no
  * permission ceiling prints exactly the two tier lines; a read ceiling adds the one set every
- * grant of such a Workspace mints, a contents ceiling the two sets its write and read grants mint,
- * and either adds a CEILING column. OIDC purposes, when declared, follow.
+ * grant of such a Workspace mints, a contents ceiling the two sets its write and read grants mint
+ * (the read set of a Workspace with `checks_read` on its own line, `contents+checks_read` in the
+ * column), and either adds a CEILING column. OIDC purposes, when declared, follow.
  */
 export function formatPolicySummary(policy) {
   const uncapped = policy.workspaces.find((workspace) => workspace.permission_ceiling === undefined);
   const capped = policy.workspaces.find((workspace) => workspace.permission_ceiling === READ_CEILING);
   const contentsOnly = policy.workspaces.find((workspace) => workspace.permission_ceiling === CONTENTS_CEILING);
+  const contentsChecks = policy.workspaces.find(
+    (workspace) => workspace.permission_ceiling === CONTENTS_CEILING && workspace.checks_read === true,
+  );
+  const contentsPlain = policy.workspaces.find(
+    (workspace) => workspace.permission_ceiling === CONTENTS_CEILING && workspace.checks_read !== true,
+  );
   const ceilingColumn = capped !== undefined || contentsOnly !== undefined;
   const header = ["WORKSPACE", "TEAM_ID", "TEAM_SLUG", ...(ceilingColumn ? ["CEILING"] : [])];
   const rows = policy.workspaces.map((workspace) => [
     workspace.id,
     String(workspace.github_team_id),
     workspace.github_team_slug ?? "-",
-    ...(ceilingColumn ? [workspace.permission_ceiling ?? "-"] : []),
+    ...(ceilingColumn
+      ? [workspace.checks_read === true ? `${workspace.permission_ceiling}+checks_read` : (workspace.permission_ceiling ?? "-")]
+      : []),
   ]);
   const widths = header.map((title, column) => Math.max(title.length, ...rows.map((row) => row[column].length)));
   const line = (values) => values.map((value, column) => value.padEnd(widths[column])).join("  ").trimEnd();
@@ -235,7 +244,16 @@ export function formatPolicySummary(policy) {
     ...(contentsOnly
       ? [
           `contents ceiling (push/maintain/admin grant of a CEILING contents Workspace) asks for: ${formatPermissions(tokenPermissions(policy, WRITE_ACCESS, contentsOnly))}`,
-          `contents ceiling (pull/triage grant of a CEILING contents Workspace) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, contentsOnly))}`,
+        ]
+      : []),
+    ...(contentsPlain
+      ? [
+          `contents ceiling (pull/triage grant of a CEILING contents Workspace) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, contentsPlain))}`,
+        ]
+      : []),
+    ...(contentsChecks
+      ? [
+          `contents ceiling with checks_read (pull/triage grant, not on the conglomerate_hosts repository) asks for: ${formatPermissions(tokenPermissions(policy, READ_ACCESS, contentsChecks))}`,
         ]
       : []),
     ...(rows.length > 0 ? [line(header), ...rows.map(line)] : ["no Workspaces"]),
