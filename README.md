@@ -25,9 +25,13 @@ Since `0.16.0` a Workspace whose policy entry declares
 repository contents only: `contents: write` for a `push`, `maintain` or
 `admin` grant, `contents: read` for a `pull` or `triage` grant, and only
 `contents: read` on the policy's `conglomerate_hosts` repository. Its tokens
-never carry an Actions, Checks, issue, membership, pull request or workflow
-permission. See
-[Contents-only Workspaces](#contents-only-workspaces-permission_ceiling-contents).
+never carry an Actions, issue, membership, pull request or workflow
+permission, and no Checks permission unless it opts in: since `0.17.0` such a
+Workspace can declare `checks_read: true`, and then its `pull` and `triage`
+grants also ask for `checks: read`, so an application host can verify a
+commit's check runs before it deploys it. See
+[Contents-only Workspaces](#contents-only-workspaces-permission_ceiling-contents)
+and [Reading check runs](#reading-check-runs-checks_read).
 
 Since `0.13.0` the Cloudflare Worker adapter also serves short-lived GitHub
 Actions runners: a job of an allowlisted Deployment Repo exchanges its GitHub
@@ -135,7 +139,11 @@ Workspace id + Workspace credential + repository (name or id)
   `pull` or `triage`, and only `contents: read` on the policy's
   `conglomerate_hosts` repository. It carries no permission for pull
   requests, issues, check runs, GitHub Actions, workflow files or
-  Organization membership: in the live check GitHub refused it opening and
+  Organization membership, except that a Workspace with `checks_read: true`
+  (since `0.17.0`) adds `checks: read` to its `pull` and `triage` grants
+  outside that repository (see
+  [Reading check runs](#reading-check-runs-checks_read)). In the live check of
+  `0.16.0` GitHub refused a contents-ceiling token opening and
   listing pull requests, opening an issue in a private repository, rerunning
   and dispatching workflows, creating a check run and pushing a change to
   `.github/workflows/`.
@@ -257,6 +265,10 @@ Schema v3 binds each Workspace to its GitHub Team and names no repositories:
   `"contents"` every token carries repository contents only; see
   [Contents-only Workspaces](#contents-only-workspaces-permission_ceiling-contents).
   Any other value, including `null`, is rejected.
+- `workspaces[].checks_read` is optional (since `0.17.0`). Its only value is
+  `true`, and only a Workspace with `permission_ceiling: "contents"` may
+  declare it; any other value or Workspace is rejected. See
+  [Reading check runs](#reading-check-runs-checks_read).
 - `oidc` is optional (since `0.13.0`). It declares the purposes for which
   GitHub Actions jobs of listed Deployment Repos may obtain a token; see
   [The `oidc` purpose table](#the-oidc-purpose-table). Absent, the broker has
@@ -497,6 +509,51 @@ For such a Workspace:
   and this ceiling never asks for it. The Team gate selects the read tier
   there, and the mint refuses the write set for that repository before
   GitHub is asked, should a gate ever select it.
+
+#### Reading check runs (`checks_read`)
+
+Since `0.17.0` a contents-ceiling Workspace can opt in to reading check runs.
+An application host needs it to deploy a Module's commit only once that
+commit's checks have passed: it reads
+`GET /repos/{owner}/{repo}/commits/{sha}/check-runs` for the Module
+repository, which a `contents: read` token cannot. The policy entry adds:
+
+```json
+{
+  "id": "example-apps-host",
+  "github_team_id": 4005,
+  "github_team_slug": "apps-host",
+  "credential_file": "/run/secrets/workspace-example-apps-host",
+  "permission_ceiling": "contents",
+  "checks_read": true
+}
+```
+
+For such a Workspace:
+
+- a `pull` or `triage` grant mints exactly `contents: read` and
+  `checks: read` (plus `metadata: read`);
+- a `push`, `maintain` or `admin` grant still mints exactly
+  `contents: write`, so the repositories the host writes, such as its
+  applications' data repositories, gain nothing;
+- on the policy's `conglomerate_hosts` repository every grant still mints
+  exactly `contents: read`, so a `push` grant lowered to the read tier there
+  gains nothing either;
+- no write permission is added anywhere, and other Workspaces of the policy
+  mint exactly as before.
+
+`checks: read` reveals check runs (names, status, conclusions and output
+summaries) of repositories the Workspace can already read. It cannot create,
+rerun or change a check run. The installation already holds `checks: read`
+(the policy requires it), so an Organization accepts no new installation
+permission; what it accepts is this wider read for that one Workspace, by
+merging the opt-in into its reviewed policy.
+
+`checks_read` is only `true` and only on a contents-ceiling Workspace; any
+other value, or the key on another Workspace, is rejected and the broker
+fails closed. A broker before `0.17.0` ignores the key, keeps minting
+`contents: read` and the host's read of check runs is refused, so nothing is
+deployed. Deploy `0.17.0` before relying on the opt-in.
 
 `contents: write` is GitHub's whole permission for repository contents, and
 the ceiling cannot narrow it further: GitHub has no installation permission
